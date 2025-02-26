@@ -18,4 +18,4 @@ COPY . /app
 # Sync the project
 RUN uv sync --frozen
 
-CMD [ "python", "iirspy/foo.py" ]
+CMD [ "python", "iirspy/utils.py" ]
