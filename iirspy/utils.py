@@ -1,283 +1,42 @@
 import hashlib
+import warnings
 import zipfile
+from importlib.resources import files
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pandas as pd
 import pdr
+import rasterio
 import rioxarray
+
+# import xarray_regrid
 import xarray as xr
-import xesmf as xe
-from osgeo import gdal
+
+# import xesmf as xe
 from pyproj import CRS
 from rasterio.control import GroundControlPoint
 from scipy.interpolate import RBFInterpolator, make_interp_spline
+from scipy.ndimage import convolve
 from scipy.stats import norm
 
+warnings.filterwarnings("ignore", message="Dataset has no geotransform")
+
 ## Constants
+# Access the data directory
+data_dir = files("iirspy").joinpath("data")
+
+# Example usage
+FPOLISH = str(data_dir.joinpath("spectral_polish_verma2022.csv"))
+FBADBANDS = str(data_dir.joinpath("iirs_bad_bands.csv"))
+FSOLAR = str(data_dir.joinpath("ch2_iirs_solar_flux.txt"))
 # Projections used in the Ch2 IIRS selenoref tool https://doi.org/10.1007/s12524-024-01814-4
 IIRS_PROJ_DICT = {
     "equatorial": 'PROJCS["Moon_Equidistant_Cylindrical",GEOGCS["Moon 2000",DATUM["D_Moon_2000",SPHEROID["Moon_2000_IAU_IAG",1737400.0,0.0]],PRIMEM["Greenwich",0],UNIT["Decimal_Degree",0.0174532925199433]],PROJECTION["Equidistant_Cylindrical"],PARAMETER["False_Easting",0],PARAMETER["False_Northing",0],PARAMETER["Central_Meridian",0],PARAMETER["Standard_Parallel_1",0],UNIT["Meter",1]]',
     "polarstereographicsouthpole": 'PROJCS["Moon_South_Pole_Stereographic",GEOGCS["Moon 2000",DATUM["D_Moon_2000",SPHEROID["Moon_2000_IAU_IAG",1737400.0,0.0]],PRIMEM["Greenwich",0],UNIT["Decimal_Degree",0.0174532925199433]],PROJECTION["Stereographic"],PARAMETER["False_Easting",0],PARAMETER["False_Northing",0],PARAMETER["Central_Meridian",0],PARAMETER["Scale_Factor",1],PARAMETER["Latitude_Of_Origin",-90],UNIT["Meter",1]]',
     "polarstereographicnorthpole": 'PROJCS["Moon_North_Pole_Stereographic",GEOGCS["Moon 2000",DATUM["D_Moon_2000",SPHEROID["Moon_2000_IAU_IAG",1737400.0,0.0]],PRIMEM["Greenwich",0],UNIT["Decimal_Degree",0.0174532925199433]],PROJECTION["Stereographic"],PARAMETER["False_Easting",0],PARAMETER["False_Northing",0],PARAMETER["Central_Meridian",0],PARAMETER["Scale_Factor",1],PARAMETER["Latitude_Of_Origin",90],UNIT["Meter",1]]',
 }
-# Statistical polish from Verma et al. (2022) - see https://github.com/prabhakaralok/CH2IIRS
-POLISH = np.concatenate([
-    [np.nan] * 7,
-    [
-        1.007951631,
-        1.003136498,
-        1.012137177,
-        0.983221552,
-        0.982301846,
-        0.980570808,
-        0.974865433,
-        0.97640194,
-        0.992019454,
-        1.007100398,
-        1.004167929,
-        0.986444903,
-        1.005016461,
-        1.013553818,
-        1.009490688,
-        1.003308071,
-        1.011969658,
-        1.0141375,
-        1.006193945,
-        1.015513554,
-        1.020218579,
-        1.016652203,
-        1.023330972,
-        1.020211072,
-        1.015149832,
-        1.00860599,
-        1.000767149,
-        0.994761146,
-        1.067891991,
-        1.044841918,
-        0.972851837,
-        0.9762951,
-        0.979046208,
-        0.97102683,
-        0.982455709,
-        0.987001059,
-        0.988436954,
-        0.979160136,
-        0.9986847,
-        0.997752521,
-        0.998447812,
-        1.016854934,
-        0.997900542,
-        0.983831379,
-        0.969376425,
-        0.979670198,
-        0.973878228,
-        0.996289037,
-        1.014184498,
-        1.01477613,
-        1.001481496,
-        0.975778394,
-        0.997684295,
-        0.984763646,
-        0.983395789,
-        0.98823384,
-        0.988012215,
-        0.952374697,
-        0.937581808,
-        1.013480796,
-        1.014063354,
-        1.022099753,
-        1.03204087,
-        1.035484491,
-        1.041175268,
-        1.036634478,
-        1.034566162,
-        1.03809732,
-        1.046558655,
-        1.021576737,
-        1.028588801,
-        1.007904219,
-        0.972531419,
-        0.956629793,
-        0.955287872,
-        0.979925337,
-        1.002466257,
-        1.014420813,
-        1.008463966,
-        1.00003099,
-        1.008471522,
-        0.99282371,
-        0.99980302,
-        0.987547313,
-        0.984068212,
-        0.992388063,
-        0.988139868,
-        1.012650312,
-        1.052139241,
-        1.012472306,
-        0.965437548,
-        0.939243701,
-        0.967441753,
-        0.963544372,
-        0.990952989,
-        0.973117569,
-        1.013248635,
-        1.020203633,
-        1.029157186,
-        1.020485688,
-        1.020579985,
-        1.006238104,
-        1.014835128,
-        1.006275303,
-        1.010898129,
-        1.00045314,
-        1.008028897,
-        1.012421421,
-        1.027533403,
-        1.031189861,
-        1.029572772,
-        0.998242,
-        0.988472694,
-        0.964883574,
-        0.965888213,
-        0.949632716,
-        0.959468989,
-        0.953967103,
-        0.97185828,
-        0.975099523,
-        0.99858193,
-        0.998573727,
-        1.021937907,
-        1.019142949,
-        1.038073792,
-        1.031876174,
-        1.041953094,
-        1.029414494,
-        1.031461328,
-        1.008333598,
-        1.0158236,
-        0.997626672,
-        0.997772942,
-        0.951297807,
-        0.98848544,
-        0.983055255,
-        0.973287938,
-        1.020004362,
-        1.007683124,
-        1.002357289,
-        1.009943767,
-        0.967795252,
-        0.999227534,
-        0.97305723,
-        0.984516543,
-        0.996874775,
-        1.05340332,
-        1.037099582,
-        1.015145219,
-        1.02252679,
-        0.987330432,
-        0.896931034,
-        0.854160633,
-        1.141899078,
-        1.108682789,
-        1.023030659,
-        0.939513645,
-        0.914993685,
-        0.994857247,
-        1.264567511,
-        0.759581027,
-        1.008047196,
-        1.012150301,
-        0.962843991,
-        1.019548525,
-        0.989332932,
-        1.049050719,
-        0.980318607,
-        1.018721793,
-        0.965286873,
-        1.027176253,
-        0.963709485,
-        1.010598964,
-        0.971110269,
-        1.076940686,
-        1.020255436,
-        0.929940419,
-        0.996612177,
-        0.958811048,
-        1.059205186,
-        1.002448358,
-        0.973559634,
-        1.002937935,
-        1.013683258,
-        1.0474072,
-        1.000925241,
-        0.985500261,
-        0.982660401,
-        0.938587583,
-        1.046900212,
-        0.952743318,
-        1.026649622,
-        1.115011575,
-        0.887761742,
-        1.005459078,
-        0.95483364,
-        0.967275555,
-        1.13852458,
-        0.986343909,
-        0.965651948,
-        1.101161236,
-        0.988116073,
-        0.853138055,
-        0.974375472,
-        1.177442497,
-        0.927739407,
-        0.932486397,
-        0.962300997,
-        0.985181241,
-        0.829206405,
-        1.493934047,
-        1.059590538,
-        0.71322689,
-        0.875132631,
-        1.121072252,
-        0.938541303,
-        1.139668914,
-        0.897165185,
-        1.117762208,
-        0.961511703,
-        0.528956345,
-        1.711570255,
-        1.20749058,
-        1.024243553,
-        0.713165588,
-        1.06875679,
-        0.570841199,
-        0.932178556,
-        2.546499369,
-        2.664596812,
-        1.224978705,
-        0.567434034,
-        0.726464718,
-        0.745085856,
-        1.21801428,
-        1.140071493,
-        0.828417838,
-        1.063662997,
-        0.953993832,
-        1.084346492,
-        0.826805177,
-        1.166156321,
-        0.873581953,
-        0.906603941,
-        1.403382254,
-        0.898905495,
-        1.006518779,
-        np.nan,
-        np.nan,
-    ],
-])
-FSOLAR = "./data/ch2_iirs_solar_flux.txt"
 
 
 ## Reflectance corr
@@ -286,14 +45,23 @@ def iirs_refl(  # noqa: C901 `iirs_refl` is too complex
     fspm,
     fgeom="",
     fout="",
+    ftif="",
+    finc="",
+    fiaz="",
+    shift_iaz=0,
     fflux=FSOLAR,
     dem=None,
     extent=(None, None, None, None),
     smoothing="none",
     swindow=1,
     polish=False,
+    fpolish=FPOLISH,
     drop_bad_bands=True,
+    bad_bands_buffer=0,
+    bad_band_mask=None,
+    thermal=False,
     ychunks=4000,
+    max_refl=np.inf,
     destripe=False,
     **destripe_kws,
 ):
@@ -313,7 +81,6 @@ def iirs_refl(  # noqa: C901 `iirs_refl` is too complex
     Optionally smooths spectra with a boxcar filter along wavelength.
     Optionally applies fourier smoothing to remove vertical/horizontal stripes.
     TODO: Optionally computes a thermal correction for the NIR bands.
-    TODO: Optionally computes the incidence angle relative to a given DEM.
 
     Parameters
     ----------
@@ -325,12 +92,18 @@ def iirs_refl(  # noqa: C901 `iirs_refl` is too complex
     extent(tuple): (xmin, xmax, ymin, ymax) in degrees if fgeom is given, otherwise in pixels.
     smoothing (int): Smooth spectra ('none', 'boxcar', 'gaussian').
     swindow (int): Window size for smoothing (must be odd for gaussian).
-    polish (bool): Apply IIRS spectral polish (Verma et al. 2022)
+    polish (bool): Apply IIRS spectral polish from FPOLISH (default: False)
+    fpolish (str or path): CSV with columns: band, polish (default: spectral_polish_verma2022.csv)
     drop_bad_bands (bool): Set bad bands defined in the IIRS SIS to NaN.
+    bad_bands_buffer (int): Number of additional bands on either side of bad bands to also set to NaN.
+    bad_band_mask (arr of bool): Manually specified array of len(bands) where True indicates a bad band to drop.
     destripe (bool): Whether to apply fourier destriping routine.
     destripe_kws (dict): Options for destriping (see fourier_filter).
     ychunks (dict): How many lines to chunk input image into using dask.
     """
+    bands = slice(None, None)
+    if not thermal:
+        bands = slice(None, 101)  # Exclude bands > 2.4um if not doing thermal correction
     # If fgeom is given, interpret extent as degrees, otherwise interpret as pixels
     if fgeom:
         gridlon, gridlat, xyext = geom2grid(fgeom, extent)
@@ -338,48 +111,60 @@ def iirs_refl(  # noqa: C901 `iirs_refl` is too complex
     else:
         xmin, xmax, ymin, ymax = extent
 
-    # Read and unscale IIRS L1 radiance from [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
-    da = 0.01 * xr.open_dataarray(fqub, engine="rasterio").sel(x=slice(xmin, xmax), y=slice(ymin, ymax))
+    # Read IIRS L1 radiance in [1000 mW/cm^2/sr/um]
+    if ftif:
+        da = xr.open_dataarray(ftif, engine="rasterio").sel(band=bands)
+    else:
+        da = xr.open_dataarray(fqub, engine="rasterio").sel(x=slice(xmin, xmax), y=slice(ymin, ymax), band=bands)
     if ychunks:
         da = da.chunk(y=ychunks, x=len(da.x), band=len(da.band))
+    da = 0.01 * da  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
 
-    # Polish: Apply statistical polish used in Verma et al. 2022
-    if polish:
-        coeff = POLISH[:, None, None]
-        da /= coeff
-
-    # Drop bad bands: Sets bad bands to nan (bad bands based on gain,exposure)
+    # (Optional): Sets bad bands to nan (bad bands based on gain,exposure)
     if drop_bad_bands:
-        bb = get_bad_bands(fqub)[:, None, None]
-        da = da.where(bb)
+        if bad_band_mask is None:
+            bad_band_mask = get_bad_bands(fqub, bad_bands_buffer)  # array where True == bad
+        da = da.where(~bad_band_mask[bands, None, None])
+
+    # (Optional): Fourier filtering for vertical / horizontal artefacts
+    if destripe:
+        # TODO: check for off by one error (lines shifted up 1 pixel?)
+        # TODO: test on dask chunked images
+        da = fourier_filter(da, **destripe_kws)
 
     # Reflectance correction: I/F
     # Get solar spectrum
     L = pd.read_csv(fflux, sep="\t", header=None, names=["wl", "flux"])
-    wl = L["wl"].values[:, None, None] * 1e-9  # wl [m]
+    wl = L["wl"].values[bands, None, None] * 1e-9  # wl [m]
     sdist = get_solar_distance(fqub)
-    F = L["flux"].values[:, None, None] * 10 / (np.pi * sdist**2)  # Solar flux [W/m^2/sr/um]
+    F = L["flux"].values[bands, None, None] * 10 / (np.pi * sdist**2)  # Solar flux [W/m^2/sr/um]
 
     # Get solar incidence for each line of image
-    inc, iaz = get_iirs_inc_az(fqub, fspm, yrange=(int(da.y[0]), int(da.y[-1]) + 1))
+    inc, iaz = get_iirs_inc_az(fqub, fspm, yrange=(int(ymin), int(ymin) + len(da.y)))
     cos_inc = np.cos(np.radians(inc[None, :, None]))
+
+    # (Optional): adjust cos_inc relative to dem
     if dem is not None:
-        # Find angle between sun and pixel in DEM
-        elev = 90 - inc[None, :, None]
-        cos_inc = dem.dot(elev)
-        print("DEM not implemented")
+        if not hasattr(dem, "sel"):
+            dem = xr.open_dataarray(dem, engine="rasterio").sel(band=1)
+        if finc:
+            inc = xr.open_dataarray(finc, engine="rasterio").sel(band=1)
+        if fiaz:
+            iaz = xr.open_dataarray(fiaz, engine="rasterio").sel(band=1)
+            iaz -= shift_iaz
+        dem = dem.rio.reproject_match(da.sel(band=1))
+        dem = dem.assign_coords(x=da.x, y=da.y)
+        cos_inc = get_cos_inc_dem(dem, inc, iaz).values[None, :, :]
 
     # Convert to I/F reflectance
     da = da / (cos_inc * F)
-    da = da.assign_coords(wl=("band", wl.squeeze() * 1e9))  # Attach wavelengths
 
-    # Destriping: Fourier filtering for vertical / horizontal artefacts
-    if destripe:
-        # TODO: check for off by one error (lines shifted up 1 pixel)
-        # TODO: test on dask chunked images
-        da = fourier_filter(da, **destripe_kws)
+    # (Optional): Apply statistical polish to reflectance (coeffs from Verma et al. (2022) - see https://github.com/prabhakaralok/CH2IIRS)
+    if polish:
+        spec_polish = pd.read_csv(fpolish).set_index("band").to_xarray()
+        da /= spec_polish.sel(band=bands)
 
-    # Smoothing:
+    # (Optional): Smooth the spectra on each pixel
     if smoothing.lower() == "boxcar":
         # Moving average over wavelength (test this since .mean on a rolling array may not handle NaNs correctly)
         da = da.rolling({"band": swindow}, center=True, min_periods=swindow / 2).mean(["band"])
@@ -400,21 +185,26 @@ def iirs_refl(  # noqa: C901 `iirs_refl` is too complex
         )
 
     # Remove bad values, reduce precision for writing
-    da = da.where(da >= 0).astype("float32")
+    da = da.where((da >= 0) & (da <= max_refl))  # .astype("float32")
+    da = da.assign_coords(wl=("band", np.round(wl.squeeze() * 1e9, 2)))
+    da.rio.write_crs("IAU_2015:30135", inplace=True)
+    da.rio.write_nodata(np.nan, inplace=True)
 
-    # Write image
+    # (Optional): Write image to file
     if fout:
         if fout[-4:].lower() == ".img":
             write_envi(da, fout)
-        elif fgeom and fout[-4:].lower() == ".tif":
+        elif fgeom and fout[-4:].lower() == ".tif" and not ftif:
             da = warp2grid(da, xyext, gridlon, gridlat)
+            da = da.swap_dims({"band": "wl"})
             da.rio.to_raster(fout, driver="GTiff", compress="LZW")
         else:
+            da = da.swap_dims({"band": "wl"})
             da.rio.to_raster(fout)
     return da
 
 
-def iirs_refl_verma(da, inc=None, smoothing=3, fflux=FSOLAR):
+def iirs_refl_verma(da, inc=None, smoothing=3, fflux=FSOLAR, fpolish=FPOLISH):
     """
     Return IIRS L2 reflectance from L1 radiance.
 
@@ -438,7 +228,7 @@ def iirs_refl_verma(da, inc=None, smoothing=3, fflux=FSOLAR):
     ss = np.round(ss, 4)
 
     # Get statistical polish
-    coeff = POLISH[:, None, None]
+    coeff = pd.read_csv(fpolish)["polish"].values[:, None, None]
 
     # Isothermal temperature correction
     c = 3e8
@@ -479,6 +269,74 @@ def get_reflectance_factor(fimg, fspm):
     return 1 / (cinc * f_scaled)
 
 
+def get_cos_inc_dem(dem, inc, iaz):
+    """Return cos(inc) relative to a dem using the dot product.
+
+    All input images must be co-registered with the same width and height.
+    """
+    # Calculate local illumination using dot product method between surface normal and sun vector
+
+    res_x = abs(float(dem.x[1] - dem.x[0]))
+    res_y = abs(float(dem.y[1] - dem.y[0]))
+
+    # Calculate surface gradients using kernel convolution
+    kernel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]) / (8 * res_x)
+    kernel_y = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]]) / (8 * res_y)
+
+    # Calculate derivatives
+    dz_dx = convolve(dem.values, kernel_x)
+    dz_dy = convolve(dem.values, kernel_y)
+
+    # Create surface normal vectors [nx, ny, nz]
+    # For each pixel: n = [-dz/dx, -dz/dy, 1] (unnormalized)
+    nx = -dz_dx
+    ny = -dz_dy
+    nz = np.ones_like(dz_dx)
+
+    # Normalize the normal vectors
+    norm_factor = np.sqrt(nx**2 + ny**2 + nz**2)
+    nx = nx / norm_factor
+    ny = ny / norm_factor
+    nz = nz / norm_factor
+
+    # 2. Calculate sun vector for each line (convert from inc, az to vector)
+    # First convert incidence and azimuth to radians
+    inc_rad = np.radians(inc)
+    iaz_rad = np.radians(iaz)
+
+    # Sun vector components [sx, sy, sz] from incidence and azimuth angles
+    # Sun position given as (inc, az) where inc is from zenith, az is clockwise from north
+    # We first convert to a directional sun vector (pointing from surface to sun)
+    sx = np.sin(inc_rad) * np.sin(iaz_rad)  # East component
+    sy = np.sin(inc_rad) * np.cos(iaz_rad)  # North component
+    sz = np.cos(inc_rad)  # Up component
+
+    # Reshape sun vector for broadcasting
+    # Assume inc and iaz are 1D arrays with one value per image line
+    sx = sx[:, np.newaxis]  # Shape becomes (lines, 1)
+    sy = sy[:, np.newaxis]
+    sz = sz[:, np.newaxis]
+
+    # 3. Compute dot product between normal and sun vector for each pixel
+    # Expand dimensions for band axis
+    # nx = nx[np.newaxis, :, :]  # Shape becomes (1, y, x)
+    # ny = ny[np.newaxis, :, :]
+    # nz = nz[np.newaxis, :, :]
+
+    # Calculate dot product (cosine of incidence angle)
+    # n⋅s = nx*sx + ny*sy + nz*sz
+    # The result will have shape (lines, cols)
+    # cos_inc = (
+    #     nx * sx[np.newaxis, :, np.newaxis] + ny * sy[np.newaxis, :, np.newaxis] + nz * sz[np.newaxis, :, np.newaxis]
+    # )
+    cos_inc = nx * sx + ny * sy + nz * sz
+
+    # Handle negative values (local shadows)
+    # cos_inc[(cos_inc > 1) | (cos_inc < 1e-3)] = np.nan
+    # cos_inc = np.clip(cos_inc, 0.001, 1)
+    return cos_inc
+
+
 def get_iirs_inc_az(fimg, fspm, yrange=(None, None)):
     """
     Return incidence angle from IIRS SPM timestamped file.
@@ -488,8 +346,8 @@ def get_iirs_inc_az(fimg, fspm, yrange=(None, None)):
     get_sun_elev = get_spm_interpolator(fspm, "sun_elev")
     get_sun_az = get_spm_interpolator(fspm, "sun_az")
     line_times = get_line_times(fimg)
-    inc = 90 - get_sun_elev(line_times)[yrange[0], yrange[1]]
-    az = get_sun_az(line_times)[yrange[0], yrange[1]]
+    inc = 90 - abs(get_sun_elev(line_times)[yrange[0] : yrange[1]])
+    az = get_sun_az(line_times)[yrange[0] : yrange[1]]
     return inc, az
 
 
@@ -568,14 +426,57 @@ def warp2grid(da, ext, gridlon, gridlat, method="bilinear"):
         "lon": np.arange(minlon, maxlon + dlon, dlon, dtype="float32"),
         "lat": np.arange(minlat, maxlat + dlat, dlat, "float32"),
     }
-    regridder = xe.Regridder(src, target_grid, method, unmapped_to_nan=True)
-    out = regridder(src)
+    # TODO: need to replace regridder
+    # regridder = xe.Regridder(src, target_grid, method, unmapped_to_nan=True)
+    # out = regridder(src)
+    out = target_grid
 
     # Write crs (Moon unprojected)
     out.rio.write_crs(CRS.from_authority("IAU", "30100"), inplace=True)
     out.rio.set_spatial_dims("lon", "lat", inplace=True)
     out.rio.write_coordinate_system(inplace=True)
     return out
+
+
+def warp2gcps(fqub, da, gcps, gcps_crs, fout, method="bilinear"):
+    """Warp and project the image based on the provided GCPs."""
+    import rasterio
+    from rasterio.warp import Resampling, calculate_default_transform, reproject
+
+    # Create a temporary file to store the warped image
+    with rasterio.open(fqub) as src:
+        # Create a VRT dataset with GCPs
+        vrt_options = {
+            "crs": da.rio.crs,
+            "src_crs": gcps_crs,
+            "src_transform": rasterio.transform.from_gcps(gcps),
+            "src_method": "GCP_TPS",
+        }
+        with rasterio.vrt.WarpedVRT(src, **vrt_options) as vrt:
+            transform, width, height = calculate_default_transform(
+                gcps_crs, da.rio.crs, da.rio.width, da.rio.height, gcps=gcps
+            )
+            print(transform, "\n", width, height)
+            kwargs = da.rio.profile
+            kwargs.update({"crs": gcps_crs, "transform": transform, "width": width, "height": height})
+
+            with rasterio.open(fout, "w", **kwargs) as dst:
+                for i in range(1, da.rio.count + 1):
+                    reproject(
+                        source=rasterio.band(vrt, i),
+                        destination=rasterio.band(dst, i),
+                        src_transform=da.rio.transform,
+                        src_crs=da.rio.crs,
+                        gcps=gcps,
+                        dst_transform=transform,
+                        dst_crs=gcps_crs,
+                        resampling=getattr(Resampling, method),
+                    )
+
+        # Read the warped image back into an xarray DataArray
+        warped_da = xr.open_dataarray(fout, engine="rasterio")
+
+    return warped_da
 
 
 def fix_metadata(fqub, fgeotiff):
@@ -633,7 +534,7 @@ def geom2grid(fgeom, extent):
     return gridlon, gridlat, xy_ext
 
 
-def iirs2gcps(fqub, fgeom, fout=None, extent=(None, None, None, None)):
+def iirs2gcps(fqub, fgeom, fout=None, extent=(None, None, None, None), corners_only=False):
     """
     Write iirs qub subset to latlon as geotiff with GCPs. Optionally check MD5 checksum.
 
@@ -642,7 +543,7 @@ def iirs2gcps(fqub, fgeom, fout=None, extent=(None, None, None, None)):
     extent: (minlon, maxlon, minlat, maxlat)
     """
     # Get GCPs and ext in pixel coordinates
-    gcps, ext = parse_geom(fgeom, extent, as_gcps=True)
+    gcps, ext = parse_geom(fgeom, extent, as_gcps=True, corners_only=corners_only)
 
     # Read the hyperspectral data cube
     ds = xr.open_dataarray(fqub, engine="rasterio").sel(
@@ -664,6 +565,17 @@ def points2gcps(fqub, fpoints, fout, extent=(None, None, None, None)):
 
 
 ## File I/O
+def read_gcps(fgcps):
+    """Parse gcps and CRS from a QGIS georeferencer .points file."""
+    with open(fgcps) as f:
+        crs = CRS.from_wkt(f.readline().lstrip("#CRS: "))
+    df = pd.read_csv(fgcps, skiprows=1, header=0)
+    # df['sourceY'] = len(da.y) + df.sourceY
+    # df['sourceY'] =  abs(df.sourceY)
+    gcps = [GroundControlPoint(row["sourceX"], row["sourceY"], row["mapX"], row["mapY"]) for _, row in df.iterrows()]
+    return gcps, crs
+
+
 def unzip(fzip, ddir):
     """Unzip a file to a directory."""
     with zipfile.ZipFile(fzip, "r") as zip_ref:
@@ -720,7 +632,7 @@ def get_wls(fname, as_str=False):
     return wls
 
 
-def parse_geom(fgeom, extent=(None, None, None, None), buffer=0, center=True, as_gcps=False):
+def parse_geom(fgeom, extent=(None, None, None, None), buffer=0, center=True, as_gcps=False, corners_only=False):
     """
     Read lat,lon,x,y from iirs geometry file and return as list of GCPs or DataFrame.
 
@@ -742,20 +654,26 @@ def parse_geom(fgeom, extent=(None, None, None, None), buffer=0, center=True, as
     maxlon = 180 if maxlon is None else maxlon
     minlat = -90 if minlat is None else minlat
     maxlat = 90 if maxlat is None else maxlat
-    df = df[
+    out = df[
         (df["Longitude"] >= minlon - buffer)
         & (df["Longitude"] <= maxlon + buffer)
         & (df["Latitude"] >= minlat - buffer)
         & (df["Latitude"] <= maxlat + buffer)
     ]
-    # Add 0.5 to pixel and scan to get the pixel center
-    ext = [min(df["Pixel"]), max(df["Pixel"]), min(df["Scan"]), max(df["Scan"])]
-    if as_gcps:
-        gcps = [
-            GroundControlPoint(row["Scan"], row["Pixel"], row["Longitude"], row["Latitude"]) for i, row in df.iterrows()
+    # Convert output dataframe to list of gcps or gcp corners if requested
+    xyext = [min(out["Pixel"]), max(out["Pixel"]), min(out["Scan"]), max(out["Scan"])]
+    if as_gcps and corners_only:
+        out = [
+            GroundControlPoint(row["Scan"], row["Pixel"], row["Longitude"], row["Latitude"])
+            for i, row in out.iterrows()
+            if row["Pixel"] in xyext and row["Scan"] in xyext
         ]
-        return gcps, ext
-    return df, ext
+    elif as_gcps:
+        out = [
+            GroundControlPoint(row["Scan"], row["Pixel"], row["Longitude"], row["Latitude"])
+            for i, row in out.iterrows()
+        ]
+    return out, xyext
 
 
 def load_iirs_spm(fspm):
@@ -815,16 +733,17 @@ def get_iirs_shape_meta(fimg):
     return bands, lines, samples
 
 
-def get_iirs_solar_flux(sdist=1, fflux="../data/moon/ch2/iirs/iir/miscellaneous/ch2_iirs_solar_flux.txt"):
+def get_iirs_solar_flux(sdist=1, fflux=FSOLAR):
     """Return the solar flux from the IIRS solar flux csv."""
     df = pd.read_csv(fflux, sep="\t", header=None, names=["wl", "flux"])
     df.loc[:, "flux"] = df.flux / 3.14 / sdist**2
     return df
 
 
-def load_bad_bands(fbad_bands="../data/moon/ch2/iirs/iirs_bad_bands.csv"):
+def load_bad_bands(fbad_bands=FBADBANDS):
     """Load bad bands from a CSV file."""
-    return pd.read_csv(fbad_bands, index_col=0).astype(bool)
+    # Negates the df since provided bad bands file is 1 for good, 0 for bad
+    return ~pd.read_csv(fbad_bands, index_col=0).astype(bool)
 
 
 def get_exposore_gain(fimg):
@@ -835,11 +754,22 @@ def get_exposore_gain(fimg):
     return f"{exposure}{gain}"
 
 
-def get_bad_bands(fimg):
-    """Return bad bands for the given image (depends on exposure and gain)."""
-    exp_gain = get_exposore_gain(fimg)  # e.g. 'e1g2
-    bad_bands = load_bad_bands()
-    return bad_bands[exp_gain].values  # np array band 1-256
+def get_bad_bands(fimg, buffer=0):
+    """
+    Return bad bands for the given image (depends on exposure and gain).
+
+    Set buffer number of bands to left and right of each bad band as bad.
+    """
+    exp_gain = get_exposore_gain(fimg)  # e.g., "e1g2"
+    bad_bands = load_bad_bands()[exp_gain].values  # array of True / False
+
+    # Buffer - use kernel convolution to bump n adjacent bands, flag these as also bad
+    # Ex. [0, 1, 1, 1, 0, 1, 1] with buffer 1 => [0, 0, 1, 0, 0, 0, 1]
+    kernel_size = 2 * buffer + 1
+    kernel = np.ones(kernel_size)
+    bad_buffered = np.convolve((bad_bands).astype(int), kernel, mode="same").astype(bool)
+
+    return bad_buffered  # array of True where band is bad
 
 
 def get_solar_distance(fimg):
@@ -858,14 +788,26 @@ def get_solar_distance(fimg):
 
 
 def write_envi(da, fout):
-    """Write dataarray cube to fout."""
-    wls = [f"{wl:.3f} nm" for wl in da.wl]
+    """Write dataarray cube to fout using rasterio."""
+
+    wls = [f"{wl:.2f}" for wl in da.wl]
     nz, ny, nx = da.shape
-    dst = gdal.GetDriverByName("ENVI").Create(fout, nx, ny, nz, gdal.GDT_Float32)
-    for i in range(nz):
-        db = dst.GetRasterBand(i + 1)
-        db.SetDescription(wls[i])
-        db.WriteArray(da.isel(band=i).values)
+    transform = da.rio.transform
+
+    with rasterio.open(
+        fout,
+        "w",
+        driver="ENVI",
+        height=ny,
+        width=nx,
+        count=nz,
+        dtype=da.dtype,
+        transform=transform,
+        crs=da.rio.crs if da.rio.crs else None,
+    ) as dst:
+        for i in range(nz):
+            dst.write(da.isel(band=i).values, i + 1)
+            dst.set_band_description(i + 1, wls[i])
 
 
 ## Thermal corr
@@ -975,4 +917,17 @@ def fourier_filter(img, vthresh=0.8, vtilt=0.0, hthresh=0.0, htilt=0.0, get_filt
 
 
 if __name__ == "__main__":  # pragma: no cover
+    fqub = (
+        "/home/cjtu/projects/lai/issdc-requester/data/corrected_python/refl/ch2_iir_20210622T1256344234_destriped.img"
+    )
+    fgeom = "/home/cjtu/projects/lai/data/moon/ch2/iirs/geometry/calibrated/20210622/ch2_iir_nci_20210622T1256344234_g_grd_d32.csv"
+    fpoints = "/home/cjtu/projects/lai/data/moon/ch2/iirs/corrected_python/refl/ch2_iir_20210622T1256344234_destriped.img.points"
+
+    # Read un-georeferenced data qub and add projection info
+    da = xr.open_dataarray(fqub, engine="rasterio")
+    gridlon, gridlat, xyext = geom2grid(fgeom, (None, None, -86, -83))
+    gcps, gcps_crs = read_gcps(fpoints)
+
+    # projected = warp2grid(da, xyext, gridlon, gridlat)
+    proj_from_gcps = warp2gcps(da, gcps, gcps_crs, "./test.tif")
     pass

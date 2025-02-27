@@ -5,12 +5,11 @@ description = "Handling and correcting Chandrayaan-2 IIRS data in Python."
 authors = [{ name = "Christian J. Tai Udovicic", email = "cj.taiudovicic@gmail.com" }]
 readme = "README.md"
 keywords = ['python']
-requires-python = ">=3.9,<4.0"
+requires-python = ">=3.10,<4.0"
 classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -18,6 +17,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+    "dask>=2025.2.0",
     "matplotlib>=3.9.4",
     "numpy>=2.0.2",
     "opencv-python>=4.11.0.86",
@@ -26,7 +26,7 @@ dependencies = [
     "rioxarray>=0.15.0",
     "scipy>=1.13.1",
     "xarray>=2024.7.0",
-    "xesmf>=0.8.8",
+    "xarray-regrid>=0.4.0",
 ]
 
 [project.urls]
@@ -52,7 +52,8 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-
+[tool.hatch.build]
+include = ["iirspy/data/**"]
 
 [tool.mypy]
 files = ["iirspy"]
@@ -71,6 +72,7 @@ testpaths = ["tests"]
 target-version = "py39"
 line-length = 120
 fix = true
+exclude = ["notebooks"]
 
 [tool.ruff.lint]
 select = [

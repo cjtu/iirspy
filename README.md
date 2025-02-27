@@ -1,68 +1,51 @@
-# iirspy
+# IIRSpy
 
-[![Release](https://img.shields.io/github/v/release/cjtu/iirspy)](https://img.shields.io/github/v/release/cjtu/iirspy)
-[![Build status](https://img.shields.io/github/actions/workflow/status/cjtu/iirspy/main.yml?branch=main)](https://github.com/cjtu/iirspy/actions/workflows/main.yml?query=branch%3Amain)
-[![Commit activity](https://img.shields.io/github/commit-activity/m/cjtu/iirspy)](https://img.shields.io/github/commit-activity/m/cjtu/iirspy)
-[![License](https://img.shields.io/github/license/cjtu/iirspy)](https://img.shields.io/github/license/cjtu/iirspy)
+This is a work in progress. May be buggy and subject to change w/o notice!
 
-Handling and correcting Chandrayaan-2 IIRS data in Python.
+Main code is in: [iirspy/utils.py](iirspy/utils.py).
 
-- **Github repository**: <https://github.com/cjtu/iirspy/>
-- **Documentation** <https://cjtu.github.io/iirspy/>
+## Current Workflow
 
-## Getting started with your project
+Follow below steps to correct IIRS data in python.
 
-### 1. Create a New Repository
+## Download IIRS
 
-First, create a repository on GitHub with the same name as this project, and then run the following commands:
+- Uses the ISSDC/PRADAN command line downloader I wrote in python
+  - requires your ISRO PRADAN system login
+  - retries on disconnect
+  - refreshes the login session on timeout
+  - comes with checksums that we can check to ensure correctness (should add this to the package so we can re-download if the checksum fails)
 
-```bash
-git init -b main
-git add .
-git commit -m "init commit"
-git remote add origin git@github.com:cjtu/iirspy.git
-git push -u origin main
-```
+## Georeference to LOLA DEM
 
-### 2. Set Up Your Development Environment
+Using the `ldem_80s_20m` from LOLA.
 
-Then, install the environment and the pre-commit hooks with
+1. Read image with lat/lon extent in python and find nearest latitudes given in the geom `.csv` file
+2. Crop to desired lines using `gdal`
+3. Import into QGIS
+4. Select tie-points from `ldem` to IIRS image
+5. Warp DEM to image coords (bilinear interpolation, thin plate spline)
 
-```bash
-make install
-```
+## Correct IIRS in python
 
-This will also generate your `uv.lock` file
+1. Read IIRS L1 data from `.qub`
+2. Convert radiance units to SI (x0.01) [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
+   - (Optional) Find bad bands (`iirs_bad_bands.csv`) for this img's exposure and gain (`.xml`) and set those bands to nodata
+   - (Optional) Run the fourier destriper on the IIRS image to smooth artefacts
+3. Read solar spectrum (`ch2_iirs_solar_flux.txt`) and scale by solar distance (spice) at image collection time
+4. Get local solar incidence and azimuth for each line of the image from `.spm`
+   - (Optional) Adjust solar incidence by dem
+     - Resample the `ldem` to the resolution of the IIRS image
+     - Get slope from gradient of `ldem`
+     - Dot product between solar inc/az vector and surface normal vector
+5. Do I/F refl correction (radiance / (cos_inc \* solar_flux)) on all pixels
+   - (Optional): apply spectral polish (don't - makes the spectra worse)
+   - (Optional): apply spectral smoothing (usually do the 3-band boxcar)
+6. Write to geotif or envi img/hdr format
+   - (Optional): Edit envi hdr / geotiff metadata to add wavelength band labels
 
-### 3. Run the pre-commit hooks
+## Georeference image
 
-Initially, the CI/CD pipeline might be failing due to formatting issues. To resolve those run:
-
-```bash
-uv run pre-commit run -a
-```
-
-### 4. Commit the changes
-
-Lastly, commit the changes made by the two steps above to your repository.
-
-```bash
-git add .
-git commit -m 'Fix formatting issues'
-git push origin main
-```
-
-You are now ready to start development on your project!
-The CI/CD pipeline will be triggered when you open a pull request, merge to main, or when you create a new release.
-
-To finalize the set-up for publishing to PyPI, see [here](https://fpgmaas.github.io/cookiecutter-uv/features/publishing/#set-up-for-pypi).
-For activating the automatic documentation with MkDocs, see [here](https://fpgmaas.github.io/cookiecutter-uv/features/mkdocs/#enabling-the-documentation-on-github).
-To enable the code coverage reports, see [here](https://fpgmaas.github.io/cookiecutter-uv/features/codecov/).
-
-## Releasing a new version
-
-
-
----
-
-Repository initiated with [fpgmaas/cookiecutter-uv](https://github.com/fpgmaas/cookiecutter-uv).
+- Read reflectance image into QGIS
+- Choose tie points (or use the previous ones for dem, reversed)
+- Project to Spole stereo (`IAU_2015:30135`)
