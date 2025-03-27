@@ -40,7 +40,7 @@ IIRS_PROJ_DICT = {
 
 
 ## Reflectance corr
-def iirs_refl(  # noqa: C901 `iirs_refl` is too complex
+def iirs_refl(
     fqub,
     fspm,
     fgeom="",
@@ -59,51 +59,46 @@ def iirs_refl(  # noqa: C901 `iirs_refl` is too complex
     drop_bad_bands=True,
     bad_bands_buffer=0,
     bad_band_mask=None,
-    thermal=False,
+    thermal="verma",
     ychunks=4000,
     max_refl=np.inf,
     destripe=False,
     **destripe_kws,
 ):
     """
-    Convert IIRS L1 radiance to L2 reflectance using I/f folmula:
-
-    F = foc / (π*d^2)
-    R = I / (μo * F)
-
-    Where foc is the spectral solar irradiance convolved with the relative
-    response function of IIRS from PRADAN (ch2_iirs_solar_flux.txt), d is the
-    solar distance (AU), μo is the cosine of the solar incidence angle, and I
-    is the L1 IIRS spectral radiance.
-
-    Optionally reads GCPs from metadata and returns a geotif
-    (note: low accuracy near the poles).
-    Optionally smooths spectra with a boxcar filter along wavelength.
-    Optionally applies fourier smoothing to remove vertical/horizontal stripes.
-    TODO: Optionally computes a thermal correction for the NIR bands.
-
-    Parameters
-    ----------
-    fqub (str or path): IIRS L1 radiance ".qub" file.
-    fspm (str or path): IIRS sun parameter ".spm" file.
-    fgeom (str or path): IIRS geometry ".csv" file.
-    fout (str): Path to write reflectance image (.img for ENVI, .tif for geotiff).
-    fflux (str): Path to IIRS solar flux input file.
-    extent(tuple): (xmin, xmax, ymin, ymax) in degrees if fgeom is given, otherwise in pixels.
-    smoothing (int): Smooth spectra ('none', 'boxcar', 'gaussian').
-    swindow (int): Window size for smoothing (must be odd for gaussian).
-    polish (bool): Apply IIRS spectral polish from FPOLISH (default: False)
-    fpolish (str or path): CSV with columns: band, polish (default: spectral_polish_verma2022.csv)
-    drop_bad_bands (bool): Set bad bands defined in the IIRS SIS to NaN.
-    bad_bands_buffer (int): Number of additional bands on either side of bad bands to also set to NaN.
-    bad_band_mask (arr of bool): Manually specified array of len(bands) where True indicates a bad band to drop.
-    destripe (bool): Whether to apply fourier destriping routine.
-    destripe_kws (dict): Options for destriping (see fourier_filter).
-    ychunks (dict): How many lines to chunk input image into using dask.
+    Convert IIRS L1 radiance to L2 reflectance using I/f formula.
     """
-    bands = slice(None, None)
-    if not thermal:
-        bands = slice(None, 101)  # Exclude bands > 2.4um if not doing thermal correction
+    # Step 1: Read and preprocess the input data
+    da, gridlon, gridlat, xyext = preprocess_input_data(fqub, fgeom, ftif, extent, ychunks=ychunks)
+
+    # Step 2: Handle bad bands
+    if drop_bad_bands:
+        da = handle_bad_bands(da, fqub, bad_band_mask, bad_bands_buffer)
+
+    # Step 3: Apply destriping if needed
+    if destripe:
+        da = apply_destriping(da, **destripe_kws)
+
+    # Step 4: Perform reflectance correction
+    da = apply_reflectance_correction(da, fqub, fspm, fflux, dem, finc, fiaz, shift_iaz, thermal, max_refl)
+
+    # Step 5: Apply optional spectral polish
+    if polish:
+        da = apply_spectral_polish(da, fpolish)
+
+    # Step 6: Apply smoothing
+    if smoothing.lower() != "none":
+        da = apply_smoothing(da, smoothing, swindow)
+
+    # Step 7: Write output if specified
+    if fout:
+        write_output(da, fout, fgeom, gridlon, gridlat, xyext, ftif)
+
+    return da
+
+
+def preprocess_input_data(fqub, fgeom, ftif, extent, ychunks):
+    """Read and preprocess input data."""
     # If fgeom is given, interpret extent as degrees, otherwise interpret as pixels
     if fgeom:
         gridlon, gridlat, xyext = geom2grid(fgeom, extent)
@@ -113,58 +108,79 @@ def iirs_refl(  # noqa: C901 `iirs_refl` is too complex
 
     # Read IIRS L1 radiance in [1000 mW/cm^2/sr/um]
     if ftif:
-        da = xr.open_dataarray(ftif, engine="rasterio").sel(band=bands)
+        da = xr.open_dataarray(ftif, engine="rasterio")
     else:
-        da = xr.open_dataarray(fqub, engine="rasterio").sel(x=slice(xmin, xmax), y=slice(ymin, ymax), band=bands)
+        da = xr.open_dataarray(fqub, engine="rasterio").sel(x=slice(xmin, xmax), y=slice(ymin, ymax))
     if ychunks:
         da = da.chunk(y=ychunks, x=len(da.x), band=len(da.band))
     da = 0.01 * da  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
 
-    # (Optional): Sets bad bands to nan (bad bands based on gain,exposure)
-    if drop_bad_bands:
-        if bad_band_mask is None:
-            bad_band_mask = get_bad_bands(fqub, bad_bands_buffer)  # array where True == bad
-        da = da.where(~bad_band_mask[bands, None, None])
+    return da, gridlon, gridlat, xyext
 
-    # (Optional): Fourier filtering for vertical / horizontal artefacts
-    if destripe:
-        # TODO: check for off by one error (lines shifted up 1 pixel?)
-        # TODO: test on dask chunked images
-        da = fourier_filter(da, **destripe_kws)
 
+def handle_bad_bands(da, fqub, bad_band_mask, bad_bands_buffer):
+    """Handle bad bands by setting them to NaN."""
+    if bad_band_mask is None:
+        bad_band_mask = get_bad_bands(fqub, bad_bands_buffer)  # array where True == bad
+    da = da.where(~bad_band_mask[:, None, None])
+    return da
+
+
+def apply_destriping(da, **destripe_kws):
+    """Apply Fourier destriping to the data."""
+    da = fourier_filter(da, **destripe_kws)
+    return da
+
+
+def apply_reflectance_correction(da, fqub, fspm, fflux, dem, shift_iaz, thermal, max_refl):
+    """Perform reflectance correction using I/F formula."""
     # Reflectance correction: I/F
     # Get solar spectrum
     L = pd.read_csv(fflux, sep="\t", header=None, names=["wl", "flux"])
-    wl = L["wl"].values[bands, None, None] * 1e-9  # wl [m]
+    wl = L["wl"].values[:, None, None] * 1e-9  # wl [m]
     sdist = get_solar_distance(fqub)
-    F = L["flux"].values[bands, None, None] * 10 / (np.pi * sdist**2)  # Solar flux [W/m^2/sr/um]
+    F = L["flux"].values[:, None, None] * 10 / (np.pi * sdist**2)  # Solar flux [W/m^2/sr/um]
+    da = da.assign_coords(wl=("band", np.round(wl.squeeze() * 1e9, 3)))
 
     # Get solar incidence for each line of image
-    inc, iaz = get_iirs_inc_az(fqub, fspm, yrange=(int(ymin), int(ymin) + len(da.y)))
+    inc, iaz = get_iirs_inc_az(fqub, fspm, yrange=(int(da.y[0]), int(da.y[0]) + len(da.y)))
     cos_inc = np.cos(np.radians(inc[None, :, None]))
 
     # (Optional): adjust cos_inc relative to dem
     if dem is not None:
         if not hasattr(dem, "sel"):
             dem = xr.open_dataarray(dem, engine="rasterio").sel(band=1)
-        if finc:
-            inc = xr.open_dataarray(finc, engine="rasterio").sel(band=1)
-        if fiaz:
-            iaz = xr.open_dataarray(fiaz, engine="rasterio").sel(band=1)
-            iaz -= shift_iaz
+        # TODO: check if this is correct condition
+        # if yflip:
+        #     iaz -= shift_iaz
         dem = dem.rio.reproject_match(da.sel(band=1))
         dem = dem.assign_coords(x=da.x, y=da.y)
         cos_inc = get_cos_inc_dem(dem, inc, iaz).values[None, :, :]
 
+    # Get thermal component
+    trad = 0
+    if thermal == "verma":
+        trad = get_thermal_rad_verma(da, wl)
+
     # Convert to I/F reflectance
-    da = da / (cos_inc * F)
+    da = (da - trad) / (cos_inc * F)
 
-    # (Optional): Apply statistical polish to reflectance (coeffs from Verma et al. (2022) - see https://github.com/prabhakaralok/CH2IIRS)
-    if polish:
-        spec_polish = pd.read_csv(fpolish).set_index("band").to_xarray()
-        da /= spec_polish.sel(band=bands)
+    # Remove bad values, reduce precision for writing
+    da = da.where((da >= 0) & (da <= max_refl))  # .astype("float32")
+    da = da.assign_coords(wl=("band", np.round(wl.squeeze() * 1e9, 2)))
 
-    # (Optional): Smooth the spectra on each pixel
+    return da
+
+
+def apply_spectral_polish(da, fpolish):
+    """Apply spectral polish to the reflectance data."""
+    spec_polish = pd.read_csv(fpolish).set_index("band").to_xarray()
+    da /= spec_polish.sel(band=slice(None, 101))
+    return da
+
+
+def apply_smoothing(da, smoothing, swindow):
+    """Smooth the spectra using boxcar or Gaussian smoothing."""
     if smoothing.lower() == "boxcar":
         # Moving average over wavelength (test this since .mean on a rolling array may not handle NaNs correctly)
         da = da.rolling({"band": swindow}, center=True, min_periods=swindow / 2).mean(["band"])
@@ -183,25 +199,25 @@ def iirs_refl(  # noqa: C901 `iirs_refl` is too complex
             .dot(weights)
             .where(~da.isnull())
         )
+    return da
 
-    # Remove bad values, reduce precision for writing
-    da = da.where((da >= 0) & (da <= max_refl))  # .astype("float32")
-    da = da.assign_coords(wl=("band", np.round(wl.squeeze() * 1e9, 2)))
+
+def write_output(da, fout, fgeom, gridlon, gridlat, xyext, ftif):
+    """Write the processed data to the specified output file."""
     da.rio.write_crs("IAU_2015:30135", inplace=True)
     da.rio.write_nodata(np.nan, inplace=True)
-
-    # (Optional): Write image to file
-    if fout:
-        if fout[-4:].lower() == ".img":
-            write_envi(da, fout)
-        elif fgeom and fout[-4:].lower() == ".tif" and not ftif:
-            da = warp2grid(da, xyext, gridlon, gridlat)
-            da = da.swap_dims({"band": "wl"})
-            da.rio.to_raster(fout, driver="GTiff", compress="LZW")
-        else:
-            da = da.swap_dims({"band": "wl"})
-            da.rio.to_raster(fout)
-    return da
+    if fout[-4:].lower() == ".img":
+        write_envi(da, fout)
+    elif fgeom and fout[-4:].lower() == ".tif" and not ftif:
+        da = warp2grid(da, xyext, gridlon, gridlat)
+        da = da.swap_dims({"band": "wl"})
+        da.rio.to_raster(fout, driver="GTiff", compress="LZW")
+    else:
+        da = da.swap_dims({"band": "wl"})
+        da.rio.to_raster(fout)
+        with rasterio.open(fout, "r+", driver="GTiff") as dst:
+            dst.descriptions = tuple([str(w) for w in da.wl])
+            # TODO fix wavelength metadata
 
 
 def iirs_refl_verma(da, inc=None, smoothing=3, fflux=FSOLAR, fpolish=FPOLISH):
@@ -255,6 +271,25 @@ def iirs_refl_verma(da, inc=None, smoothing=3, fflux=FSOLAR, fpolish=FPOLISH):
     # Attach wls
     da = da.assign_coords(wl=("band", wl.squeeze() * 1e9))
     return da
+
+
+def get_thermal_rad_verma(da, wl, eps=0.95, tbands=(224, 246)):
+    """
+    Return thermal radiance assuming isothermal surface as Verma et al. (2022).
+    """
+    c = 3e8
+    h = 6.626e-34
+    k = 1.38e-23
+
+    # Computes BT assuming emissivity and a blackbody
+    q = np.log(eps * 2 * h * c**2 * 1e-6 / (da * wl**5) + 1)
+    bt = h * c / (wl * k * q)
+
+    # Remove bbr(avg_BT) assuming surface is isothermal
+    # Only use wavelengths within tbands for T estimation (default 4500 to 4875)
+    btavg = bt.isel(band=slice(*tbands)).mean("band")
+    bbr = 1e-6 * (2 * h * c * c / wl**5) * 1 / (np.exp(h * c / (wl * k * btavg.values)) - 1)
+    return eps * bbr
 
 
 def get_reflectance_factor(fimg, fspm):
@@ -808,10 +843,7 @@ def write_envi(da, fout):
         for i in range(nz):
             dst.write(da.isel(band=i).values, i + 1)
             dst.set_band_description(i + 1, wls[i])
-
-
-## Thermal corr
-# TODO
+            # TODO fix wavelength metadata
 
 
 ## Image smoothing
