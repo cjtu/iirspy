@@ -9,7 +9,6 @@ import numpy as np
 import pandas as pd
 import pdr
 import rasterio
-import rioxarray
 
 # import xarray_regrid
 import xarray as xr
@@ -47,7 +46,6 @@ def iirs_refl(
     fout="",
     ftif="",
     md5checksum=False,
-    yflip=False,
     fflux=FSOLAR,
     dem=None,
     extent=(None, None, None, None),
@@ -76,7 +74,7 @@ def iirs_refl(
             checksum(fgeom)
 
     # Step 1: Read and preprocess the input data
-    da = preprocess_input_data(fqub, fgeom, fspm, ftif, extent, yrange, yflip, ychunks)
+    da = preprocess_input_data(fqub, fgeom, fspm, ftif, extent, yrange, ychunks)
 
     # Step 2: Handle bad bands
     if drop_bad_bands:
@@ -104,7 +102,7 @@ def iirs_refl(
     return da
 
 
-def preprocess_input_data(fqub, fgeom, fspm, ftif, extent, yrange, yflip, ychunks):
+def preprocess_input_data(fqub, fgeom, fspm, ftif, extent, yrange, ychunks):
     """Read and preprocess input data."""
     # Read in dataarray. If tif, assume it is L1 radiance that is already cropped
     if ftif:
@@ -122,6 +120,13 @@ def preprocess_input_data(fqub, fgeom, fspm, ftif, extent, yrange, yflip, ychunk
         da = da.chunk(y=ychunks, x=len(da.x), band=len(da.band))
 
     # Add geometry
+    orbit_dir = pdr.open(fqub).metaget("isda:orbit_limb_direction").lower()  # Ascending or Descending
+    if orbit_dir == "ascending":
+        yflip = False
+    elif orbit_dir == "descending":
+        yflip = True
+    else:
+        print("Unknown orbit, assuming ascending")
     if fgeom:
         # Ascending
         yoff = 51
@@ -136,12 +141,14 @@ def preprocess_input_data(fqub, fgeom, fspm, ftif, extent, yrange, yflip, ychunk
 
     # Get solar incidence for each line of image
     inc, iaz = get_iirs_inc_az(fqub, fspm, yrange)
-    # Adjust for direction of image collection
     if yflip:
         iaz -= 180
-        da.coords["y"] = min(da.y) - da.y
     da = da.assign_coords(inc=("y", inc))
     da = da.assign_coords(iaz=("y", iaz))
+
+    # Adjust for direction of image collection
+    if yflip:
+        da.coords["y"] = min(da.y) - da.y
 
     # IIRS L1 radiance is in [1000 mW/cm^2/sr/um]
     da = 0.01 * da  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
@@ -179,6 +186,8 @@ def apply_reflectance_correction(da, fqub, fflux, dem, thermal, max_refl):
     if dem is not None:
         if not hasattr(dem, "sel"):
             dem = xr.open_dataarray(dem, engine="rasterio").sel(band=1)
+            if dem.shape == (2822, 2789):  # TODO: fix and delete
+                dem.coords["y"] = -dem.y
         # dem = dem.rio.reproject_match(da.sel(band=1))
         # dem = dem.assign_coords(x=da.x, y=da.y)
         dem = dem.interp_like(da.isel(band=1), method="slinear")
@@ -316,7 +325,7 @@ def get_thermal_rad_verma(da, wl, eps=0.95, tbands=(224, 246)):
     # Remove bbr(avg_BT) assuming surface is isothermal
     # Only use wavelengths within tbands for T estimation (default 4500 to 4875)
     btavg = bt.isel(band=slice(*tbands)).mean("band")
-    bbr = 1e-6 * (2 * h * c * c / wl**5) * 1 / (np.exp(h * c / (wl * k * btavg.values)) - 1)
+    bbr = 1e-6 * (2 * h * c * c / wl**5) * 1 / (np.exp(h * c / (wl * k * btavg)) - 1)
     return eps * bbr
 
 
@@ -350,8 +359,6 @@ def get_cos_inc_dem(dem, inc, iaz, latitudes):
     kernel_y = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]]) / (8 * res_y)
 
     # Calculate derivatives
-    # dz_dx = convolve(dem.values, kernel_x)
-    # dz_dy = convolve(dem.values, kernel_y)
     dz_dx = xr.apply_ufunc(
         convolve,
         dem,
@@ -381,29 +388,35 @@ def get_cos_inc_dem(dem, inc, iaz, latitudes):
     nz = nz / norm_factor
 
     # Convert incidence and azimuth to radians
+    inc = inc
     inc_rad = np.radians(inc)
     iaz_rad = np.radians(iaz)
 
     # Calculate sun vector components [sx, sy, sz] for each row
-    sx = np.cos(inc_rad) * np.cos(iaz_rad)  # East component
-    sy = np.cos(inc_rad) * np.sin(iaz_rad)  # North component
-    sz = np.sin(inc_rad)  # Up component
+    sx = np.sin(inc_rad) * np.sin(iaz_rad)  # East component
+    sy = np.sin(inc_rad) * np.cos(iaz_rad)  # North component
+    sz = np.cos(inc_rad)  # Up component
 
     # Adjust sun vector for local latitude
     lat_rad = np.radians(latitudes)
-    sy = sy * np.sin(lat_rad) + sz * np.cos(lat_rad)
-    sz = sz * np.sin(lat_rad) - sy * np.cos(lat_rad)
+    sy_adj = sy * np.cos(lat_rad) - sz * np.sin(lat_rad)
+    sz_adj = sy * np.sin(lat_rad) + sz * np.cos(lat_rad)
 
-    # Reshape sun vector for broadcasting
-    # sx = sx[:, np.newaxis]  # Shape becomes (lines, 1)
-    # sy = sy[:, np.newaxis]
-    # sz = sz[:, np.newaxis]
+    # Replace original sy and sz with adjusted values
+    sy = sy_adj
+    sz = sz_adj
 
     # Compute dot product between normal and sun vector for each pixel
     cos_inc = nx * sx + ny * sy + nz * sz
 
+    # Debugging: Print intermediate values for testing
+    if np.any(np.isnan(cos_inc)):
+        print("NaN values detected in cos_inc. Check inputs and calculations.")
+    if np.min(cos_inc) < 0:
+        print("Negative cos_inc values detected. Verify sun vector and surface normal calculations.")
+
     # Handle negative values (local shadows)
-    cos_inc = np.clip(cos_inc, 0, 1)
+    # cos_inc = np.clip(cos_inc, 0, 1)
     return cos_inc
 
 
@@ -501,18 +514,18 @@ def warp2gcps(fqub, da, gcps, gcps_crs, fout, method="bilinear"):
 
 def fix_metadata(fout, wls):
     """Fix metadata for geotiff to match original qub."""
-    # with rasterio.open(fout, "r+", driver="GTiff") as dst:
-    #     dst.descriptions = tuple([str(wl) for wl in wls])
+    with rasterio.open(fout, "r+", driver="GTiff") as dst:
+        dst.descriptions = tuple([str(wl) for wl in wls])
 
-    ds = rioxarray.open_rasterio(fout, band_as_variable=True)
+    # ds = rioxarray.open_rasterio(fout, band_as_variable=True, engine='rasterio')
+    # ds.attrs["name"] = "radiance"  # 'reflectance'
+    # ds.attrs["longname"] = "radiance (µW/cm^2/sr/µm)"  # 'reflectance'
+    # # ds.attrs['lines'] = ds.sizes['lat']
+    # # ds.attrs['samples'] = ds.sizes['lon']
 
-    ds.attrs["name"] = "radiance"  # 'reflectance'
-    ds.attrs["longname"] = "radiance (µW/cm^2/sr/µm)"  # 'reflectance'
-    # ds.attrs['lines'] = ds.sizes['lat']
-    # ds.attrs['samples'] = ds.sizes['lon']
-
-    # Assign wavelength labels
-    ds = ds.rename({f"band_{i + 1}": wl for i, wl in enumerate(wls)})
+    # # Assign wavelength labels
+    # ds = ds.rename({f"band_{i + 1}": wl for i, wl in enumerate(wls)})
+    # ds.rio.to_raster(fout)
 
     # for band in ds.band.values:
     #     # TODO: Compute and store band stats?
