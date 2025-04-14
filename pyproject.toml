@@ -1,6 +1,6 @@
 [project]
 name = "iirspy"
-version = "0.0.1"
+version = "0.0.2"
 description = "Handling and correcting Chandrayaan-2 IIRS data in Python."
 authors = [{ name = "Christian J. Tai Udovicic", email = "cj.taiudovicic@gmail.com" }]
 readme = "README.md"
