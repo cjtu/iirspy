@@ -1,4 +1,5 @@
 import hashlib
+import re
 import warnings
 import zipfile
 from importlib.resources import files
@@ -27,6 +28,7 @@ warnings.filterwarnings("ignore", message="Dataset has no geotransform")
 data_dir = files("iirspy").joinpath("data")
 
 # Example usage
+CHUNKSIZE = 200e6  # [MB] chunk large images into this size with dask to fit in RAM (typically between 100MB-1GB)
 FPOLISH = str(data_dir.joinpath("spectral_polish_verma2022.csv"))
 FBADBANDS = str(data_dir.joinpath("iirs_bad_bands.csv"))
 FSOLAR = str(data_dir.joinpath("ch2_iirs_solar_flux.txt"))
@@ -227,7 +229,7 @@ def apply_smoothing(da, smoothing, swindow):
         # note: this interpolates NaN to allow spectra to be smooth up to a NaN band
         #  we then need to reapply the NaNs at the end. More steps and more expensive than moving avg
         if not swindow % 2:
-            raise ValueError("Gaussian swindow must be odd.")  # noqa: TRY003
+            raise ValueError("Gaussian swindow must be odd.")
         gaussian = norm(loc=0, scale=1).pdf(np.arange(swindow) - swindow // 2)
         weights = xr.DataArray(gaussian / gaussian.sum(), dims=["window"])
         da = (
@@ -620,8 +622,19 @@ def unzip(fzip, ddir):
         zip_ref.extractall(ddir)
 
 
+def iirsbasename(input_str):
+    """Return the image basename from str_in (e.g., 20201226T1745264921)"""
+    pattern = r"\d{8}T\d{10}"
+    try:
+        return re.search(pattern, input_str).group()
+    except AttributeError as e:
+        raise ValueError(f"Can't parse basename: {input_str}") from e
+
+
 def get_iirs_paths(ddir, exts=("qub", "hdr", "xml", "csv", "xml-csv", "lbr", "oat", "oath", "spm")):
     """Return a list of paths to IIRS image, geom, and misc files."""
+    # TODO: Fix search for L0 data (and base off basename glob?)
+
     out = {}
     for ext in exts:
         subdir = "."
