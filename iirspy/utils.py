@@ -24,20 +24,20 @@ from scipy.stats import norm
 warnings.filterwarnings("ignore", message="Dataset has no geotransform")
 
 ## Constants
-# Access the data directory
-data_dir = files("iirspy").joinpath("data")
+PKG_DATA = files("iirspy").joinpath("data")
 
-# Example usage
 CHUNKSIZE = 200e6  # [MB] chunk large images into this size with dask to fit in RAM (typically between 100MB-1GB)
-FPOLISH = str(data_dir.joinpath("spectral_polish_verma2022.csv"))
-FBADBANDS = str(data_dir.joinpath("iirs_bad_bands.csv"))
-FSOLAR = str(data_dir.joinpath("ch2_iirs_solar_flux.txt"))
+FPOLISH = str(PKG_DATA.joinpath("spectral_polish_verma2022.csv"))
+FBADBANDS = str(PKG_DATA.joinpath("iirs_bad_bands.csv"))
+FSOLAR = str(PKG_DATA.joinpath("ch2_iirs_solar_flux.txt"))
 # Projections used in the Ch2 IIRS selenoref tool https://doi.org/10.1007/s12524-024-01814-4
 IIRS_PROJ_DICT = {
     "equatorial": 'PROJCS["Moon_Equidistant_Cylindrical",GEOGCS["Moon 2000",DATUM["D_Moon_2000",SPHEROID["Moon_2000_IAU_IAG",1737400.0,0.0]],PRIMEM["Greenwich",0],UNIT["Decimal_Degree",0.0174532925199433]],PROJECTION["Equidistant_Cylindrical"],PARAMETER["False_Easting",0],PARAMETER["False_Northing",0],PARAMETER["Central_Meridian",0],PARAMETER["Standard_Parallel_1",0],UNIT["Meter",1]]',
     "polarstereographicsouthpole": 'PROJCS["Moon_South_Pole_Stereographic",GEOGCS["Moon 2000",DATUM["D_Moon_2000",SPHEROID["Moon_2000_IAU_IAG",1737400.0,0.0]],PRIMEM["Greenwich",0],UNIT["Decimal_Degree",0.0174532925199433]],PROJECTION["Stereographic"],PARAMETER["False_Easting",0],PARAMETER["False_Northing",0],PARAMETER["Central_Meridian",0],PARAMETER["Scale_Factor",1],PARAMETER["Latitude_Of_Origin",-90],UNIT["Meter",1]]',
     "polarstereographicnorthpole": 'PROJCS["Moon_North_Pole_Stereographic",GEOGCS["Moon 2000",DATUM["D_Moon_2000",SPHEROID["Moon_2000_IAU_IAG",1737400.0,0.0]],PRIMEM["Greenwich",0],UNIT["Decimal_Degree",0.0174532925199433]],PROJECTION["Stereographic"],PARAMETER["False_Easting",0],PARAMETER["False_Northing",0],PARAMETER["Central_Meridian",0],PARAMETER["Scale_Factor",1],PARAMETER["Latitude_Of_Origin",90],UNIT["Meter",1]]',
 }
+# Convert data level to "Mission-Type-Camera" identifier
+LVL2MTC = {0: "nri", 1: "nci", 2: "ndi"}
 
 
 ## Reflectance corr
@@ -390,7 +390,6 @@ def get_cos_inc_dem(dem, inc, iaz, latitudes):
     nz = nz / norm_factor
 
     # Convert incidence and azimuth to radians
-    inc = inc
     inc_rad = np.radians(inc)
     iaz_rad = np.radians(iaz)
 
@@ -616,10 +615,23 @@ def read_gcps(fgcps):
     return gcps, crs
 
 
-def unzip(fzip, ddir):
-    """Unzip a file to a directory."""
-    with zipfile.ZipFile(fzip, "r") as zip_ref:
-        zip_ref.extractall(ddir)
+def unzip_iirs(ddir, basename, level, md5checksum=True):
+    """Find zipped IIRS image from PRADAN ISSDC, unzip and run checksum."""
+    mtc = LVL2MTC[level]
+    f = next((f for f in Path(ddir).glob(f"**/*{mtc}*.zip") if basename in f.stem), None)
+    if f is None:
+        raise ValueError(f"Image {basename} not found in {ddir}. Please download from PRADAN or check file path.")
+    with zipfile.ZipFile(f, "r") as zipf:
+        print(f"Extracting {basename} to {f.parent}")
+        zipf.extractall(f.parent)
+    paths = get_iirs_paths(f.parent, level=level, basenames=[basename])
+    if "qub" not in paths:
+        raise RuntimeError("Unzip failed.")
+    if checksum:
+        print("Verifying unzipped image...", end=" ")
+        checksum(paths["qub"][basename].as_posix())
+        print("Success!")
+    return paths
 
 
 def iirsbasename(input_str):
@@ -631,21 +643,45 @@ def iirsbasename(input_str):
         raise ValueError(f"Can't parse basename: {input_str}") from e
 
 
-def get_iirs_paths(ddir, exts=("qub", "hdr", "xml", "csv", "xml-csv", "lbr", "oat", "oath", "spm")):
+def get_iirs_paths(
+    ddir,
+    exts=("qub", "hdr", "xml", "csv", "xml-csv", "lbr", "oat", "oath", "spm", "png", "xml-png"),
+    level=1,
+    basenames=None,
+):
     """Return a list of paths to IIRS image, geom, and misc files."""
-    # TODO: Fix search for L0 data (and base off basename glob?)
 
+    def basename(img_path_obj):
+        """Return IIRS basename e.g. 20210122T0920157625 from pathlib path."""
+        return img_path_obj.stem.split("_")[3]
+
+    LVL2DIR = {0: "raw", 1: "calibrated", 2: "derived"}
     out = {}
     for ext in exts:
         subdir = "."
-        if ext in ("hdr", "qub", "xml"):
-            subdir = "data"
+        if ext in ("png", "xml-png"):
+            subdir = "browse/" + LVL2DIR[level]
+        elif ext in ("hdr", "qub", "xml"):
+            subdir = "data/" + LVL2DIR[level]
         elif ext in ("csv", "xml-csv"):
-            subdir = "geometry"
+            subdir = "geometry/calibrated"
+        elif ext in ("lbr", "oat", "oath", "spm"):
+            subdir = "miscellaneous/" + LVL2DIR[level]
         else:
-            subdir = "miscellaneous"
-        out[ext] = {f.stem.split("_")[3]: f for f in Path(ddir).glob(f'{subdir}/**/*.{ext.split("-")[0]}')}
-    out["imgs"] = list(out["qub"].keys())
+            raise ValueError(f"Unknown IIRS file extension: {ext}")
+        paths = Path(ddir).glob(f'**/{subdir}/**/*.{ext.split("-")[0]}')
+
+        if basenames is not None:
+            basenames = [basenames] if isinstance(basenames, str) else basenames
+            out[ext] = {basename(f): f for f in paths if basename(f) in basenames}
+        else:
+            out[ext] = {basename(f): f for f in paths}
+        # Drop this entry from dict if it is empty
+        if not out[ext]:
+            del out[ext]
+    # Add list of basenames to dict
+    if "qub" in out:
+        out["imgs"] = list(out["qub"].keys())
     return out
 
 
@@ -774,12 +810,12 @@ def load_bad_bands(fbad_bands=FBADBANDS):
     return ~pd.read_csv(fbad_bands, index_col=0).astype(bool)
 
 
-def get_exposore_gain(fimg):
+def get_exposure_gain(fimg):
     """Return exposure (E1-E4) and gain (G2) as eXgY string."""
     img = pdr.open(fimg)
     exposure = img.metaget("isda:exposure")
     gain = img.metaget("isda:gain")
-    return f"{exposure}{gain}"
+    return f"{exposure}{gain}".lower()
 
 
 def get_bad_bands(fimg, buffer=0):
@@ -788,7 +824,7 @@ def get_bad_bands(fimg, buffer=0):
 
     Set buffer number of bands to left and right of each bad band as bad.
     """
-    exp_gain = get_exposore_gain(fimg)  # e.g., "e1g2"
+    exp_gain = get_exposure_gain(fimg)  # e.g., "e1g2"
     bad_bands = load_bad_bands()[exp_gain].values  # array of True / False
 
     # Buffer - use kernel convolution to bump n adjacent bands, flag these as also bad
