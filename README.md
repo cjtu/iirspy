@@ -2,6 +2,14 @@
 
 Toolkit for working with ISRO's Chandrayaan-2 IIRS dataset. This is a work in progress - comes with no guarantees, is not yet tested, and is subject to change without notice!
 
+## Installation
+
+1. Fork / clone this repository.
+2. Get uv package manager [installation](https://github.com/astral-sh/uv?tab=readme-ov-file#installation)
+3. From the main `iirspy` directory run `uv run make test`
+    * This will make a new virtual environment and run the `iirspy` tests
+    * You can now use this `venv` from an IDE or `uv run ipython` for an interactive prompt
+
 ## Current Workflow
 
 1. Download IIRS data from the PRADAN / ISSDC system (requires an account).
