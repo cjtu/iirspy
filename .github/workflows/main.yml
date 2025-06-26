@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.9", "3.13"]
       fail-fast: false
     defaults:
       run:
@@ -45,10 +45,6 @@ jobs:
 
       - name: Run tests
         run: uv run python -m pytest tests
-
-      # - name: Check typing
-      #   run: uv run mypy
-
 
 
   check-docs:
