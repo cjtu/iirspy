@@ -48,13 +48,12 @@ class IIRSData(ABC):
             self.xml_csv = paths["xml-csv"].get(basename, "")
 
         # Store metadata from the qub file
-        self.metadata = self._extract_metadata(self.qub)
+        self.metadata = self._extract_metadata()
 
         # Read image
         self.img = xr.open_dataarray(self.qub, engine="rasterio")
         self.shape = self.img.shape
         self.nband, self.ny, self.nx = self.shape
-        self.bounds = self.img.rio.bounds()
 
         # Chunk with dask if needed
         if chunk and self.nband * self.ny * self.nx * 4 > utils.CHUNKSIZE:
@@ -63,9 +62,9 @@ class IIRSData(ABC):
                 chunk = {"band": self.nband, "y": dy, "x": self.nx}
             self.img = self.img.chunk(chunk)
 
-    def _extract_metadata(self, qub_file):
+    def _extract_metadata(self):
         """Extract relevant metadata from the given qub file."""
-        img = pdr.open(qub_file)
+        img = pdr.open(self.qub)
         metadata = {
             "projection": img.metaget("isda:projection"),
             "orbit_direction": img.metaget("isda:orbit_limb_direction"),  # L1 Only
@@ -78,10 +77,36 @@ class IIRSData(ABC):
         }
         return metadata
 
+    def metaget(self, key):
+        """Search metadata for key."""
+        return pdr.open(self.qub).metaget(key)
+
     @abstractmethod
     def plot(self, band=12, y=(None, None), x=(None, None), **kwargs):
-        """Plot image at band and x, y indices if supplied."""
-        pass
+        """
+        Plot image at band and x, y indices. Lowers resolution along y if large.
+        """
+        data = self.img.sel(band=band, y=slice(*y), x=slice(*x))
+
+        # Defaults
+        size = kwargs.pop("size", 5)
+        vmin = kwargs.pop("vmin", 0)
+        title = kwargs.pop("title", f"{self.basename}")
+        cmap = kwargs.pop("cmap", "inferno")
+        if "ax" not in kwargs:
+            kwargs["size"] = size  # Supply size only if ax not specified
+
+        # Coarsen data for quicker plot
+        if len(data.y) > 2000:
+            data = data.sel(y=slice(None, None, len(data.y) // 1000))
+
+        # Plot
+        p = data.plot(vmin=vmin, cmap=cmap, **kwargs)
+        ax = p.axes
+        ax.set_title(title)
+        ax.set_aspect("equal")
+
+        return p, ax
 
 
 class L0(IIRSData):
@@ -104,33 +129,40 @@ class L0(IIRSData):
         """
         super().__init__(basename, directory, extent, chunk, level=0)
         self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
+        self.bounds = self.img.rio.bounds()
 
-    def plot(self, band=12, y=(None, None), x=(None, None), north_up=True, **kwargs):
+    def plot(self, band=12, y=(None, None), x=(None, None), flip_xy=False, **kwargs):
         """Plot image at band and x, y indices if supplied."""
-        data = self.img.sel(band=band, y=slice(*y), x=slice(*x))
-
-        # Defaults
-        size = kwargs.pop("size", 5)
-        vmin = kwargs.pop("vmin", 0)
-        title = kwargs.pop("title", f"{self.basename}")
-        cmap = kwargs.pop("cmap", "inferno")
         cbarlabel = kwargs.pop("cbarlabel", "Digital Number")
+        p, ax = super().plot(band, (None, None), (None, None), **kwargs)
+        p.colorbar.ax.set_ylabel(cbarlabel, rotation=-90, va="bottom")
 
-        # Coarsen data for quicker plot
-        if len(data.y) > 2000:
-            data = data.sel(y=slice(None, None, len(data.y) // 1000))
-
-        # Plot
-        ax = data.plot(vmin=vmin, size=size, cmap=cmap, **kwargs)
-        ax.axes.set_title(title, fontsize=10)
-        ax.axes.set_aspect("equal")
-        ax.colorbar.ax.set_ylabel(cbarlabel, rotation=-90, va="bottom")
-
-        # Flip image if collected on descending orbit
-        if north_up and self.bounds[1] < self.bounds[3]:
-            ax.axes.yaxis.set_inverted(True)
-            ax.axes.xaxis.set_inverted(True)
+        # Flip image if flip_xy (can plot a descending orbit with north up)
+        if flip_xy:
+            ax.yaxis.set_inverted(True)
+            ax.xaxis.set_inverted(True)
         return ax
+
+    def calibrate_to_rad(self, calib_dir="", denoise_gain=False):
+        """
+        Perform IIRS L0 digital number to L1 radiance calibration.
+
+        Steps:
+        0) (Raw data is already dark subtracted).
+        1) Find and apply gain and offset from lookup table.
+        2) (Optional) destripe.
+        3) Convert to radiance [mW cm^-2 sr^-1 um^-1]
+        4) (Not implemented) Postprocessing (keystone correction, radiance adjustment in OSF and at edges).
+        5) Write to file as 32-bit floating point binary BSQ.
+        """
+        gain_off_lut = utils.get_lut_file(self.qub, calib_dir=calib_dir)
+        gain, offset = utils.get_gain_offset(gain_off_lut, denoise_gain)
+
+        # Apply gain and offset to convert DN -> Radiance
+        rad = self.img * gain + offset
+        rad.name = "Radiance [µW/cm^2/sr/µm]"
+
+        return rad
 
 
 class L1(IIRSData):
@@ -170,33 +202,53 @@ class L1(IIRSData):
         if all(e is None for e in extent):
             self.extent = xy_extent
         self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
+        self.bounds = self.img.rio.bounds()
 
         # Fix units
         self.img *= 0.01  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
 
     def plot(self, band=12, y=(None, None), x=(None, None), north_up=True, **kwargs):
         """Plot image at band and x, y indices if supplied."""
-        data = self.img.sel(band=band, y=slice(*y), x=slice(*x))
-
-        # Defaults
-        size = kwargs.pop("size", 5)
-        vmin = kwargs.pop("vmin", 0)
-        title = kwargs.pop("title", f"{self.basename}")
-        cmap = kwargs.pop("cmap", "inferno")
         cbarlabel = kwargs.pop("cbarlabel", "Radiance [$W/m^2/sr/um$]")
-
-        # Coarsen data for quicker plot
-        if len(data.y) > 2000:
-            data = data.sel(y=slice(None, None, len(data.y) // 1000))
-
-        # Plot
-        ax = data.plot(vmin=vmin, size=size, cmap=cmap, **kwargs)
-        ax.axes.set_title(title, fontsize=10)
-        ax.axes.set_aspect("equal")
-        ax.colorbar.ax.set_ylabel(cbarlabel, rotation=-90, va="bottom")
+        p, ax = super().plot(band, (None, None), (None, None), **kwargs)
+        p.colorbar.ax.set_ylabel(cbarlabel, rotation=-90, va="bottom")
 
         # Flip image if collected on descending orbit
         if north_up and self.metadata.get("orbit_direction", "").lower() == "descending":
-            ax.axes.yaxis.set_inverted(True)
-            ax.axes.xaxis.set_inverted(True)
+            ax.yaxis.set_inverted(True)
+            ax.xaxis.set_inverted(True)
         return ax
+
+    def calibrate_to_refl(self):
+        """
+        Perform IIRS L1 radiance to L2 I/f reflectance calibration.
+
+        Steps:
+        """
+        raise NotImplementedError("Work in progress.")
+        # # Step 1: Read and preprocess the input data
+        # da = utils.preprocess_input_data(self.qub, self.geom, self.spm, ftif, self.extent)
+
+        # # Step 2: Handle bad bands
+        # if drop_bad_bands:
+        #     da = utils.handle_bad_bands(da, self.qub)
+
+        # # Step 3: Apply destriping if needed
+        # if destripe:
+        #     da = utils.apply_destriping(da, **destripe_kws)
+
+        # # Step 4: Perform reflectance correction
+        # da = utils.apply_reflectance_correction(da, self.qub, fflux, dem, thermal, max_refl)
+
+        # # Step 5: Apply optional spectral polish
+        # if polish:
+        #     da = utils.apply_spectral_polish(da, fpolish)
+
+        # # Step 6: Apply smoothing
+        # if smoothing.lower() != "none":
+        #     da = utils.apply_smoothing(da, smoothing, swindow)
+
+        # # Step 7: Write output if specified
+        # if fout:
+        #     utils.write_output(da, fout, self.geom, self.extent, ftif)
+        # return da

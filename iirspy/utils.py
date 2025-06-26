@@ -25,7 +25,7 @@ warnings.filterwarnings("ignore", message="Dataset has no geotransform")
 
 ## Constants
 PKG_DATA = files("iirspy").joinpath("data")
-
+DCALIB = PKG_DATA.joinpath("iir/calibration")
 CHUNKSIZE = 200e6  # [MB] chunk large images into this size with dask to fit in RAM (typically between 100MB-1GB)
 FPOLISH = str(PKG_DATA.joinpath("spectral_polish_verma2022.csv"))
 FBADBANDS = str(PKG_DATA.joinpath("iirs_bad_bands.csv"))
@@ -123,6 +123,7 @@ def preprocess_input_data(fqub, fgeom, fspm, ftif, extent, yrange, ychunks):
 
     # Add geometry
     orbit_dir = pdr.open(fqub).metaget("isda:orbit_limb_direction").lower()  # Ascending or Descending
+    yflip = False
     if orbit_dir == "ascending":
         yflip = False
     elif orbit_dir == "descending":
@@ -157,7 +158,7 @@ def preprocess_input_data(fqub, fgeom, fspm, ftif, extent, yrange, ychunks):
     return da
 
 
-def handle_bad_bands(da, fqub, bad_band_mask, bad_bands_buffer):
+def handle_bad_bands(da, fqub, bad_band_mask=None, bad_bands_buffer=0):
     """Handle bad bands by setting them to NaN."""
     if bad_band_mask is None:
         bad_band_mask = get_bad_bands(fqub, bad_bands_buffer)  # array where True == bad
@@ -836,6 +837,69 @@ def get_bad_bands(fimg, buffer=0):
     return bad_buffered  # array of True where band is bad
 
 
+def get_lut_file(fimg, lut_type="lut_coeff", calib_dir=DCALIB):
+    """
+    Locate and return the correct LUT file for the given image.
+
+    Parameters
+    ----------
+    fimg : str
+        Path to the IIRS image file.
+    lut_type : str
+        Type of LUT to find (default: "lut_coeff").
+        Options: "lut_coeff", "saturations_radiance"
+    calib_dir : str or Path
+        Directory containing calibration LUT files.
+    ext : str
+        File extension to look for (default: "csv").
+        Options: "csv", "xml"
+
+    Returns
+    -------
+    Path to the LUT file as a string.
+
+    Raises
+    ------
+    FileNotFoundError if the LUT file is not found.
+    """
+    exp_gain = get_exposure_gain(fimg)  # e.g., "e1g2"
+    pattern = f"ch2_iirs_cal_{exp_gain}_{lut_type}.csv"
+    flut = Path(calib_dir) / pattern
+    if flut.exists():
+        return str(flut)
+    raise FileNotFoundError(f"IIRS calibration file {flut} not found.")
+
+
+def get_gain_offset(flut, denoise=False):
+    """
+    Return the IIRS gain and offset for fimg as DataArrays.
+
+    Parameters
+    ----------
+    flut : str
+        Path to the lookup table file.
+    denoise: bool
+        Replace speckly noise from gain / offset with NaN.
+    """
+    lut = np.loadtxt(flut, delimiter=",").reshape((256, 250, 2))
+    coords = {"band": 1 + np.arange(0, 256), "x": 0.5 + np.arange(250)}
+    gain = xr.DataArray(lut[:, :, 0], coords=coords, name="gain")
+    off = xr.DataArray(lut[:, :, 1], coords=coords, name="offset")
+    if denoise:
+        # Outlier detection with moving window and local median deviations
+        thresh = 40  # Empirical - seemed to filter out noise
+        window = gain.rolling({"band": 3, "x": 5}, center=True, min_periods=1)
+        meddev = abs(gain - window.median())
+        meddev_norm = meddev / meddev.median()
+        gain = gain.where(meddev_norm < thresh)
+
+        window = off.rolling({"band": 3, "x": 5}, center=True, min_periods=1)
+        meddev = abs(off - window.median())
+        meddev_norm = meddev / meddev.median()
+        off = off.where(meddev_norm < thresh)
+    return gain, off
+
+
 def get_solar_distance(fimg):
     """Return the solar distance from the IIRS metadata."""
     # TODO: Do properly - needs spice. doesn't seem to be in the metadata
@@ -879,8 +943,8 @@ def write_envi(da, fout):
 class ChecksumError(Exception):
     """Exception raised for checksum mismatches."""
 
-    def __init__(self, fname):
-        self.message = f"Checksum failed for {fname}."
+    def __init__(self, fname, actual, expected):
+        self.message = f"Checksum failed for {fname}. Actual: {actual}. Expected: {expected}"
         super().__init__(self.message)
 
 
@@ -895,8 +959,10 @@ def get_md5(fname):
 
 def checksum(fname):
     """Raise an exception if the MD5 checksum of file does not match label."""
-    if pdr.open(fname).metaget("md5_checksum") != get_md5(fname):
-        raise ChecksumError(fname)
+    actual = get_md5(fname)
+    expected = pdr.open(fname).metaget("md5_checksum")
+    if actual != expected:
+        raise ChecksumError(fname, actual, expected)
 
 
 ## Image smoothing
