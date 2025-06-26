@@ -43,7 +43,7 @@ class IIRSData(ABC):
         self.oat = paths["oat"].get(basename, "")
         self.oath = paths["oath"].get(basename, "")
         self.spm = paths["spm"].get(basename, "")
-        if level == 1:
+        if self.level == 1:
             self.csv = paths["csv"].get(basename, "")
             self.xml_csv = paths["xml-csv"].get(basename, "")
 
@@ -80,6 +80,12 @@ class IIRSData(ABC):
     def metaget(self, key):
         """Search metadata for key."""
         return pdr.open(self.qub).metaget(key)
+
+    def checksum(self):
+        """Verify all data was downloaded correctly."""
+        utils.checksum(self.qub.as_posix())
+        if self.level == 1:
+            utils.checksum(self.csv.as_posix())
 
     @abstractmethod
     def plot(self, band=12, y=(None, None), x=(None, None), **kwargs):
