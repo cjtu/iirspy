@@ -5,7 +5,7 @@ site_description: Handling and correcting Chandrayaan-2 IIRS data in Python.
 site_author: Christian J. Tai Udovicic
 edit_uri: edit/main/docs/
 repo_name: cjtu/iirspy
-copyright: Maintained by <a href="https://cjtu.com">cjtu</a>.
+copyright: Maintained by <a href="https://github.com/cjtu/">cjtu</a>.
 
 nav:
   - Home: index.md

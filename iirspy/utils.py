@@ -1,4 +1,5 @@
 import hashlib
+import re
 import warnings
 import zipfile
 from importlib.resources import files
@@ -9,7 +10,6 @@ import numpy as np
 import pandas as pd
 import pdr
 import rasterio
-import rioxarray
 
 # import xarray_regrid
 import xarray as xr
@@ -24,19 +24,20 @@ from scipy.stats import norm
 warnings.filterwarnings("ignore", message="Dataset has no geotransform")
 
 ## Constants
-# Access the data directory
-data_dir = files("iirspy").joinpath("data")
-
-# Example usage
-FPOLISH = str(data_dir.joinpath("spectral_polish_verma2022.csv"))
-FBADBANDS = str(data_dir.joinpath("iirs_bad_bands.csv"))
-FSOLAR = str(data_dir.joinpath("ch2_iirs_solar_flux.txt"))
+PKG_DATA = files("iirspy").joinpath("data")
+DCALIB = PKG_DATA.joinpath("iir/calibration")
+CHUNKSIZE = 200e6  # [MB] chunk large images into this size with dask to fit in RAM (typically between 100MB-1GB)
+FPOLISH = str(PKG_DATA.joinpath("spectral_polish_verma2022.csv"))
+FBADBANDS = str(PKG_DATA.joinpath("iirs_bad_bands.csv"))
+FSOLAR = str(PKG_DATA.joinpath("ch2_iirs_solar_flux.txt"))
 # Projections used in the Ch2 IIRS selenoref tool https://doi.org/10.1007/s12524-024-01814-4
 IIRS_PROJ_DICT = {
     "equatorial": 'PROJCS["Moon_Equidistant_Cylindrical",GEOGCS["Moon 2000",DATUM["D_Moon_2000",SPHEROID["Moon_2000_IAU_IAG",1737400.0,0.0]],PRIMEM["Greenwich",0],UNIT["Decimal_Degree",0.0174532925199433]],PROJECTION["Equidistant_Cylindrical"],PARAMETER["False_Easting",0],PARAMETER["False_Northing",0],PARAMETER["Central_Meridian",0],PARAMETER["Standard_Parallel_1",0],UNIT["Meter",1]]',
     "polarstereographicsouthpole": 'PROJCS["Moon_South_Pole_Stereographic",GEOGCS["Moon 2000",DATUM["D_Moon_2000",SPHEROID["Moon_2000_IAU_IAG",1737400.0,0.0]],PRIMEM["Greenwich",0],UNIT["Decimal_Degree",0.0174532925199433]],PROJECTION["Stereographic"],PARAMETER["False_Easting",0],PARAMETER["False_Northing",0],PARAMETER["Central_Meridian",0],PARAMETER["Scale_Factor",1],PARAMETER["Latitude_Of_Origin",-90],UNIT["Meter",1]]',
     "polarstereographicnorthpole": 'PROJCS["Moon_North_Pole_Stereographic",GEOGCS["Moon 2000",DATUM["D_Moon_2000",SPHEROID["Moon_2000_IAU_IAG",1737400.0,0.0]],PRIMEM["Greenwich",0],UNIT["Decimal_Degree",0.0174532925199433]],PROJECTION["Stereographic"],PARAMETER["False_Easting",0],PARAMETER["False_Northing",0],PARAMETER["Central_Meridian",0],PARAMETER["Scale_Factor",1],PARAMETER["Latitude_Of_Origin",90],UNIT["Meter",1]]',
 }
+# Convert data level to "Mission-Type-Camera" identifier
+LVL2MTC = {0: "nri", 1: "nci", 2: "ndi"}
 
 
 ## Reflectance corr
@@ -46,12 +47,11 @@ def iirs_refl(
     fgeom="",
     fout="",
     ftif="",
-    finc="",
-    fiaz="",
-    shift_iaz=0,
+    md5checksum=False,
     fflux=FSOLAR,
     dem=None,
     extent=(None, None, None, None),
+    yrange=(None, None),
     smoothing="none",
     swindow=1,
     polish=False,
@@ -68,8 +68,15 @@ def iirs_refl(
     """
     Convert IIRS L1 radiance to L2 reflectance using I/f formula.
     """
+    # Step 0: Ensure data was downloaded correctly
+    if md5checksum:
+        checksum(fqub)
+        checksum(fspm)
+        if fgeom:
+            checksum(fgeom)
+
     # Step 1: Read and preprocess the input data
-    da, gridlon, gridlat, xyext = preprocess_input_data(fqub, fgeom, ftif, extent, ychunks=ychunks)
+    da = preprocess_input_data(fqub, fgeom, fspm, ftif, extent, yrange, ychunks)
 
     # Step 2: Handle bad bands
     if drop_bad_bands:
@@ -80,7 +87,7 @@ def iirs_refl(
         da = apply_destriping(da, **destripe_kws)
 
     # Step 4: Perform reflectance correction
-    da = apply_reflectance_correction(da, fqub, fspm, fflux, dem, finc, fiaz, shift_iaz, thermal, max_refl)
+    da = apply_reflectance_correction(da, fqub, fflux, dem, thermal, max_refl)
 
     # Step 5: Apply optional spectral polish
     if polish:
@@ -92,33 +99,66 @@ def iirs_refl(
 
     # Step 7: Write output if specified
     if fout:
-        write_output(da, fout, fgeom, gridlon, gridlat, xyext, ftif)
+        write_output(da, fout, fgeom, extent, ftif)
 
     return da
 
 
-def preprocess_input_data(fqub, fgeom, ftif, extent, ychunks):
+def preprocess_input_data(fqub, fgeom, fspm, ftif, extent, yrange, ychunks):
     """Read and preprocess input data."""
-    # If fgeom is given, interpret extent as degrees, otherwise interpret as pixels
-    if fgeom:
-        gridlon, gridlat, xyext = geom2grid(fgeom, extent)
-        xmin, xmax, ymin, ymax = xyext
-    else:
-        xmin, xmax, ymin, ymax = extent
-
-    # Read IIRS L1 radiance in [1000 mW/cm^2/sr/um]
+    # Read in dataarray. If tif, assume it is L1 radiance that is already cropped
     if ftif:
         da = xr.open_dataarray(ftif, engine="rasterio")
     else:
-        da = xr.open_dataarray(fqub, engine="rasterio").sel(x=slice(xmin, xmax), y=slice(ymin, ymax))
+        # Subset da using xy coords from extent
+        if fgeom:
+            # when fgeom is given, assume extent is in lat/lon, parse to get the extent in xy
+            _, extent = parse_geom(fgeom, extent)
+        da = xr.open_dataarray(fqub, engine="rasterio").sel(
+            x=slice(extent[0], extent[1]), y=slice(extent[2], extent[3])
+        )
+
     if ychunks:
         da = da.chunk(y=ychunks, x=len(da.x), band=len(da.band))
+
+    # Add geometry
+    orbit_dir = pdr.open(fqub).metaget("isda:orbit_limb_direction").lower()  # Ascending or Descending
+    yflip = False
+    if orbit_dir == "ascending":
+        yflip = False
+    elif orbit_dir == "descending":
+        yflip = True
+    else:
+        print("Unknown orbit, assuming ascending")
+    if fgeom:
+        # Ascending
+        yoff = 51
+        ymin, ymax = yrange
+        if yflip:  # Descending
+            yoff = -86
+            ymin, ymax = yrange
+        ys = np.linspace(ymin, ymax, len(da.y), endpoint=False) - yoff
+        lon2d, lat2d, extent = geom2grid(fgeom, extent, xs=da.x, ys=ys)
+        da = da.assign_coords(lon=(("y", "x"), lon2d))
+        da = da.assign_coords(lat=(("y", "x"), lat2d))
+
+    # Get solar incidence for each line of image
+    inc, iaz = get_iirs_inc_az(fqub, fspm, yrange)
+    if yflip:
+        iaz -= 180
+    da = da.assign_coords(inc=("y", inc))
+    da = da.assign_coords(iaz=("y", iaz))
+
+    # Adjust for direction of image collection
+    if yflip:
+        da.coords["y"] = min(da.y) - da.y
+
+    # IIRS L1 radiance is in [1000 mW/cm^2/sr/um]
     da = 0.01 * da  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
+    return da
 
-    return da, gridlon, gridlat, xyext
 
-
-def handle_bad_bands(da, fqub, bad_band_mask, bad_bands_buffer):
+def handle_bad_bands(da, fqub, bad_band_mask=None, bad_bands_buffer=0):
     """Handle bad bands by setting them to NaN."""
     if bad_band_mask is None:
         bad_band_mask = get_bad_bands(fqub, bad_bands_buffer)  # array where True == bad
@@ -132,42 +172,43 @@ def apply_destriping(da, **destripe_kws):
     return da
 
 
-def apply_reflectance_correction(da, fqub, fspm, fflux, dem, shift_iaz, thermal, max_refl):
+def apply_reflectance_correction(da, fqub, fflux, dem, thermal, max_refl):
     """Perform reflectance correction using I/F formula."""
-    # Reflectance correction: I/F
-    # Get solar spectrum
-    L = pd.read_csv(fflux, sep="\t", header=None, names=["wl", "flux"])
-    wl = L["wl"].values[:, None, None] * 1e-9  # wl [m]
-    sdist = get_solar_distance(fqub)
-    F = L["flux"].values[:, None, None] * 10 / (np.pi * sdist**2)  # Solar flux [W/m^2/sr/um]
-    da = da.assign_coords(wl=("band", np.round(wl.squeeze() * 1e9, 3)))
+    # Set very low radiance pixels to NaN (TODO: this is an arbitrary choice of band/min value)
+    da = da.where(da.sel(band=10) > 0.5)
 
-    # Get solar incidence for each line of image
-    inc, iaz = get_iirs_inc_az(fqub, fspm, yrange=(int(da.y[0]), int(da.y[0]) + len(da.y)))
-    cos_inc = np.cos(np.radians(inc[None, :, None]))
+    # Get solar spectrum and wavelength and assign to da TODO: move to import step
+    L = pd.read_csv(fflux, sep="\t", header=None, names=["wl", "flux"])
+    da = da.assign_coords(wl=("band", np.round(L["wl"].values, 3)))
+
+    sdist = get_solar_distance(fqub)
+    solar_flux = L["flux"].values * 10 / (np.pi * sdist**2)  # [W/m^2/sr/um]
+    da = da.assign_coords(F=("band", solar_flux))
 
     # (Optional): adjust cos_inc relative to dem
     if dem is not None:
         if not hasattr(dem, "sel"):
             dem = xr.open_dataarray(dem, engine="rasterio").sel(band=1)
-        # TODO: check if this is correct condition
-        # if yflip:
-        #     iaz -= shift_iaz
-        dem = dem.rio.reproject_match(da.sel(band=1))
-        dem = dem.assign_coords(x=da.x, y=da.y)
-        cos_inc = get_cos_inc_dem(dem, inc, iaz).values[None, :, :]
+            if dem.shape == (2822, 2789):  # TODO: fix and delete
+                dem.coords["y"] = -dem.y
+        # dem = dem.rio.reproject_match(da.sel(band=1))
+        # dem = dem.assign_coords(x=da.x, y=da.y)
+        dem = dem.interp_like(da.isel(band=1), method="slinear")
+        cos_inc = get_cos_inc_dem(dem, da.inc, da.iaz, da.lat)
+    else:
+        cos_inc = np.cos(np.radians(da.inc))
+    cos_inc = cos_inc.where((cos_inc > 0.03) & (cos_inc < 0.999))
 
     # Get thermal component
     trad = 0
     if thermal == "verma":
-        trad = get_thermal_rad_verma(da, wl)
+        trad = get_thermal_rad_verma(da, da.wl * 1e-9)
 
     # Convert to I/F reflectance
-    da = (da - trad) / (cos_inc * F)
+    da = (da - trad) / (cos_inc * da.F)
 
-    # Remove bad values, reduce precision for writing
-    da = da.where((da >= 0) & (da <= max_refl))  # .astype("float32")
-    da = da.assign_coords(wl=("band", np.round(wl.squeeze() * 1e9, 2)))
+    # Remove bad values
+    da = da.where(da <= max_refl)
 
     return da
 
@@ -189,7 +230,7 @@ def apply_smoothing(da, smoothing, swindow):
         # note: this interpolates NaN to allow spectra to be smooth up to a NaN band
         #  we then need to reapply the NaNs at the end. More steps and more expensive than moving avg
         if not swindow % 2:
-            raise ValueError("Gaussian swindow must be odd.")  # noqa: TRY003
+            raise ValueError("Gaussian swindow must be odd.")
         gaussian = norm(loc=0, scale=1).pdf(np.arange(swindow) - swindow // 2)
         weights = xr.DataArray(gaussian / gaussian.sum(), dims=["window"])
         da = (
@@ -202,22 +243,21 @@ def apply_smoothing(da, smoothing, swindow):
     return da
 
 
-def write_output(da, fout, fgeom, gridlon, gridlat, xyext, ftif):
+def write_output(da, fout, fgeom, extent, ftif):
     """Write the processed data to the specified output file."""
     da.rio.write_crs("IAU_2015:30135", inplace=True)
     da.rio.write_nodata(np.nan, inplace=True)
     if fout[-4:].lower() == ".img":
         write_envi(da, fout)
     elif fgeom and fout[-4:].lower() == ".tif" and not ftif:
+        gridlon, gridlat, xyext = geom2grid(fgeom, extent)
         da = warp2grid(da, xyext, gridlon, gridlat)
         da = da.swap_dims({"band": "wl"})
         da.rio.to_raster(fout, driver="GTiff", compress="LZW")
     else:
         da = da.swap_dims({"band": "wl"})
         da.rio.to_raster(fout)
-        with rasterio.open(fout, "r+", driver="GTiff") as dst:
-            dst.descriptions = tuple([str(w) for w in da.wl])
-            # TODO fix wavelength metadata
+        fix_metadata(fout, da.wl.values)
 
 
 def iirs_refl_verma(da, inc=None, smoothing=3, fflux=FSOLAR, fpolish=FPOLISH):
@@ -288,26 +328,29 @@ def get_thermal_rad_verma(da, wl, eps=0.95, tbands=(224, 246)):
     # Remove bbr(avg_BT) assuming surface is isothermal
     # Only use wavelengths within tbands for T estimation (default 4500 to 4875)
     btavg = bt.isel(band=slice(*tbands)).mean("band")
-    bbr = 1e-6 * (2 * h * c * c / wl**5) * 1 / (np.exp(h * c / (wl * k * btavg.values)) - 1)
+    bbr = 1e-6 * (2 * h * c * c / wl**5) * 1 / (np.exp(h * c / (wl * k * btavg)) - 1)
     return eps * bbr
 
 
-def get_reflectance_factor(fimg, fspm):
-    """Return I/f reflectance from radiance and solar irradiance."""
-    # Get cinc, format along lines / y direction assuming (band, y, x)
-    inc, _ = get_iirs_inc_az(fimg, fspm)
-    cinc = np.cos(np.radians(inc))[None, :, None]
+def get_cos_inc_dem(dem, inc, iaz, latitudes):
+    """
+    Return cos(inc) relative to a DEM using the dot product, considering local latitude.
 
-    # Get solar flux scaled by sdist and pi along band direction
-    sdist = get_solar_distance(fimg)
-    f_scaled = get_iirs_solar_flux(sdist, fimg)["flux"][:, None, None]
-    return 1 / (cinc * f_scaled)
+    Parameters
+    ----------
+    dem : xr.DataArray
+        DEM data with the same spatial resolution as the image.
+    inc : np.ndarray
+        Solar incidence angle (degrees) for each row of data.
+    iaz : np.ndarray
+        Solar azimuth angle (degrees) for each row of data.
+    latitudes : np.ndarray
+        1D array of latitude values corresponding to each row of the DEM.
 
-
-def get_cos_inc_dem(dem, inc, iaz):
-    """Return cos(inc) relative to a dem using the dot product.
-
-    All input images must be co-registered with the same width and height.
+    Returns
+    -------
+    cos_inc : np.ndarray
+        2D array of cos(inc) values adjusted for the DEM and local latitude.
     """
     # Calculate local illumination using dot product method between surface normal and sun vector
 
@@ -319,9 +362,22 @@ def get_cos_inc_dem(dem, inc, iaz):
     kernel_y = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]]) / (8 * res_y)
 
     # Calculate derivatives
-    dz_dx = convolve(dem.values, kernel_x)
-    dz_dy = convolve(dem.values, kernel_y)
-
+    dz_dx = xr.apply_ufunc(
+        convolve,
+        dem,
+        input_core_dims=[["y", "x"]],
+        kwargs={"weights": kernel_x, "mode": "nearest"},
+        output_core_dims=[["y", "x"]],
+        vectorize=True,
+    )
+    dz_dy = xr.apply_ufunc(
+        convolve,
+        dem,
+        input_core_dims=[["y", "x"]],
+        kwargs={"weights": kernel_y, "mode": "nearest"},
+        output_core_dims=[["y", "x"]],
+        vectorize=True,
+    )
     # Create surface normal vectors [nx, ny, nz]
     # For each pixel: n = [-dz/dx, -dz/dy, 1] (unnormalized)
     nx = -dz_dx
@@ -334,55 +390,50 @@ def get_cos_inc_dem(dem, inc, iaz):
     ny = ny / norm_factor
     nz = nz / norm_factor
 
-    # 2. Calculate sun vector for each line (convert from inc, az to vector)
-    # First convert incidence and azimuth to radians
+    # Convert incidence and azimuth to radians
     inc_rad = np.radians(inc)
     iaz_rad = np.radians(iaz)
 
-    # Sun vector components [sx, sy, sz] from incidence and azimuth angles
-    # Sun position given as (inc, az) where inc is from zenith, az is clockwise from north
-    # We first convert to a directional sun vector (pointing from surface to sun)
+    # Calculate sun vector components [sx, sy, sz] for each row
     sx = np.sin(inc_rad) * np.sin(iaz_rad)  # East component
     sy = np.sin(inc_rad) * np.cos(iaz_rad)  # North component
     sz = np.cos(inc_rad)  # Up component
 
-    # Reshape sun vector for broadcasting
-    # Assume inc and iaz are 1D arrays with one value per image line
-    sx = sx[:, np.newaxis]  # Shape becomes (lines, 1)
-    sy = sy[:, np.newaxis]
-    sz = sz[:, np.newaxis]
+    # Adjust sun vector for local latitude
+    lat_rad = np.radians(latitudes)
+    sy_adj = sy * np.cos(lat_rad) - sz * np.sin(lat_rad)
+    sz_adj = sy * np.sin(lat_rad) + sz * np.cos(lat_rad)
 
-    # 3. Compute dot product between normal and sun vector for each pixel
-    # Expand dimensions for band axis
-    # nx = nx[np.newaxis, :, :]  # Shape becomes (1, y, x)
-    # ny = ny[np.newaxis, :, :]
-    # nz = nz[np.newaxis, :, :]
+    # Replace original sy and sz with adjusted values
+    sy = sy_adj
+    sz = sz_adj
 
-    # Calculate dot product (cosine of incidence angle)
-    # n⋅s = nx*sx + ny*sy + nz*sz
-    # The result will have shape (lines, cols)
-    # cos_inc = (
-    #     nx * sx[np.newaxis, :, np.newaxis] + ny * sy[np.newaxis, :, np.newaxis] + nz * sz[np.newaxis, :, np.newaxis]
-    # )
+    # Compute dot product between normal and sun vector for each pixel
     cos_inc = nx * sx + ny * sy + nz * sz
 
+    # Debugging: Print intermediate values for testing
+    if np.any(np.isnan(cos_inc)):
+        print("NaN values detected in cos_inc. Check inputs and calculations.")
+    if np.min(cos_inc) < 0:
+        print("Negative cos_inc values detected. Verify sun vector and surface normal calculations.")
+
     # Handle negative values (local shadows)
-    # cos_inc[(cos_inc > 1) | (cos_inc < 1e-3)] = np.nan
-    # cos_inc = np.clip(cos_inc, 0.001, 1)
+    # cos_inc = np.clip(cos_inc, 0, 1)
     return cos_inc
 
 
-def get_iirs_inc_az(fimg, fspm, yrange=(None, None)):
+def get_iirs_inc_az(fimg, fspm, yrange):
     """
     Return incidence angle from IIRS SPM timestamped file.
 
     Computes spacecraft clock time for each line and interpolates from SPM.
     """
+    ymin, ymax = yrange
     get_sun_elev = get_spm_interpolator(fspm, "sun_elev")
     get_sun_az = get_spm_interpolator(fspm, "sun_az")
     line_times = get_line_times(fimg)
-    inc = 90 - abs(get_sun_elev(line_times)[yrange[0] : yrange[1]])
-    az = get_sun_az(line_times)[yrange[0] : yrange[1]]
+    inc = 90 - abs(get_sun_elev(line_times)[ymin:ymax])
+    az = get_sun_az(line_times)[ymin:ymax]
     return inc, az
 
 
@@ -394,57 +445,6 @@ def get_spm_interpolator(fspm, col="sun_elev"):
 
     # Return linear interpolator function (linear: k=1, will extrapolate)
     return make_interp_spline(spm_times, spm_vals, k=1)
-
-
-# Georeferencing
-def iirs2geotiff(
-    fqub,
-    fgeom,
-    fspm=None,
-    fout=None,
-    extent=(None, None, None, None),
-    md5checksum=False,
-    chunks=None,
-    reflectance=False,
-):
-    """
-    Return iirs xarray subset to latlon and projected on grid from geom.
-    Optionally write to geotiff.
-
-    Parameters
-    ----------
-    fqub: str
-        Path to input radiance ch2_iir_... .qub file.
-    fgeom: str
-        Path to input geometry ch2_iir_... .csv file.
-    fout: str or None
-        Path to output geotiff. If None, return xarray.
-    extent: tuple
-        Extent in degrees (minlon, maxlon, minlat, maxlat).
-    md5checksum: bool
-        Check MD5 checksum of input files against xml label.
-    bav: bool
-        Bands as variables. Preserves wavelength labels in geotiff. Is slow!
-    """
-    if md5checksum:
-        checksum(fgeom)
-        checksum(fqub)
-    if chunks is None:
-        chunks = {"y": 4000}
-
-    src = xr.open_dataarray(fqub, engine="rasterio", chunks=chunks)
-    if reflectance:
-        ref_factor = get_reflectance_factor(fqub, fspm, len(src.y))
-        src = src * ref_factor
-
-    # Subset to extent
-    gridlon, gridlat, ext = geom2grid(fgeom, extent)
-    ds = warp2grid(src, ext, gridlon, gridlat)
-    if fout:
-        ds.rio.to_raster(fout)
-        print(f"Wrote {fout}")
-
-    return ds
 
 
 def warp2grid(da, ext, gridlon, gridlat, method="bilinear"):
@@ -514,24 +514,25 @@ def warp2gcps(fqub, da, gcps, gcps_crs, fout, method="bilinear"):
     return warped_da
 
 
-def fix_metadata(fqub, fgeotiff):
+def fix_metadata(fout, wls):
     """Fix metadata for geotiff to match original qub."""
-    ds = rioxarray.open_rasterio(fgeotiff, band_as_variable=True)
+    with rasterio.open(fout, "r+", driver="GTiff") as dst:
+        dst.descriptions = tuple([str(wl) for wl in wls])
 
-    ds.attrs["name"] = "radiance"  # 'reflectance'
-    ds.attrs["longname"] = "radiance (µW/cm^2/sr/µm)"  # 'reflectance'
-    # ds.attrs['lines'] = ds.sizes['lat']
-    # ds.attrs['samples'] = ds.sizes['lon']
+    # ds = rioxarray.open_rasterio(fout, band_as_variable=True, engine='rasterio')
+    # ds.attrs["name"] = "radiance"  # 'reflectance'
+    # ds.attrs["longname"] = "radiance (µW/cm^2/sr/µm)"  # 'reflectance'
+    # # ds.attrs['lines'] = ds.sizes['lat']
+    # # ds.attrs['samples'] = ds.sizes['lon']
 
-    # Assign wavelength labels
-    wls = get_wls(fqub, as_str=True)
-    ds = ds.rename({f"band_{i + 1}": wl for i, wl in enumerate(wls)})
+    # # Assign wavelength labels
+    # ds = ds.rename({f"band_{i + 1}": wl for i, wl in enumerate(wls)})
+    # ds.rio.to_raster(fout)
 
     # for band in ds.band.values:
     #     # TODO: Compute and store band stats?
     #     ds[band].attrs['x'] = 'y'
-
-    pass
+    return
 
 
 def get_iirs_proj(fqub):
@@ -543,9 +544,9 @@ def get_iirs_proj(fqub):
     return IIRS_PROJ_DICT[proj_name]
 
 
-def geom2grid(fgeom, extent):
+def geom2grid(fgeom, extent, xs=None, ys=None):
     """Interpolate sparse geometry csv to full 2D lat and lon grids."""
-    df_buf, xy_ext = parse_geom(fgeom, extent)
+    df_buf, xyext = parse_geom(fgeom, extent)
 
     # Add buffer to the extent to ensure edges are included in interpolator
     # NOTE: Makes almost no difference (pixel lvl offset, overall offset much larger)
@@ -559,14 +560,18 @@ def geom2grid(fgeom, extent):
     rbf_lat = RBFInterpolator(points, lats, kernel="thin_plate_spline")
 
     # Create a 2D grid of all pixel x and y values in extent
-    pixel_range = np.arange(xy_ext[0], xy_ext[1] + 1, 1)
-    scan_range = np.arange(xy_ext[2], xy_ext[3] + 1, 1)
+    pixel_range = np.arange(xyext[0], xyext[1] + 1, 1)
+    scan_range = np.arange(xyext[2], xyext[3] + 1, 1)
+    if xs is not None:
+        pixel_range = xs
+    if ys is not None:
+        scan_range = ys
     grid_pixel, grid_scan = np.meshgrid(pixel_range, scan_range)
 
     # Create the 2D interpolated grids of lon and lat
     gridlon = rbf_lon(np.column_stack([grid_pixel.ravel(), grid_scan.ravel()])).reshape(grid_pixel.shape)
     gridlat = rbf_lat(np.column_stack([grid_pixel.ravel(), grid_scan.ravel()])).reshape(grid_pixel.shape)
-    return gridlon, gridlat, xy_ext
+    return gridlon, gridlat, xyext
 
 
 def iirs2gcps(fqub, fgeom, fout=None, extent=(None, None, None, None), corners_only=False):
@@ -578,11 +583,11 @@ def iirs2gcps(fqub, fgeom, fout=None, extent=(None, None, None, None), corners_o
     extent: (minlon, maxlon, minlat, maxlat)
     """
     # Get GCPs and ext in pixel coordinates
-    gcps, ext = parse_geom(fgeom, extent, as_gcps=True, corners_only=corners_only)
+    gcps, xyext = parse_geom(fgeom, extent, as_gcps=True, corners_only=corners_only)
 
     # Read the hyperspectral data cube
     ds = xr.open_dataarray(fqub, engine="rasterio").sel(
-        x=slice(ext[0] - 0.5, ext[1] + 0.5), y=slice(ext[2] - 0.5, ext[3] + 0.5)
+        x=slice(xyext[0] - 0.5, xyext[1] + 0.5), y=slice(xyext[2] - 0.5, xyext[3] + 0.5)
     )
 
     # Set the GCPs and CRS (Moon unprojected)
@@ -611,50 +616,74 @@ def read_gcps(fgcps):
     return gcps, crs
 
 
-def unzip(fzip, ddir):
-    """Unzip a file to a directory."""
-    with zipfile.ZipFile(fzip, "r") as zip_ref:
-        zip_ref.extractall(ddir)
+def unzip_iirs(ddir, basename, level, md5checksum=True):
+    """Find zipped IIRS image from PRADAN ISSDC, unzip and run checksum."""
+    mtc = LVL2MTC[level]
+    f = next((f for f in Path(ddir).glob(f"**/*{mtc}*.zip") if basename in f.stem), None)
+    if f is None:
+        raise ValueError(f"Image {basename} not found in {ddir}. Please download from PRADAN or check file path.")
+    with zipfile.ZipFile(f, "r") as zipf:
+        print(f"Extracting {basename} to {f.parent}")
+        zipf.extractall(f.parent)
+    paths = get_iirs_paths(f.parent, level=level, basenames=[basename])
+    if "qub" not in paths:
+        raise RuntimeError("Unzip failed.")
+    if checksum:
+        print("Verifying unzipped image...", end=" ")
+        checksum(paths["qub"][basename].as_posix())
+        print("Success!")
+    return paths
 
 
-def get_iirs_paths(ddir, exts=("qub", "hdr", "xml", "csv", "xml-csv", "lbr", "oat", "oath", "spm")):
+def iirsbasename(input_str):
+    """Return the image basename from str_in (e.g., 20201226T1745264921)"""
+    pattern = r"\d{8}T\d{10}"
+    try:
+        return re.search(pattern, input_str).group()
+    except AttributeError as e:
+        raise ValueError(f"Can't parse basename: {input_str}") from e
+
+
+def get_iirs_paths(
+    ddir,
+    exts=("qub", "hdr", "xml", "csv", "xml-csv", "lbr", "oat", "oath", "spm", "png", "xml-png"),
+    level=1,
+    basenames=None,
+):
     """Return a list of paths to IIRS image, geom, and misc files."""
+
+    def basename(img_path_obj):
+        """Return IIRS basename e.g. 20210122T0920157625 from pathlib path."""
+        return img_path_obj.stem.split("_")[3]
+
+    LVL2DIR = {0: "raw", 1: "calibrated", 2: "derived"}
     out = {}
     for ext in exts:
         subdir = "."
-        if ext in ("hdr", "qub", "xml"):
-            subdir = "data"
+        if ext in ("png", "xml-png"):
+            subdir = "browse/" + LVL2DIR[level]
+        elif ext in ("hdr", "qub", "xml"):
+            subdir = "data/" + LVL2DIR[level]
         elif ext in ("csv", "xml-csv"):
-            subdir = "geometry"
+            subdir = "geometry/calibrated"
+        elif ext in ("lbr", "oat", "oath", "spm"):
+            subdir = "miscellaneous/" + LVL2DIR[level]
         else:
-            subdir = "miscellaneous"
-        out[ext] = {f.stem.split("_")[3]: f for f in Path(ddir).glob(f'{subdir}/**/*.{ext.split("-")[0]}')}
-    out["imgs"] = list(out["qub"].keys())
+            raise ValueError(f"Unknown IIRS file extension: {ext}")
+        paths = Path(ddir).glob(f'**/{subdir}/**/*.{ext.split("-")[0]}')
+
+        if basenames is not None:
+            basenames = [basenames] if isinstance(basenames, str) else basenames
+            out[ext] = {basename(f): f for f in paths if basename(f) in basenames}
+        else:
+            out[ext] = {basename(f): f for f in paths}
+        # Drop this entry from dict if it is empty
+        if not out[ext]:
+            del out[ext]
+    # Add list of basenames to dict
+    if "qub" in out:
+        out["imgs"] = list(out["qub"].keys())
     return out
-
-
-## Checksums
-class ChecksumError(Exception):
-    """Exception raised for checksum mismatches."""
-
-    def __init__(self, fname):
-        self.message = f"Checksum failed for {fname}."
-        super().__init__(self.message)
-
-
-def get_md5(fname):
-    """Return md5 hash of file."""
-    hash_md5 = hashlib.md5()  # noqa: S324
-    with open(fname, "rb") as f:
-        for chunk in iter(lambda: f.read(16 * 1024), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
-
-
-def checksum(fname):
-    """Raise an exception if the MD5 checksum of file does not match label."""
-    if pdr.open(fname).metaget("md5_checksum") != get_md5(fname):
-        raise ChecksumError(fname)
 
 
 def get_wls(fname, as_str=False):
@@ -667,7 +696,7 @@ def get_wls(fname, as_str=False):
     return wls
 
 
-def parse_geom(fgeom, extent=(None, None, None, None), buffer=0, center=True, as_gcps=False, corners_only=False):
+def parse_geom(fgeom, extent=(None, None, None, None), buffer=0, center=False, as_gcps=False, corners_only=False):
     """
     Read lat,lon,x,y from iirs geometry file and return as list of GCPs or DataFrame.
 
@@ -696,6 +725,7 @@ def parse_geom(fgeom, extent=(None, None, None, None), buffer=0, center=True, as
         & (df["Latitude"] <= maxlat + buffer)
     ]
     # Convert output dataframe to list of gcps or gcp corners if requested
+    # TODO: better error handling for ranges returning 0-length xyext
     xyext = [min(out["Pixel"]), max(out["Pixel"]), min(out["Scan"]), max(out["Scan"])]
     if as_gcps and corners_only:
         out = [
@@ -781,12 +811,12 @@ def load_bad_bands(fbad_bands=FBADBANDS):
     return ~pd.read_csv(fbad_bands, index_col=0).astype(bool)
 
 
-def get_exposore_gain(fimg):
+def get_exposure_gain(fimg):
     """Return exposure (E1-E4) and gain (G2) as eXgY string."""
     img = pdr.open(fimg)
     exposure = img.metaget("isda:exposure")
     gain = img.metaget("isda:gain")
-    return f"{exposure}{gain}"
+    return f"{exposure}{gain}".lower()
 
 
 def get_bad_bands(fimg, buffer=0):
@@ -795,7 +825,7 @@ def get_bad_bands(fimg, buffer=0):
 
     Set buffer number of bands to left and right of each bad band as bad.
     """
-    exp_gain = get_exposore_gain(fimg)  # e.g., "e1g2"
+    exp_gain = get_exposure_gain(fimg)  # e.g., "e1g2"
     bad_bands = load_bad_bands()[exp_gain].values  # array of True / False
 
     # Buffer - use kernel convolution to bump n adjacent bands, flag these as also bad
@@ -805,6 +835,69 @@ def get_bad_bands(fimg, buffer=0):
     bad_buffered = np.convolve((bad_bands).astype(int), kernel, mode="same").astype(bool)
 
     return bad_buffered  # array of True where band is bad
+
+
+def get_lut_file(fimg, lut_type="lut_coeff", calib_dir=DCALIB):
+    """
+    Locate and return the correct LUT file for the given image.
+
+    Parameters
+    ----------
+    fimg : str
+        Path to the IIRS image file.
+    lut_type : str
+        Type of LUT to find (default: "lut_coeff").
+        Options: "lut_coeff", "saturations_radiance"
+    calib_dir : str or Path
+        Directory containing calibration LUT files.
+    ext : str
+        File extension to look for (default: "csv").
+        Options: "csv", "xml"
+
+    Returns
+    -------
+    Path to the LUT file as a string.
+
+    Raises
+    ------
+    FileNotFoundError if the LUT file is not found.
+    """
+    exp_gain = get_exposure_gain(fimg)  # e.g., "e1g2"
+    pattern = f"ch2_iirs_cal_{exp_gain}_{lut_type}.csv"
+    flut = Path(calib_dir) / pattern
+    if flut.exists():
+        return str(flut)
+    raise FileNotFoundError(f"IIRS calibration file {flut} not found.")
+
+
+def get_gain_offset(flut, denoise=False):
+    """
+    Return the IIRS gain and offset for fimg as DataArrays.
+
+    Parameters
+    ----------
+    flut : str
+        Path to the lookup table file.
+    denoise: bool
+        Replace speckly noise from gain / offset with NaN.
+    """
+    lut = np.loadtxt(flut, delimiter=",").reshape((256, 250, 2))
+    coords = {"band": 1 + np.arange(0, 256), "x": 0.5 + np.arange(250)}
+    gain = xr.DataArray(lut[:, :, 0], coords=coords, name="gain")
+    off = xr.DataArray(lut[:, :, 1], coords=coords, name="offset")
+    if denoise:
+        # Outlier detection with moving window and local median deviations
+        thresh = 40  # Empirical - seemed to filter out noise
+        window = gain.rolling({"band": 3, "x": 5}, center=True, min_periods=1)
+        meddev = abs(gain - window.median())
+        meddev_norm = meddev / meddev.median()
+        gain = gain.where(meddev_norm < thresh)
+
+        window = off.rolling({"band": 3, "x": 5}, center=True, min_periods=1)
+        meddev = abs(off - window.median())
+        meddev_norm = meddev / meddev.median()
+        off = off.where(meddev_norm < thresh)
+    return gain, off
 
 
 def get_solar_distance(fimg):
@@ -844,6 +937,32 @@ def write_envi(da, fout):
             dst.write(da.isel(band=i).values, i + 1)
             dst.set_band_description(i + 1, wls[i])
             # TODO fix wavelength metadata
+
+
+## Checksums
+class ChecksumError(Exception):
+    """Exception raised for checksum mismatches."""
+
+    def __init__(self, fname, actual, expected):
+        self.message = f"Checksum failed for {fname}. Actual: {actual}. Expected: {expected}"
+        super().__init__(self.message)
+
+
+def get_md5(fname):
+    """Return md5 hash of file."""
+    hash_md5 = hashlib.md5()  # noqa: S324
+    with open(fname, "rb") as f:
+        for chunk in iter(lambda: f.read(16 * 1024), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+
+def checksum(fname):
+    """Raise an exception if the MD5 checksum of file does not match label."""
+    actual = get_md5(fname)
+    expected = pdr.open(fname).metaget("md5_checksum")
+    if actual != expected:
+        raise ChecksumError(fname, actual, expected)
 
 
 ## Image smoothing
