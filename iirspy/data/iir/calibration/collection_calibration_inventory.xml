@@ -12,8 +12,8 @@
             <editor_list>Chandreayaan-2 DP Team</editor_list>
             <publication_year>2020</publication_year>
             <description>
-	    This collection contains the calibration files used to calibrate
-            and correct the images acquired by the IIRS instrument onboard
+	    This collection contains the calibration files used to calibrate 
+            and correct the images acquired by the IIRS instrument onboard 
             chandrayaan-2 orbiter spacecraft.
 	    </description>
         </Citation_Information>
@@ -47,7 +47,7 @@
                 		<name>Chandrayaan 2 Orbiter</name>
                 		<type>Spacecraft</type>
                 		<description>
-                    			Chandrayaan-2 Orbiter is an Orbiter craft under the Chandrayaan-2 Spacecraft
+                    			Chandrayaan-2 Orbiter is an Orbiter craft under the Chandrayaan-2 Spacecraft 
                     			consists of various scientific instruments.
                 		</description>
             		</Observing_System_Component>
@@ -55,8 +55,8 @@
                 		<name>imaging infrared spectrometer</name>
                 		<type>Instrument</type>
                 		<description>
-                                   IIRS (Imaging InfraRed Spectrometer) is one of the scientific instrument hosted
-                                   on the Chandrayaan-2 Orbiter. The instrument is a grating based spectrometer
+                                   IIRS (Imaging InfraRed Spectrometer) is one of the scientific instrument hosted 
+                                   on the Chandrayaan-2 Orbiter. The instrument is a grating based spectrometer 
                                    covering the spectral region between 0.8 um to 5.0 um.
                 		</description>
             		</Observing_System_Component>

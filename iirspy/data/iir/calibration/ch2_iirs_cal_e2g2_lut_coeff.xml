@@ -24,7 +24,7 @@
                 <name>Chandrayaan 2 Orbiter</name>
                 <type>Spacecraft</type>
                 <description>
-                    Chandrayaan-2 Orbiter is an Orbiter craft under the Chandrayaan-2 Spacecraft
+                    Chandrayaan-2 Orbiter is an Orbiter craft under the Chandrayaan-2 Spacecraft 
                     consists of various scientific instruments.
                 </description>
             </Observing_System_Component>
@@ -32,8 +32,8 @@
                 <name>imaging infrared spectrometer</name>
                 <type>Instrument</type>
                 <description>
-	            IIRS (Imaging InfraRed Spectrometer) is one of the scientific instrument hosted
-                    on the Chandrayaan-2 Orbiter. The instrument is a grating based spectrometer
+	            IIRS (Imaging InfraRed Spectrometer) is one of the scientific instrument hosted 
+                    on the Chandrayaan-2 Orbiter. The instrument is a grating based spectrometer 
                     covering the spectral region between 0.8 um to 5.0 um.
                 </description>
             </Observing_System_Component>
@@ -53,11 +53,11 @@
             <records>64000</records>
             <md5_checksum>62a26fbddfebf70c1653d502ca84187a</md5_checksum>
             <comment>
-		This file contains a lut coefficient with
-                fields Multiplicative factor, and Offset.
+		This file contains a lut coefficient with 
+                fields Multiplicative factor, and Offset. 
 		Every 250 number of lines corresponds to each bands
                 As there are 256 bands, hence 250*256 is 64000 number
-                of records. md5_checksum is provided for ensuring data
+                of records. md5_checksum is provided for ensuring data 
 		integrity when users are downloading the data.
             </comment>
         </File>

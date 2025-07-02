@@ -38,6 +38,8 @@ IIRS_PROJ_DICT = {
 }
 # Convert data level to "Mission-Type-Camera" identifier
 LVL2MTC = {0: "nri", 1: "nci", 2: "ndi"}
+OSF = (*range(29, 35), *range(69, 76), *range(162, 172))  # Order sorting filters
+INVALID = (*range(1, 7), *range(252, 257))  # Invalid band list
 
 
 ## Reflectance corr
@@ -621,7 +623,9 @@ def unzip_iirs(ddir, basename, level, md5checksum=True):
     mtc = LVL2MTC[level]
     f = next((f for f in Path(ddir).glob(f"**/*{mtc}*.zip") if basename in f.stem), None)
     if f is None:
-        raise ValueError(f"Image {basename} not found in {ddir}. Please download from PRADAN or check file path.")
+        raise FileNotFoundError(
+            f"Image {basename} not found in {ddir}. Please download from PRADAN or check file path."
+        )
     with zipfile.ZipFile(f, "r") as zipf:
         print(f"Extracting {basename} to {f.parent}")
         zipf.extractall(f.parent)
@@ -870,7 +874,7 @@ def get_lut_file(fimg, lut_type="lut_coeff", calib_dir=DCALIB):
     raise FileNotFoundError(f"IIRS calibration file {flut} not found.")
 
 
-def get_gain_offset(flut, denoise=False):
+def get_gain_offset(flut, denoise=False, gain_z=None, offset_z=None):
     """
     Return the IIRS gain and offset for fimg as DataArrays.
 
@@ -881,22 +885,31 @@ def get_gain_offset(flut, denoise=False):
     denoise: bool
         Replace speckly noise from gain / offset with NaN.
     """
+    zdefaults = {  # Empirically selected z-thresholds for gain, offset
+        "ch2_iirs_cal_e1g2_lut_coeff.csv": (0.01, 0.5),
+        "ch2_iirs_cal_e2g2_lut_coeff.csv": (0.5, 0.1),
+        "ch2_iirs_cal_e3g2_lut_coeff.csv": (1, 0.1),
+        "ch2_iirs_cal_e4g2_lut_coeff.csv": (1, 1),
+    }
+    if gain_z is None:
+        gain_z = zdefaults.get(Path(flut).name, (1, 1))[0]
+    if offset_z is None:
+        offset_z = zdefaults.get(Path(flut).name, (1, 1))[1]
     lut = np.loadtxt(flut, delimiter=",").reshape((256, 250, 2))
     coords = {"band": 1 + np.arange(0, 256), "x": 0.5 + np.arange(250)}
     gain = xr.DataArray(lut[:, :, 0], coords=coords, name="gain")
     off = xr.DataArray(lut[:, :, 1], coords=coords, name="offset")
     if denoise:
-        # Outlier detection with moving window and local median deviations
-        thresh = 40  # Empirical - seemed to filter out noise
-        window = gain.rolling({"band": 3, "x": 5}, center=True, min_periods=1)
-        meddev = abs(gain - window.median())
-        meddev_norm = meddev / meddev.median()
-        gain = gain.where(meddev_norm < thresh)
+        # Outlier detection with moving window and Z-score threshold
+        gwindow = gain.rolling({"band": 1, "x": 5}, center=True, min_periods=1)
+        gresid = gain - gwindow.median()
+        gzscore = abs(gresid / gresid.std())
+        gain = gain.where(gzscore < gain_z)
 
-        window = off.rolling({"band": 3, "x": 5}, center=True, min_periods=1)
-        meddev = abs(off - window.median())
-        meddev_norm = meddev / meddev.median()
-        off = off.where(meddev_norm < thresh)
+        owindow = off.rolling({"band": 1, "x": 5}, center=True, min_periods=1)
+        oresid = off - owindow.median()
+        ozscore = abs(oresid / oresid.std())
+        off = off.where(ozscore < offset_z)
     return gain, off
 
 

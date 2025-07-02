@@ -149,26 +149,47 @@ class L0(IIRSData):
             ax.xaxis.set_inverted(True)
         return ax
 
-    def calibrate_to_rad(self, calib_dir="", denoise_gain=False):
+    def calibrate_to_rad(self, denoise_gain=False, get_l1_metadata=True, interp_osf_method="", **kwargs):
         """
         Perform IIRS L0 digital number to L1 radiance calibration.
 
         Steps:
         0) (Raw data is already dark subtracted).
-        1) Find and apply gain and offset from lookup table.
+        1) Find and apply gain and offset to convert to radiance [W cm^-2 sr^-1 um^-1].
         2) (Optional) destripe.
-        3) Convert to radiance [mW cm^-2 sr^-1 um^-1]
+        3) Convert
         4) (Not implemented) Postprocessing (keystone correction, radiance adjustment in OSF and at edges).
         5) Write to file as 32-bit floating point binary BSQ.
+
+        Returns
+        -------
+        (iirspy.L1 or xarray.DataArray): Return as L1 if other L1 files from ISSDC exist, else return the DataArray with no metadata.
         """
-        gain_off_lut = utils.get_lut_file(self.qub, calib_dir=calib_dir)
+        gain_off_lut = utils.get_lut_file(self.qub, **kwargs)
         gain, offset = utils.get_gain_offset(gain_off_lut, denoise_gain)
 
         # Apply gain and offset to convert DN -> Radiance
-        rad = self.img * gain + offset
-        rad.name = "Radiance [µW/cm^2/sr/µm]"
+        rad = 10 * self.img * gain + offset  # [W/m^2/sr/um]
 
-        return rad
+        # Drop OSF and invalid bands. interp if specified
+        rad = rad.where(~rad.band.isin((*utils.OSF, *utils.INVALID)))
+        if interp_osf_method:
+            rad = rad.interpolate_na("band", max_gap=11, keep_attrs=True, method=interp_osf_method)
+
+        # Format as L1 for output
+        out = rad
+        out.name = "Radiance [W/m^2/sr/µm]"
+
+        if get_l1_metadata:
+            try:
+                out = L1(self.basename, str(self.directory), self.extent)
+                out.img = rad
+            except FileNotFoundError:
+                print(
+                    f"Cannot find L1 metadata at {self.directory}. Returning as DataArray. Run with get_l1_metadata=False to suppress this warning."
+                )
+
+        return out
 
 
 class L1(IIRSData):

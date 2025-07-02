@@ -24,7 +24,7 @@
                 <name>Chandrayaan 2 Orbiter</name>
                 <type>Spacecraft</type>
                 <description>
-                    Chandrayaan-2 Orbiter is an Orbiter craft under the Chandrayaan-2 Spacecraft
+                    Chandrayaan-2 Orbiter is an Orbiter craft under the Chandrayaan-2 Spacecraft 
                     consists of various scientific instruments.
                 </description>
             </Observing_System_Component>
@@ -32,8 +32,8 @@
                 <name>imaging infrared spectrometer</name>
                 <type>Instrument</type>
                 <description>
-	            IIRS (Imaging InfraRed Spectrometer) is one of the scientific instrument hosted
-                    on the Chandrayaan-2 Orbiter. The instrument is a grating based spectrometer
+	            IIRS (Imaging InfraRed Spectrometer) is one of the scientific instrument hosted 
+                    on the Chandrayaan-2 Orbiter. The instrument is a grating based spectrometer 
                     covering the spectral region between 0.8 um to 5.0 um.
                 </description>
             </Observing_System_Component>
@@ -53,10 +53,10 @@
             <records>256</records>
             <md5_checksum>188b7da454a4d7fcfc1f4087cb7fb64f</md5_checksum>
             <comment>
-		This file contains a saturation radiance with
-                fields Band Number, saturation, dynamic_range, and validity.
-		Every single line corresponds to each bands of records.
-                md5_checksum is provided for ensuring data integrity
+		This file contains a saturation radiance with 
+                fields Band Number, saturation, dynamic_range, and validity. 
+		Every single line corresponds to each bands of records. 
+                md5_checksum is provided for ensuring data integrity 
                 when users are downloading the data.
             </comment>
         </File>
