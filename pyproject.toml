@@ -1,11 +1,11 @@
-[project]
+1[project]
 name = "iirspy"
 version = "0.0.2"
 description = "Handling and correcting Chandrayaan-2 IIRS data in Python."
 authors = [{ name = "Christian J. Tai Udovicic", email = "cj.taiudovicic@gmail.com" }]
 readme = "README.md"
 keywords = ['python']
-requires-python = ">=3.10,<4.0"
+requires-python = ">=3.10,<=3.11"
 classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python",
