@@ -1,4 +1,4 @@
-1[project]
+[project]
 name = "iirspy"
 version = "0.0.2"
 description = "Handling and correcting Chandrayaan-2 IIRS data in Python."
