@@ -979,6 +979,78 @@ def checksum(fname):
 
 
 ## Image smoothing
+def detect_stripes(da, sigma_threshold=1):
+    """
+    Detect vertical stripes for each individual band in a DataArray.
+    
+    Parameters
+    ----------
+    da : xarray.DataArray
+        Input data array with dimensions ('band', 'y', 'x').
+    sigma_threshold : float, optional
+        The number of standard deviations to use as the threshold for detecting
+        anomalous pixels. Higher values are more conservative (default: 1).
+    
+    Returns
+    -------
+    xarray.DataArray
+        Bool DataArray with dimensions ('band', 'x') indicating if is a stripe.
+    """
+    # Fraction of anomalous pixels to be considered a stripe, in terms of sigma
+    #  E.g. 68% for sigma=1, 95% for sigma=2, 99.7% for sigma=3, etc.
+    frac = norm().cdf(sigma_threshold) - norm().cdf(-sigma_threshold)
+    thresh = frac * len(da.y)  # threshold in num pixels
+
+    # Apply ufunc is hard to parse - applies the stripe detection band-wise
+    #   I.e. `for band in da: detect_stripes_2D(da[band])` 
+    #   but with some fancy vectorizaiton and dask-delayed compute magic
+    out = xr.apply_ufunc(
+        detect_stripes_2D,
+        da, thresh,
+        input_core_dims=[['y', 'x'],[]],
+        output_core_dims=[['x']],
+        exclude_dims={'y'},
+        vectorize=True,
+        dask='parallelized',
+        output_dtypes=[da.dtype]
+    )
+    return out
+
+
+def detect_stripes_2D(data, threshold):
+    """
+    Detect stripe along lines (y) in a 2D image (e.g. a single band from a data cube).
+
+    Defines a stripe as a line with more than thresh pixels lower or higher 
+    than both adjacent pixels (e.g. a hot or cold line).
+
+    Parameters
+    ----------
+    data : 2D array
+        Numpy array image [lines (y), samples (x)]
+    thresh : num
+        Fraction of anomalous pixels to consider a line a stripe.
+
+    References
+    ----------
+    Yokoya, N., Miyamura, N., & Iwasaki, A. (2010). Preprocessing of 
+        hyperspectral imagery with consideration of smile and keystone 
+        properties. In Multispectral, Hyperspectral, and Ultraspectral Remote
+        Sensing Technology, Techniques, and Applications III (Vol. 7857, 
+        pp. 73-81). SPIE.
+
+    """
+    # Make a left and right 2D image to compare with vector math 
+    #  (duplicate left and right edge for simplicity)
+    data_l = np.insert(data[:, :-1], 0, data[:, 0], axis=1)
+    data_r = np.insert(data[:, 1:], -1, data[:, -1], axis=1)
+    # Number anomalous (larger or smaller than both neighbours)
+    num_anom = np.sum(((data < data_l) & (data < data_r)) |
+                      ((data > data_l) & (data > data_r)), axis=0)
+    is_stripe_x = (num_anom > threshold)  # 1D bool array along samples (x)
+    return is_stripe_x
+
+
 def fourier_filter(img, vthresh=0.8, vtilt=0.0, hthresh=0.0, htilt=0.0, get_filt_at_band=None):
     """
     Filters linear features from an img cube in ftt domain.

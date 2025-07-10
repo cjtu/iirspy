@@ -113,6 +113,10 @@ class IIRSData(ABC):
         ax.set_aspect("equal")
 
         return p, ax
+    
+    def detect_stripes(self, sigma_threshold):
+        """Detect stripes in image. See utils.detect_stripes()."""
+        return utils.detect_stripes(self.img, sigma_threshold)
 
 
 class L0(IIRSData):
