@@ -1,10 +1,14 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+import numpy as np
 import pdr
 import xarray as xr
 
 import iirspy.utils as utils
+
+# Skip div 0 and 0/0 warnings
+np.seterr(divide="ignore", invalid="ignore")
 
 
 class IIRSData(ABC):
@@ -21,7 +25,7 @@ class IIRSData(ABC):
         directory : str
             Path to the directory containing IIRS data files.
         extent : tuple
-            Extent in (minlon, maxlon, minlat, maxlat) format.
+            Extent in (minx, maxx, miny, maxy) format.
         chunk : bool or dict
             Chunk image automatically (default: True). Or supply dict of x,y,band chunk sizes (see dask).
         """
@@ -54,6 +58,9 @@ class IIRSData(ABC):
         self.img = xr.open_dataarray(self.qub, engine="rasterio")
         self.shape = self.img.shape
         self.nband, self.ny, self.nx = self.shape
+
+        # Assign wavelength [nm] as coordinate
+        self.img = self.img.assign_coords(wl=("band", utils.get_wls(self.qub)))
 
         # Chunk with dask if needed
         if chunk and self.nband * self.ny * self.nx * 4 > utils.CHUNKSIZE:
@@ -113,7 +120,7 @@ class IIRSData(ABC):
         ax.set_aspect("equal")
 
         return p, ax
-    
+
     def detect_stripes(self, sigma_threshold):
         """Detect stripes in image. See utils.detect_stripes()."""
         return utils.detect_stripes(self.img, sigma_threshold)
@@ -144,7 +151,7 @@ class L0(IIRSData):
     def plot(self, band=12, y=(None, None), x=(None, None), flip_xy=False, **kwargs):
         """Plot image at band and x, y indices if supplied."""
         cbarlabel = kwargs.pop("cbarlabel", "Digital Number")
-        p, ax = super().plot(band, (None, None), (None, None), **kwargs)
+        p, ax = super().plot(band, y, x, **kwargs)
         p.colorbar.ax.set_ylabel(cbarlabel, rotation=-90, va="bottom")
 
         # Flip image if flip_xy (can plot a descending orbit with north up)
@@ -153,46 +160,60 @@ class L0(IIRSData):
             ax.xaxis.set_inverted(True)
         return ax
 
-    def calibrate_to_rad(self, denoise_gain=False, get_l1_metadata=True, interp_osf_method="", **kwargs):
+    def calibrate_to_rad(self, denoise_gain=False, interp_bands=None, calib_dir=utils.DCALIB):
         """
         Perform IIRS L0 digital number to L1 radiance calibration.
 
-        Steps:
+        Steps
+        -----
         0) (Raw data is already dark subtracted).
-        1) Find and apply gain and offset to convert to radiance [W cm^-2 sr^-1 um^-1].
-        2) (Optional) destripe.
-        3) Convert
-        4) (Not implemented) Postprocessing (keystone correction, radiance adjustment in OSF and at edges).
+        1) Find and apply gain and offset to convert to radiance [W/cm^2/sr/um].
+        2) Convert to [W/m^2/sr/µm].
+        4) Drop invalid data (bad bands, order sorting filters, saturated pixels)
+        5) (Optional) Interpolate across band using the strategy in interp_bands (e.g. "linear")
+        4) (IIRS steps not implemented) Postprocessing (keystone correction, radiance adjustment in OSF and at edges).
         5) Write to file as 32-bit floating point binary BSQ.
 
         Returns
         -------
-        (iirspy.L1 or xarray.DataArray): Return as L1 if other L1 files from ISSDC exist, else return the DataArray with no metadata.
+        (xarray.DataArray): Radiance DataArray in [W/m^2/sr/µm].
         """
-        gain_off_lut = utils.get_lut_file(self.qub, **kwargs)
-        gain, offset = utils.get_gain_offset(gain_off_lut, denoise_gain)
+        gain, offset = utils.get_gain_offset(self.qub, denoise_gain, calib_dir=calib_dir)
 
         # Apply gain and offset to convert DN -> Radiance
         rad = 10 * self.img * gain + offset  # [W/m^2/sr/um]
 
         # Drop OSF and invalid bands. interp if specified
         rad = rad.where(~rad.band.isin((*utils.OSF, *utils.INVALID)))
-        if interp_osf_method:
-            rad = rad.interpolate_na("band", max_gap=11, keep_attrs=True, method=interp_osf_method)
 
-        # Format as L1 for output
+        # Drop saturated pixels
+        rad = rad.where(rad < utils.get_saturation_radiance(self.qub, calib_dir))
+
+        # Interpolate across bands
+        if interp_bands is not None:
+            rad = rad.interpolate_na("band", max_gap=11, keep_attrs=True, method=interp_bands)
+
+        # Format and output Radiance DataArray
         out = rad
         out.name = "Radiance [W/m^2/sr/µm]"
 
-        if get_l1_metadata:
-            try:
-                out = L1(self.basename, str(self.directory), self.extent)
-                out.img = rad
-            except FileNotFoundError:
-                print(
-                    f"Cannot find L1 metadata at {self.directory}. Returning as DataArray. Run with get_l1_metadata=False to suppress this warning."
-                )
+        return out
 
+    def calibrate_to_l1(self, *args, **kwargs):
+        """Calibrate to IIRS Level 1 radiance object.
+
+        Requires L1 data to be downloaded from ISSDC to same directory as L0.
+        """
+        try:
+            out = L1(self.basename, str(self.directory), self.extent)
+        except FileNotFoundError as err:
+            raise RuntimeError(
+                f"Cannot find L1 metadata at {self.directory}. Download from ISSDC \
+                or use calibrate_to_rad() method to return radiance without L1 metadata."
+            ) from err
+
+        # Replace l1 image with the calibrated image, keeping metadata the same
+        out.img = self.calibrate_to_rad(*args, **kwargs)
         return out
 
 
@@ -250,36 +271,58 @@ class L1(IIRSData):
             ax.xaxis.set_inverted(True)
         return ax
 
-    def calibrate_to_refl(self):
+    def calibrate_to_refl(self, dem=None, solar_flux=None, thermal_corr=""):
         """
-        Perform IIRS L1 radiance to L2 I/f reflectance calibration.
+        Perform IIRS radiance to I/f reflectance calibration.
 
-        Steps:
+        Steps
+        -----
+
+
+        Returns
+        -------
+        (xarray.DataArray): I/f reflectance [unitless].
         """
-        raise NotImplementedError("Work in progress.")
-        # # Step 1: Read and preprocess the input data
-        # da = utils.preprocess_input_data(self.qub, self.geom, self.spm, ftif, self.extent)
+        import numpy as np
 
-        # # Step 2: Handle bad bands
-        # if drop_bad_bands:
-        #     da = utils.handle_bad_bands(da, self.qub)
+        # Compute solar inc, solar flux and thermal rad for I/f = (rad-trad) / (cos(inc) * solar_flux)
+        rad = self.img
 
-        # # Step 3: Apply destriping if needed
-        # if destripe:
-        #     da = utils.apply_destriping(da, **destripe_kws)
+        # Get solar inc
+        inc, iaz = utils.get_iirs_inc_az(self.qub, self.spm, self.extent[2:])
 
-        # # Step 4: Perform reflectance correction
-        # da = utils.apply_reflectance_correction(da, self.qub, fflux, dem, thermal, max_refl)
+        # (Optional): adjust cos_inc relative to dem
+        if dem is None:
+            cos_inc = np.cos(np.radians(inc))
+        else:
+            if not hasattr(dem, "sel"):
+                dem = xr.open_dataarray(dem, engine="rasterio")
+            lat, _ = utils.get_iirs_latlon(self.csv)
+            lat = lat.interp_like(inc)
+            dem = dem.interp_like(rad.sel(band=dem.band), method="slinear")
+            cos_inc = utils.get_cos_inc_dem(dem, inc, iaz, lat)
+        cos_inc = cos_inc * xr.ones_like(rad.isel(x=0, band=0))  # Add coords (along y)
+        # cos_inc = cos_inc.where((cos_inc > 0.03) & (cos_inc < 0.999))
 
-        # # Step 5: Apply optional spectral polish
+        # Retrieve solar_flux and scale by solar distance at time of this image
+        sdist = utils.get_solar_distance(self.qub)
+        if solar_flux is None:
+            solar_flux = utils.get_solar_flux(sdist, utils.FSOLAR)
+
+        # Compute thermal radiance
+        trad = 0.0
+        if thermal_corr == "verma":
+            trad = utils.get_thermal_rad_verma(rad, rad.wl * 1e-9)  # wl [nm] -> wl [m]
+        elif thermal_corr:
+            raise ValueError('Invalid thermal_corr. Options: ("", "verma")')
+
+        # Convert to I/F reflectance
+        refl = (rad - trad) / (cos_inc * solar_flux)
+
         # if polish:
         #     da = utils.apply_spectral_polish(da, fpolish)
 
-        # # Step 6: Apply smoothing
-        # if smoothing.lower() != "none":
-        #     da = utils.apply_smoothing(da, smoothing, swindow)
-
-        # # Step 7: Write output if specified
-        # if fout:
-        #     utils.write_output(da, fout, self.geom, self.extent, ftif)
-        # return da
+        # Format and output Reflectance DataArray
+        refl.name = "Reflectance"
+        refl = refl.assign_coords(wl=("band", utils.get_wls(self.qub)))
+        return refl
