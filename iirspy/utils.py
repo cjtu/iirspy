@@ -29,7 +29,8 @@ DCALIB = PKG_DATA.joinpath("iir/calibration")
 CHUNKSIZE = 200e6  # [MB] chunk large images into this size with dask to fit in RAM (typically between 100MB-1GB)
 FPOLISH = str(PKG_DATA.joinpath("spectral_polish_verma2022.csv"))
 FBADBANDS = str(PKG_DATA.joinpath("iirs_bad_bands.csv"))
-FSOLAR = str(PKG_DATA.joinpath("ch2_iirs_solar_flux.txt"))
+FSOLAR = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_solar_flux.txt"))
+FWAVELENGTHS = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_wavelength.txt"))
 # Projections used in the Ch2 IIRS selenoref tool https://doi.org/10.1007/s12524-024-01814-4
 IIRS_PROJ_DICT = {
     "equatorial": 'PROJCS["Moon_Equidistant_Cylindrical",GEOGCS["Moon 2000",DATUM["D_Moon_2000",SPHEROID["Moon_2000_IAU_IAG",1737400.0,0.0]],PRIMEM["Greenwich",0],UNIT["Decimal_Degree",0.0174532925199433]],PROJECTION["Equidistant_Cylindrical"],PARAMETER["False_Easting",0],PARAMETER["False_Northing",0],PARAMETER["Central_Meridian",0],PARAMETER["Standard_Parallel_1",0],UNIT["Meter",1]]',
@@ -133,12 +134,14 @@ def preprocess_input_data(fqub, fgeom, fspm, ftif, extent, yrange, ychunks):
     else:
         print("Unknown orbit, assuming ascending")
     if fgeom:
-        # Ascending
-        yoff = 51
         ymin, ymax = yrange
-        if yflip:  # Descending
-            yoff = -86
-            ymin, ymax = yrange
+        yoff = 0
+        # Ascending
+        # yoff = 51
+        # ymin, ymax = yrange
+        # if yflip:  # Descending
+        #     yoff = -86
+        #     ymin, ymax = yrange
         ys = np.linspace(ymin, ymax, len(da.y), endpoint=False) - yoff
         lon2d, lat2d, extent = geom2grid(fgeom, extent, xs=da.x, ys=ys)
         da = da.assign_coords(lon=(("y", "x"), lon2d))
@@ -690,14 +693,34 @@ def get_iirs_paths(
     return out
 
 
-def get_wls(fname, as_str=False):
-    """Return the wavelength labels from the image metadata."""
+def get_wls(fname):
+    """Return the wavelength [nm] for each band from image metadata."""
     img = pdr.open(fname)
     wl_dict = list(img.metaget("Band_Bin_Set").values())
-    wls = [float(wl["center_wavelength"]) for wl in wl_dict]
-    if as_str:
-        return [f"{wl} nm" for wl in wls]
-    return wls
+    return np.array([float(wl["center_wavelength"]) for wl in wl_dict])
+
+
+def get_wl_labels(fname):
+    """Return labels for wavelegnths in str format, e.g. for an ENVI header."""
+    wls = get_wls(fname)
+    return [f"{wl} nm" for wl in wls]
+
+
+def get_iirs_latlon(fgeom, center=False):
+    """Return lat and lon grids from iirs geometry csv file as DataArrays.
+
+    Note: Provided lat/lon are reported for every 50th line/sample, not every pixel.
+    """
+    df = pd.read_csv(fgeom).rename(columns={"Pixel": "x", "Scan": "y"})
+    df["Longitude"] = (df["Longitude"] + 180) % 360 - 180  # lon in [-180, 180]
+    # set coords from 1 to max(coord) unless center coords, which start at 0.5
+    df["x"] = df.x + 1 - 0.5 * center
+    df["y"] = df.y + 1 - 0.5 * center
+    df2d = df.set_index(["y", "x"])
+    lat = xr.DataArray(df2d.Latitude.unstack())
+    lon = xr.DataArray(df2d.Longitude.unstack())
+
+    return lat, lon
 
 
 def parse_geom(fgeom, extent=(None, None, None, None), buffer=0, center=False, as_gcps=False, corners_only=False):
@@ -802,13 +825,6 @@ def get_iirs_shape_meta(fimg):
     return bands, lines, samples
 
 
-def get_iirs_solar_flux(sdist=1, fflux=FSOLAR):
-    """Return the solar flux from the IIRS solar flux csv."""
-    df = pd.read_csv(fflux, sep="\t", header=None, names=["wl", "flux"])
-    df.loc[:, "flux"] = df.flux / 3.14 / sdist**2
-    return df
-
-
 def load_bad_bands(fbad_bands=FBADBANDS):
     """Load bad bands from a CSV file."""
     # Negates the df since provided bad bands file is 1 for good, 0 for bad
@@ -874,7 +890,7 @@ def get_lut_file(fimg, lut_type="lut_coeff", calib_dir=DCALIB):
     raise FileNotFoundError(f"IIRS calibration file {flut} not found.")
 
 
-def get_gain_offset(flut, denoise=False, gain_z=None, offset_z=None):
+def get_gain_offset(fimg, denoise=False, gain_z=None, offset_z=None, calib_dir=DCALIB):
     """
     Return the IIRS gain and offset for fimg as DataArrays.
 
@@ -885,6 +901,7 @@ def get_gain_offset(flut, denoise=False, gain_z=None, offset_z=None):
     denoise: bool
         Replace speckly noise from gain / offset with NaN.
     """
+    flut = get_lut_file(fimg, "lut_coeff", calib_dir)
     zdefaults = {  # Empirically selected z-thresholds for gain, offset
         "ch2_iirs_cal_e1g2_lut_coeff.csv": (0.01, 0.5),
         "ch2_iirs_cal_e2g2_lut_coeff.csv": (0.5, 0.1),
@@ -913,6 +930,20 @@ def get_gain_offset(flut, denoise=False, gain_z=None, offset_z=None):
     return gain, off
 
 
+def get_saturation_radiance(fimg, calib_dir=DCALIB):
+    """Return IIRS saturation radiance file as 1D DataArray along band."""
+    flut = get_lut_file(fimg, "saturations_radiance", calib_dir)
+    lut = np.loadtxt(flut, delimiter=",", usecols=2)  # band, wl, saturation [1000 mW/cm^2/sr/um]
+    return 0.01 * xr.DataArray(lut, coords={"band": np.arange(1, 257)}, name="saturation [W/m^2/sr/um]")
+
+
+def get_solar_flux(sdist=1.0, fflux=FSOLAR):
+    """Return IIRS solar flux as DataArray along band."""
+    L = np.loadtxt(fflux, delimiter="\t", usecols=1)
+    flux = L * 10 / (np.pi * sdist**2)  # [W/m^2/sr/um]
+    return xr.DataArray(flux, coords={"band": np.arange(1, 257)}, name="Solar flux [W/m^2/sr/um]")
+
+
 def get_solar_distance(fimg):
     """Return the solar distance from the IIRS metadata."""
     # TODO: Do properly - needs spice. doesn't seem to be in the metadata
@@ -925,7 +956,7 @@ def get_solar_distance(fimg):
         return 1.0174
     elif "20210622T1850441449" in fimg.stem or "20210622T1454378054" in fimg.stem or "20210622T1256344234" in fimg.stem:
         return 1.0184
-    return 1
+    return 1.0
 
 
 def write_envi(da, fout):
@@ -979,6 +1010,78 @@ def checksum(fname):
 
 
 ## Image smoothing
+def detect_stripes(da, sigma_threshold=1):
+    """
+    Detect vertical stripes for each individual band in a DataArray.
+
+    Parameters
+    ----------
+    da : xarray.DataArray
+        Input data array with dimensions ('band', 'y', 'x').
+    sigma_threshold : float, optional
+        The number of standard deviations to use as the threshold for detecting
+        anomalous pixels. Higher values are more conservative (default: 1).
+
+    Returns
+    -------
+    xarray.DataArray
+        Bool DataArray with dimensions ('band', 'x') indicating if is a stripe.
+    """
+    # Fraction of anomalous pixels to be considered a stripe, in terms of sigma
+    #  E.g. 68% for sigma=1, 95% for sigma=2, 99.7% for sigma=3, etc.
+    frac = norm().cdf(sigma_threshold) - norm().cdf(-sigma_threshold)
+    thresh = frac * len(da.y)  # threshold in num pixels
+
+    # Apply ufunc is hard to parse - applies the stripe detection band-wise
+    #   I.e. `for band in da: detect_stripes_2D(da[band])`
+    #   but with some fancy vectorizaiton and dask-delayed compute magic
+    out = xr.apply_ufunc(
+        detect_stripes_2D,
+        da,
+        thresh,
+        input_core_dims=[["y", "x"], []],
+        output_core_dims=[["x"]],
+        exclude_dims={"y"},
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[da.dtype],
+    )
+    return out
+
+
+def detect_stripes_2D(data, threshold):
+    """
+    Detect stripe along lines (y) in a 2D image (e.g. a single band from a data cube).
+
+    Defines a stripe as a line with more than thresh pixels lower or higher
+    than both adjacent pixels (e.g. a hot or cold line).
+
+    Parameters
+    ----------
+    data : 2D array
+        Numpy array image [lines (y), samples (x)]
+    thresh : num
+        Fraction of anomalous pixels to consider a line a stripe.
+
+    References
+    ----------
+    Yokoya, N., Miyamura, N., & Iwasaki, A. (2010). Preprocessing of
+        hyperspectral imagery with consideration of smile and keystone
+        properties. In Multispectral, Hyperspectral, and Ultraspectral Remote
+        Sensing Technology, Techniques, and Applications III (Vol. 7857,
+        pp. 73-81). SPIE.
+
+    """
+    # Make a left and right 2D image to compare with vector math
+    #  (duplicate left and right edge for simplicity)
+    data_l = np.insert(data[:, :-1], 0, data[:, 0], axis=1)
+    data_r = np.insert(data[:, 1:], -1, data[:, -1], axis=1)
+    # Number anomalous (larger or smaller than both neighbours)
+    num_anom = np.sum(((data < data_l) & (data < data_r)) | ((data > data_l) & (data > data_r)), axis=0)
+    is_stripe_x = num_anom > threshold  # 1D bool array along samples (x)
+    return is_stripe_x
+
+
 def fourier_filter(img, vthresh=0.8, vtilt=0.0, hthresh=0.0, htilt=0.0, get_filt_at_band=None):
     """
     Filters linear features from an img cube in ftt domain.
