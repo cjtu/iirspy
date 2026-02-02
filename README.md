@@ -10,7 +10,11 @@ Toolkit for working with ISRO's Chandrayaan-2 IIRS dataset. This is a work in pr
     * This will make a new virtual environment and run the `iirspy` tests
     * You can now use this `venv` from an IDE or `uv run ipython` for an interactive prompt
 
-## Current Workflow
+## Worked example
+
+Check out the fully worked examples notebooks [here](https://github.com/cjtu/iirspy/tree/main/iirspy/examples).
+
+## Quickstart
 
 1. Download IIRS data from the PRADAN / ISSDC system (requires an account).
 2. Use `iirspy` to read data by giving the datetime basename and a local directory. Use `L0` for raw or `L1` for calibrated. The package unzips the downloaded files if necessary.
@@ -22,7 +26,7 @@ Toolkit for working with ISRO's Chandrayaan-2 IIRS dataset. This is a work in pr
     iirs_l1_rad = iirspy.L1("20210720T2333026105", "/path/to/data/", extent)
     ```
 
-3. (Optional): Check that files were downloaded and unzipped correctly (slow!). Useful when files are added or changed. Prints nothing if successful.
+3. (Optional): Check that files were downloaded and unzipped correctly. Useful when files are added or changed. Prints nothing if successful.
 
     ```python
     iirs_l0_raw.checksum()
@@ -43,11 +47,11 @@ Toolkit for working with ISRO's Chandrayaan-2 IIRS dataset. This is a work in pr
     iirs_l0_raw.img.sel(y=slice(6000, 6250)).median(dims=('x', 'y')).plot()
     ```
 
-5. Calibration (coming soon)
+5. Calibration (work in progress)
 
     ```python
-    radiance = iirs_l0_raw.calibrate_to_rad()
-    reflectance = iirs_l1_rad.calibrate_to_refl()
+    l1_radiance = iirs_l0_raw.calibrate()
+    l2_reflectance = iirs_l1_rad.calibrate()
     ```
 
 ## Other features
@@ -76,27 +80,17 @@ print("Solar inc (deg):", l0.metaget("isda:solar_incidence"))
 
 Note: Raw data from ISSDCC is already dark subtracted.
 
-1. (Optional): Remove bad pixels from gain and offset array 
-2. Apply gain and offset from lookup table to convert DN to radiance [mW cm^-2 sr^-1 um^-1]
-2. (Optional): Destripe the result.
-4. (Not implemented) Postprocessing (keystone correction, radiance adjustment at order-sorting-filters and at sensor edges).
-5. Write to file as 32-bit floating point binary BSQ.
+1. Remove bad pixels from gain and offset array 
+2. Apply destriping.
+3. (Not implemented) Postprocessing (keystone correction, radiance adjustment at order-sorting-filters and at sensor edges).
+4. Write subset data to file.
 
-### Georeferencing to LOLA DEM
+### Georeferencing
 
-Using the `ldem_80s_20m` from LOLA.
+Currently works decently for equatorial L1 data using supplied GCPs but fails near poles. Using the `ldem_80s_20m` from LOLA:
 
-1. Read image with lat/lon extent in python and find nearest latitudes given in the geom `.csv` file
-2. Crop to desired lines using `gdal`
-3. Import into QGIS
-4. Select tie-points from `ldem` to IIRS image
-5. Warp DEM to image coords (bilinear interpolation, thin plate spline)
-
-Manual method:
-
-- Read reflectance image into QGIS
-- Choose tie points (or use the previous ones for dem, reversed)
-- Project to Spole stereo (`IAU_2015:30135`)
+- ingest tie-points and warp
+- auto control points / img to img matching
 
 ### Reflectance correction
 
