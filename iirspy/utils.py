@@ -32,7 +32,7 @@ CHUNKSIZE = 200e6  # [MB] chunk large images into this size with dask to fit in 
 FPOLISH = str(PKG_DATA.joinpath("spectral_polish_verma2022.csv"))
 FBADBANDS = str(PKG_DATA.joinpath("iirs_bad_bands.csv"))
 FSOLAR = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_solar_flux.txt"))
-FWAVELENGTHS = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_wavelength.txt"))
+FWAVELENGTHS = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_wavelength.csv"))
 # Projections used in the Ch2 IIRS selenoref tool https://doi.org/10.1007/s12524-024-01814-4
 IIRS_PROJ_DICT = {
     "equatorial": 'PROJCS["Moon_Equidistant_Cylindrical",GEOGCS["Moon 2000",DATUM["D_Moon_2000",SPHEROID["Moon_2000_IAU_IAG",1737400.0,0.0]],PRIMEM["Greenwich",0],UNIT["Decimal_Degree",0.0174532925199433]],PROJECTION["Equidistant_Cylindrical"],PARAMETER["False_Easting",0],PARAMETER["False_Northing",0],PARAMETER["Central_Meridian",0],PARAMETER["Standard_Parallel_1",0],UNIT["Meter",1]]',
@@ -747,7 +747,13 @@ def get_iirs_paths(
     return out
 
 
-def get_wls(fname):
+def get_wls(fwavelengths=FWAVELENGTHS):
+    """Return the wavelength [nm] for each band from IIRS wavelengths file."""
+    df = pd.read_csv(fwavelengths, header=0, names=["band", "wl"], usecols=[0, 1])
+    return df["wl"].values
+
+
+def get_wls_xml(fname):
     """Return the wavelength [nm] for each band from image metadata."""
     img = pdr.open(fname)
     wl_dict = list(img.metaget("Band_Bin_Set").values())
@@ -1410,7 +1416,7 @@ def smooth_savgol(data: xr.DataArray, savgol_window: int = 9, savgol_polyorder: 
     return result
 
 
-def plot_spectra_with_sigma(da: xr.DataArray, ax=None, label: str = "", stdev_alpha=0.2, **kwargs) -> None:
+def plot_spectra_with_sigma(da: xr.DataArray, ax=None, label: str = "", stdev_alpha=0.2, **kwargs):
     """
     Plot the median reflectance spectrum and ±1 sigma spread as lower alpha bands.
 
@@ -1418,12 +1424,16 @@ def plot_spectra_with_sigma(da: xr.DataArray, ax=None, label: str = "", stdev_al
     ----------
     da : xr.DataArray
         Reflectance data with dimensions ('band', 'y', 'x').
-    axis : matplotlib.axes.Axes, optional
+    ax : matplotlib.axes.Axes, optional
         Axis to plot on. If None, uses current axis.
     label : str, optional
         Label for the median line.
     color : str, optional
         Color for the median line and fill.
+
+    Returns
+    -------
+    ax : matplotlib.axes.Axes
     """
     if ax is None:
         ax = plt.gca()
@@ -1445,7 +1455,7 @@ def plot_spectra_with_sigma(da: xr.DataArray, ax=None, label: str = "", stdev_al
         alpha=stdev_alpha,
     )
     ax.set_xlabel("Wavelength")
-    ax.legend()
+    ax.legend(frameon=False)
     return ax
 
 

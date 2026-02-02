@@ -1,3 +1,4 @@
+import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -16,6 +17,29 @@ def bounds2extent(bounds):
     """Convert bounds to extent tuple."""
     minx, miny, maxx, maxy = bounds
     return (minx, maxx, miny, maxy)
+
+
+def _try_load_next_level_metadata(basename, target_level, directory, xyextent):
+    """Attempt to load ancillary files for target_level. Return dict with found files or None."""
+    directory = Path(directory).expanduser().absolute()
+    result = {"geometry": None, "spm": None, "geometry_df": None}
+
+    try:
+        paths = utils.get_iirs_paths(directory, level=target_level, basenames=[basename])
+        if target_level >= 1:
+            csv_path = paths.get("csv", {}).get(basename)
+            if csv_path and csv_path.exists():
+                result["geometry"] = csv_path
+                df, _ = utils.parse_geom(csv_path, xyextent=xyextent)
+                result["geometry_df"] = df
+
+            spm_path = paths.get("spm", {}).get(basename)
+            if spm_path and spm_path.exists():
+                result["spm"] = spm_path
+    except (FileNotFoundError, KeyError, ValueError):
+        pass
+
+    return result
 
 
 class IIRSData(ABC):
@@ -67,7 +91,7 @@ class IIRSData(ABC):
         self.nband, self.ny, self.nx = self.shape
 
         # Assign wavelength [nm] as coordinate
-        self.img = self.img.assign_coords(wl=("band", utils.get_wls(self.qub)))
+        self.img = self.img.assign_coords(wl=("band", utils.get_wls()))
 
         # Chunk with dask if needed
         if chunk and self.nband * self.ny * self.nx * 4 > utils.CHUNKSIZE:
@@ -83,7 +107,6 @@ class IIRSData(ABC):
         metadata = {k[5:]: v for k, v in product_meta.items()}
         extra_keys = [
             "logical_identifier",
-            "version_id",
             "modification_date",
             "start_date_time",
             "stop_date_time",
@@ -127,8 +150,10 @@ class IIRSData(ABC):
         if len(data.y) > 2000:
             data = data.sel(y=slice(None, None, len(data.y) // 1000))
 
+        # Xarray plots with lat increasing up, but when it's raw DN (y coords) origin should be upper left
+        yincrease = "y" in kwargs and kwargs["y"].lower() in ["lat", "latitude"]
         # Plot
-        p = data.plot(vmin=vmin, cmap=cmap, **kwargs)
+        p = data.plot(vmin=vmin, cmap=cmap, yincrease=yincrease, **kwargs)
         ax = p.axes
         ax.set_title(title)
         ax.set_aspect("equal")
@@ -144,7 +169,11 @@ class IIRSData(ABC):
         Plot image at band and x, y indices. Lowers resolution along y if large.
         """
         data = self.img.sel(band=slice(*bands), y=slice(*yrange), x=slice(*xrange))
-        return utils.plot_spectra_with_sigma(data, **kwargs)
+        ax = utils.plot_spectra_with_sigma(data, **kwargs)
+        ylabel = self.img.attrs.get("name", "")
+        ylabel += f' [${self.img.attrs.get("units", "")}$]' if self.img.attrs.get("units", "") else ""
+        ax.set_ylabel(ylabel)
+        return ax
 
     def detect_stripes(self, sigma_threshold):
         """Detect stripes in image. See utils.detect_stripes()."""
@@ -178,7 +207,9 @@ class L0(IIRSData):
             self.bounds = self.img.rio.bounds()
         except NoDataInBounds as e:
             raise ValueError(f"No data found within extent {self.extent} for {self.basename}.") from e
-        self.extent = bounds2extent(self.bounds)
+        self.extent = tuple(int(e) for e in bounds2extent(self.bounds))
+        self.img.attrs["name"] = "Digital Number"
+        self.img.attrs["units"] = ""
 
     def plot(self, band=12, yrange=(None, None), xrange=(None, None), flip_xy=False, **kwargs):
         """Plot image at band and x, y indices if supplied."""
@@ -236,29 +267,96 @@ class L0(IIRSData):
         # Format and output Radiance DataArray
         out = rad
         out.name = "Radiance [W/m^2/sr/µm]"
+        out.attrs["name"] = "Radiance"
+        out.attrs["units"] = "W/m^2/sr/um"
+        out.attrs["calibration_source"] = "user"
 
         return out
 
-    def calibrate_to_l1(self, *args, **kwargs):
-        """Calibrate to IIRS Level 1 radiance object.
-
-        Requires L1 data to be downloaded from ISSDC to same directory as L0.
-        """
+    def calibrate(self, *args, **kwargs):
+        """Calibrate to L1 radiance using ISSDC calibration files if they exist."""
+        img = self.calibrate_to_rad(*args, **kwargs)
         try:
             out = L1(self.basename, str(self.directory), self.extent)
-        except FileNotFoundError as err:
-            raise RuntimeError(
-                f"Cannot find L1 metadata at {self.directory}. Download from ISSDC \
-                or use calibrate_to_rad() method to return radiance without L1 metadata."
-            ) from err
+            out.img = img
+        except FileNotFoundError:
+            warnings.warn(
+                f"L1 files not found. Expected prefix: ch2_iir_nci_{self.basename} "
+                f"at {self.directory}. Continuing without metadata.",
+                UserWarning,
+                stacklevel=2,
+            )
+            out = L1.from_xarray(img, self.basename, str(self.directory))
 
-        # Replace l1 image with the calibrated image, keeping metadata the same
-        out.img = self.calibrate_to_rad(*args, **kwargs)
         return out
 
 
 class L1(IIRSData):
     """Class for reading, handling, and processing L1 IIRS data to L2 reflectance."""
+
+    @classmethod
+    def from_xarray(
+        cls,
+        data,
+        basename,
+        directory=".",
+        latlonextent=None,
+    ):
+        """Create L1 instance from user-calibrated xarray.DataArray.
+
+        Opportunistically loads L1 metadata if available.
+
+        Parameters
+        ----------
+        data : xarray.DataArray
+            Radiance data with wavelength coordinate.
+        basename : str
+            Image basename (e.g. 20201214T0844306700).
+        directory : str
+            Directory to search for L1 ancillary files.
+        latlonextent : tuple, optional
+            Approximate image corners (minlon, maxlon, minlat, maxlat).
+
+        Returns
+        -------
+        L1
+            Instance with attached metadata where available.
+        """
+        instance = cls.__new__(cls)
+        instance.basename = utils.iirsbasename(basename)
+        instance.directory = Path(directory).expanduser().absolute()
+        instance.level = 1
+        instance.img = data
+        instance.shape = data.shape
+        instance.nband, instance.ny, instance.nx = instance.shape
+        instance.extent = (int(data.x.min()), int(data.x.max()), int(data.y.min()), int(data.y.max()))
+        instance.bounds = (instance.extent[0], instance.extent[2], instance.extent[1], instance.extent[3])
+
+        instance.img.attrs["name"] = "Radiance"
+        instance.img.attrs["units"] = "W/m^2/sr/um"
+        if "calibration_source" not in data.attrs:
+            instance.img.attrs["calibration_source"] = "user"
+
+        metadata = _try_load_next_level_metadata(instance.basename, 1, directory, instance.extent)
+        instance.csv = metadata["geometry"]
+        instance.geomdf = metadata["geometry_df"]
+        instance.spm = metadata["spm"]
+        instance.metadata = {}
+
+        if latlonextent and instance.geomdf is not None:
+            instance.geomdf, xy_extent = utils.parse_geom(instance.csv, latlonextent, center=False)
+            instance.extent = xy_extent
+            lon, lat = utils.geom2latlon_coords(instance.geomdf, xy_extent, instance.nx, instance.ny)
+            instance.img = instance.img.assign_coords({"lon": ("x", lon), "lat": ("y", lat)})
+
+        if instance.spm is not None:
+            inc, iaz = utils.get_iirs_inc_az(None, instance.spm, instance.extent[2:])
+            instance.img = instance.img.assign_coords({
+                "solar_inc": ("y", inc),
+                "solar_az": ("y", iaz),
+            })
+
+        return instance
 
     def __init__(
         self,
@@ -289,7 +387,7 @@ class L1(IIRSData):
         super().__init__(basename, directory, xyextent, chunk, level=1)
 
         # Parse geometry, store gcps and extent in x, y
-        self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, center=False)
+        self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, xyextent, center=False)
         # replace any None in extent with values from xy_extent
         self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent))
         self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
@@ -302,6 +400,9 @@ class L1(IIRSData):
 
         # Fix units
         self.img *= 0.01  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
+        self.img.attrs["name"] = "Radiance"
+        self.img.attrs["units"] = "W/m^2/sr/um"
+        self.img.attrs["calibration_source"] = "issdc"
 
         # Assign lat, lon coordinates
         lon, lat = utils.geom2latlon_coords(self.geomdf, xy_extent, self.shape[2], self.shape[1])
@@ -317,64 +418,239 @@ class L1(IIRSData):
             "solar_az": ("y", iaz),
         })
 
-    def plot(self, band=12, yrange=(None, None), xrange=(None, None), north_up=True, **kwargs):
+    def plot(self, band=12, yrange=(None, None), xrange=(None, None), **kwargs):
         """Plot image at band and x, y indices if supplied."""
         if "cbarlabel" not in kwargs:
             kwargs["cbarlabel"] = "Radiance [$W/m^2/sr/um$]"
-        p, ax = super().plot(band, yrange, xrange, x="lon", y="lat", **kwargs)
+        x, y = ("lon", "lat") if "lon" in self.img.coords and "lat" in self.img.coords else ("x", "y")
+        p, ax = super().plot(band, yrange, xrange, x=x, y=y, **kwargs)
         return ax
 
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
         return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
-    def calibrate_to_refl(self, dem=None, solar_flux=None, thermal_corr=""):
-        """
-        Perform IIRS radiance to I/f reflectance calibration.
+    def calibrate(self, inc=None, dem=None, solar_flux=None, thermal_corr=""):
+        """Calibrate to L2 reflectance object (requires SPM file for solar angles)."""
+        if self.spm is None:
+            raise FileNotFoundError(
+                f"SPM file required for reflectance calibration. Expected: "
+                f"{self.directory}/miscellaneous/calibrated/ch2_iir_nci_{self.basename}_spm.dat"
+            )
 
-        Steps
-        -----
+        return L2._from_l1(
+            self,
+            inc=inc,
+            dem=dem,
+            solar_flux=solar_flux,
+            thermal_corr=thermal_corr,
+        )
 
+
+class L2(IIRSData):
+    """Class for IIRS L2 reflectance data."""
+
+    @classmethod
+    def from_xarray(
+        cls,
+        data,
+        basename,
+        directory=".",
+        latlonextent=None,
+    ):
+        """Create L2 instance from user-calibrated xarray.DataArray.
+
+        Opportunistically loads L2 metadata if available.
+
+        Parameters
+        ----------
+        data : xarray.DataArray
+            Reflectance data with wavelength coordinate.
+        basename : str
+            Image basename (e.g. 20201214T0844306700).
+        directory : str
+            Directory to search for L2 ancillary files.
+        latlonextent : tuple, optional
+            Approximate image corners (minlon, maxlon, minlat, maxlat).
 
         Returns
         -------
-        (xarray.DataArray): I/f reflectance [unitless].
+        L2
+            Instance with attached metadata where available.
         """
-        import numpy as np
+        instance = cls.__new__(cls)
+        instance.basename = utils.iirsbasename(basename)
+        instance.directory = Path(directory).expanduser().absolute()
+        instance.level = 2
+        instance.img = data
+        instance.shape = data.shape
+        instance.nband, instance.ny, instance.nx = instance.shape
+        instance.extent = (int(data.x.min()), int(data.x.max()), int(data.y.min()), int(data.y.max()))
+        instance.bounds = (instance.extent[0], instance.extent[2], instance.extent[1], instance.extent[3])
+        instance.metadata = {}
 
-        # Compute solar inc, solar flux and thermal rad for I/f = (rad-trad) / (cos(inc) * solar_flux)
-        rad = self.img
+        instance.img.attrs["name"] = "Reflectance"
+        instance.img.attrs["units"] = ""
+        if "calibration_source" not in data.attrs:
+            instance.img.attrs["calibration_source"] = "user"
 
-        cos_inc = np.cos(np.radians(rad.solar_inc))
-        # (Optional): adjust cos_inc relative to dem
+        metadata = _try_load_next_level_metadata(instance.basename, 2, directory, instance.extent)
+        instance.csv = metadata["geometry"]
+        instance.geomdf = metadata["geometry_df"]
+        instance.spm = metadata["spm"]
+
+        if latlonextent and instance.geomdf is not None:
+            instance.geomdf, xy_extent = utils.parse_geom(instance.csv, latlonextent, center=False)
+            instance.extent = xy_extent
+            lon, lat = utils.geom2latlon_coords(instance.geomdf, xy_extent, instance.nx, instance.ny)
+            instance.img = instance.img.assign_coords({"lon": ("x", lon), "lat": ("y", lat)})
+
+        return instance
+
+    @classmethod
+    def _from_l1(cls, l1_instance, inc=None, dem=None, solar_flux=None, thermal_corr=""):
+        """Internal method to create L2 from L1 instance."""
+        instance = cls.__new__(cls)
+        instance.basename = l1_instance.basename
+        instance.directory = l1_instance.directory
+        instance.level = 2
+        instance.extent = l1_instance.extent
+        instance.bounds = l1_instance.bounds
+        instance.shape = l1_instance.shape
+        instance.nband, instance.ny, instance.nx = instance.shape
+        instance.csv = l1_instance.csv
+        instance.geomdf = l1_instance.geomdf
+        instance.spm = l1_instance.spm
+        instance.metadata = l1_instance.metadata.copy()
+
+        instance.img = instance._compute_reflectance(
+            l1_instance.img,
+            l1_instance.qub if hasattr(l1_instance, "qub") else None,
+            l1_instance.csv if hasattr(l1_instance, "csv") else None,
+            inc=inc,
+            dem=dem,
+            solar_flux=solar_flux,
+            thermal_corr=thermal_corr,
+        )
+        instance.img.attrs["calibration_source"] = "user"
+
+        return instance
+
+    def _compute_reflectance(self, rad, qub_path, csv_path, inc=None, dem=None, solar_flux=None, thermal_corr=""):
+        """
+        Compute I/f reflectance from radiance data and solar geometry.
+
+        Optinally corrects for topographic effects and thermal correction.
+
+        Parameters
+        ----------
+        rad : xarray.DataArray
+            Radiance data array containing solar_inc, solar_az, and wl attributes.
+        qub_path : str or None
+            Path to QUB file for extracting solar distance. If None, assumes solar distance of 1.0 AU.
+        csv_path : str
+            Path to CSV file containing IIRS latitude/longitude information.
+        inc : float or xarray.DataArray, optional
+            Solar incidence angle in degrees. If None, extracted from rad coordinates.
+        dem : xarray.DataArray or str, optional
+            Digital elevation model as an xarray DataArray or path to DEM file.
+            If provided, topographic effects are corrected using the DEM. Default is None.
+        solar_flux : array-like, optional
+            Solar flux values for each band. If None, computed automatically from solar distance
+            and default solar flux constants. Default is None.
+        thermal_corr : str, optional
+            Thermal correction method. Currently supports:
+            - "" (empty string): No thermal correction (default)
+            - "verma": Apply Verma thermal correction method
+        Returns
+        -------
+        xarray.DataArray
+            Reflectance data array with name "Reflectance" and empty units attribute.
+        Raises
+        ------
+        ValueError
+            If thermal_corr is not "" or "verma".
+        Notes
+        -----
+        The reflectance is calculated as:
+        where trad is the thermal radiance component (if thermal correction is applied).
+        """
+        cos_inc = np.cos(np.radians(inc)) if inc is not None else np.cos(np.radians(rad.solar_inc))
+
         if dem is not None:
             if not hasattr(dem, "sel"):
                 dem = xr.open_dataarray(dem, engine="rasterio")
-            lat, _ = utils.get_iirs_latlon(self.csv)
+            lat, _ = utils.get_iirs_latlon(csv_path)
             lat = lat.interp_like(rad.solar_inc)
             dem = dem.interp_like(rad.sel(band=dem.band), method="slinear")
             cos_inc = utils.get_cos_inc_dem(dem, rad.solar_inc, rad.solar_az, lat)
-        cos_inc = cos_inc * xr.ones_like(rad.isel(x=0, band=0))  # Add coords (along y)
-        # cos_inc = cos_inc.where((cos_inc > 0.03) & (cos_inc < 0.999))
+        cos_inc = cos_inc * xr.ones_like(rad.isel(x=0, band=0))
 
-        # Retrieve solar_flux and scale by solar distance at time of this image
-        sdist = utils.get_solar_distance(self.qub)
+        sdist = utils.get_solar_distance(qub_path) if qub_path else 1.0
+
         if solar_flux is None:
             solar_flux = utils.get_solar_flux(sdist, utils.FSOLAR)
 
-        # Compute thermal radiance
         trad = 0.0
         if thermal_corr == "verma":
-            trad = utils.get_thermal_rad_verma(rad, rad.wl * 1e-9)  # wl [nm] -> wl [m]
+            trad = utils.get_thermal_rad_verma(rad, rad.wl * 1e-9)
         elif thermal_corr:
-            raise ValueError('Invalid thermal_corr. Options: ("", "verma")')
+            raise ValueError('thermal_corr must be "" or "verma"')
 
-        # Convert to I/F reflectance
         refl = (rad - trad) / (cos_inc * solar_flux)
-
-        # if polish:
-        #     da = utils.apply_spectral_polish(da, fpolish)
-
-        # Format and output Reflectance DataArray
+        # add wl array as coordinate if missing
+        if "wl" not in refl.coords:
+            refl = refl.assign_coords(wl=rad.wl)
         refl.name = "Reflectance"
-        refl = refl.assign_coords(wl=("band", utils.get_wls(self.qub)))
+        refl.attrs["name"] = "Reflectance"
+        refl.attrs["units"] = ""
+
         return refl
+
+    def __init__(
+        self,
+        basename,
+        directory=".",
+        xyextent=(None, None, None, None),
+        lonlatextent=(None, None, None, None),
+        chunk=True,
+    ):
+        """Initialize L2 from ISSDC files (if available)."""
+        if any(e is not None for e in xyextent) and any(e is not None for e in lonlatextent):
+            raise ValueError("Only one of lonlatextent and xyextent can be given.")
+        super().__init__(basename, directory, xyextent, chunk, level=2)
+
+        metadata = _try_load_next_level_metadata(self.basename, 2, directory, self.extent)
+        self.csv = metadata["geometry"]
+        self.geomdf = metadata["geometry_df"]
+        self.spm = metadata["spm"]
+
+        if self.geomdf is not None:
+            self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, center=False)
+            self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent))
+
+        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
+        try:
+            self.bounds = self.img.rio.bounds()
+        except NoDataInBounds as e:
+            raise ValueError(f"No data found within extent {self.extent} for {self.basename}.") from e
+
+        self.shape = self.img.shape
+
+        if self.geomdf is not None:
+            lon, lat = utils.geom2latlon_coords(self.geomdf, self.extent, self.shape[2], self.shape[1])
+            self.img = self.img.assign_coords({"lon": ("x", lon), "lat": ("y", lat)})
+
+        if self.spm is not None:
+            inc, iaz = utils.get_iirs_inc_az(self.qub, self.spm, self.extent[2:])
+            self.img = self.img.assign_coords({"solar_inc": ("y", inc), "solar_az": ("y", iaz)})
+
+    def plot(self, band=12, yrange=(None, None), xrange=(None, None), north_up=True, **kwargs):
+        """Plot reflectance image."""
+        if "cbarlabel" not in kwargs:
+            kwargs["cbarlabel"] = "Reflectance"
+        x, y = ("lon", "lat") if "lon" in self.img.coords and "lat" in self.img.coords else ("x", "y")
+        p, ax = super().plot(band, yrange, xrange, x=x, y=y, **kwargs)
+        return ax
+
+    def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
+        return super().plot_spectra(bands, yrange, xrange, **kwargs)
