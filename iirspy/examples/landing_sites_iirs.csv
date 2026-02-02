@@ -1,0 +1,11 @@
+﻿ImageID,IncAngleImageCenter,Gain ,Exposure,LandingSite,Lat,Lon,Coverage,Comment
+ch2_iir_nci_20211221T0324126144_d_img_hw1,7.263665,g2,e1,Apollo 12,-3.0128, -23.4219,Full,
+ch2_iir_nci_20210720T2333026105_d_img_d32,28.164392,g2,e1,Apollo 16,-8.9734,15.5011,Full,
+ch2_iir_nci_20210719T1954073057_d_img_hw1,28.795791,g2,e1,Apollo 17,20.1911,30.7723,Full,
+ch2_iir_nci_20210121T0800523007_d_img_d32,37.037613,g2,e1,Luna 16,-0.5137,56.3638,Full,Same image overlaps Luna 16 and 20. Other image just beside at different incidence: ch2_iir_nri_20240423T2051332434_d_img_d32
+ch2_iir_nci_20210121T0800523007_d_img_d32,37.037613,g2,e1,Luna 20,3.7863,56.6242,,
+ch2_iir_nci_20240520T1759268266_d_img_d18,33.852937,g2,e1,Luna 24,12.7145,62.2129,,The landing  site is in the upper quarter of the image
+ch2_iir_nci_20220716T0450278161_d_img_hw1,45.102059,g2,e1,Chang'e 5,43.0576,-51.9161,Full,"Two others that were near but not overlapping: ch2_iir_nci_20240529T1214077981_d_img_d18, ch2_iir_nci_20250616T1031483581_d_img_d18"
+ch2_iir_nci_20240605T2337002684_d_img_d18,45.452081,g2,e1,Chang'e 6,-41.6383,-153.9857,Full,"Some image IDs had almost same start time: ch2_iir_nci_20240605T2337004807_d_img_d18, ch2_iir_nci_20240605T2337002668_d_img_d18"
+ch2_iir_nci_20240606T0133308304_d_img_d18,45.288314,g2,e1,Chang'e 6,-41.6383,-153.9857,Full,"Some image IDs had almost same start time: ch2_iir_nci_20240606T0133308190_d_img_d18, ch2_iir_nci_20240606T0133308159_d_img_d18"
+ch2_iir_nci_20250613T2201445305_d_img_d18,37.295835,g2,e1,Chang'e 3,44.1214,-19.5117,Full but at edge of image,"Seems to be taken sequentially with the other Chang'E 3 image, with a little overlap. Need to verify converage"
