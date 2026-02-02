@@ -4,11 +4,18 @@ from pathlib import Path
 import numpy as np
 import pdr
 import xarray as xr
+from rioxarray.exceptions import NoDataInBounds
 
 import iirspy.utils as utils
 
 # Skip div 0 and 0/0 warnings
 np.seterr(divide="ignore", invalid="ignore")
+
+
+def bounds2extent(bounds):
+    """Convert bounds to extent tuple."""
+    minx, miny, maxx, maxy = bounds
+    return (minx, maxx, miny, maxy)
 
 
 class IIRSData(ABC):
@@ -40,16 +47,16 @@ class IIRSData(ABC):
             paths = utils.unzip_iirs(self.directory, self.basename, self.level)
         if "qub" not in paths:
             raise FileNotFoundError(f"{self.basename} not found at {self.directory}.")
-        self.qub = paths["qub"].get(basename, "")
-        self.hdr = paths["hdr"].get(basename, "")
-        self.xml = paths["xml"].get(basename, "")
-        self.lbr = paths["lbr"].get(basename, "")
-        self.oat = paths["oat"].get(basename, "")
-        self.oath = paths["oath"].get(basename, "")
-        self.spm = paths["spm"].get(basename, "")
+        self.qub = paths["qub"].get(self.basename, "")
+        self.hdr = paths["hdr"].get(self.basename, "")
+        self.xml = paths["xml"].get(self.basename, "")
+        self.lbr = paths["lbr"].get(self.basename, "")
+        self.oat = paths["oat"].get(self.basename, "")
+        self.oath = paths["oath"].get(self.basename, "")
+        self.spm = paths["spm"].get(self.basename, "")
         if self.level == 1:
-            self.csv = paths["csv"].get(basename, "")
-            self.xml_csv = paths["xml-csv"].get(basename, "")
+            self.csv = paths["csv"].get(self.basename, "")
+            self.xml_csv = paths["xml-csv"].get(self.basename, "")
 
         # Store metadata from the qub file
         self.metadata = self._extract_metadata()
@@ -72,16 +79,19 @@ class IIRSData(ABC):
     def _extract_metadata(self):
         """Extract relevant metadata from the given qub file."""
         img = pdr.open(self.qub)
-        metadata = {
-            "projection": img.metaget("isda:projection"),
-            "orbit_direction": img.metaget("isda:orbit_limb_direction"),  # L1 Only
-            "start_time": img.metaget("start_date_time"),
-            "stop_time": img.metaget("stop_date_time"),
-            "exposure": img.metaget("isda:exposure"),
-            "gain": img.metaget("isda:gain"),
-            "line_exposure_duration": img.metaget("isda:line_exposure_duration"),
-            "md5_checksum": img.metaget("md5_checksum"),
-        }
+        product_meta = img.metaget("isda:Product_Parameters")
+        metadata = {k[5:]: v for k, v in product_meta.items()}
+        extra_keys = [
+            "logical_identifier",
+            "version_id",
+            "modification_date",
+            "start_date_time",
+            "stop_date_time",
+            "file_size",
+            "md5_checksum",
+        ]
+        for key in extra_keys:
+            metadata[key] = img.metaget(key)
         return metadata
 
     def metaget(self, key):
@@ -94,18 +104,22 @@ class IIRSData(ABC):
         if self.level == 1:
             utils.checksum(self.csv.as_posix())
 
+    def mask_bad_bands(self):
+        """Mask invalid bands (OSF, bad bands)."""
+        self.img = self.img.where(~self.img.band.isin((*utils.OSF, *utils.INVALID)))
+
     @abstractmethod
-    def plot(self, band=12, y=(None, None), x=(None, None), **kwargs):
+    def plot(self, band=12, yrange=(None, None), xrange=(None, None), **kwargs):
         """
         Plot image at band and x, y indices. Lowers resolution along y if large.
         """
-        data = self.img.sel(band=band, y=slice(*y), x=slice(*x))
-
+        data = self.img.sel(band=band, y=slice(*yrange), x=slice(*xrange))
         # Defaults
         size = kwargs.pop("size", 5)
         vmin = kwargs.pop("vmin", 0)
         title = kwargs.pop("title", f"{self.basename}")
-        cmap = kwargs.pop("cmap", "inferno")
+        cmap = kwargs.pop("cmap", "gray")
+        cbarlabel = kwargs.pop("cbarlabel", "")
         if "ax" not in kwargs:
             kwargs["size"] = size  # Supply size only if ax not specified
 
@@ -119,11 +133,25 @@ class IIRSData(ABC):
         ax.set_title(title)
         ax.set_aspect("equal")
 
+        if kwargs.get("add_colorbar", True) and cbarlabel:
+            p.colorbar.ax.set_ylabel(cbarlabel, rotation=-90, va="bottom")
+
         return p, ax
+
+    @abstractmethod
+    def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
+        """
+        Plot image at band and x, y indices. Lowers resolution along y if large.
+        """
+        data = self.img.sel(band=slice(*bands), y=slice(*yrange), x=slice(*xrange))
+        return utils.plot_spectra_with_sigma(data, **kwargs)
 
     def detect_stripes(self, sigma_threshold):
         """Detect stripes in image. See utils.detect_stripes()."""
         return utils.detect_stripes(self.img, sigma_threshold)
+
+    def apply_smoothing(self, **kwargs):
+        return utils.apply_smoothing(**kwargs)
 
 
 class L0(IIRSData):
@@ -146,13 +174,17 @@ class L0(IIRSData):
         """
         super().__init__(basename, directory, extent, chunk, level=0)
         self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
-        self.bounds = self.img.rio.bounds()
+        try:
+            self.bounds = self.img.rio.bounds()
+        except NoDataInBounds as e:
+            raise ValueError(f"No data found within extent {self.extent} for {self.basename}.") from e
+        self.extent = bounds2extent(self.bounds)
 
-    def plot(self, band=12, y=(None, None), x=(None, None), flip_xy=False, **kwargs):
+    def plot(self, band=12, yrange=(None, None), xrange=(None, None), flip_xy=False, **kwargs):
         """Plot image at band and x, y indices if supplied."""
-        cbarlabel = kwargs.pop("cbarlabel", "Digital Number")
-        p, ax = super().plot(band, y, x, **kwargs)
-        p.colorbar.ax.set_ylabel(cbarlabel, rotation=-90, va="bottom")
+        if "cbarlabel" not in kwargs:
+            kwargs["cbarlabel"] = "Digital Number"
+        p, ax = super().plot(band, yrange, xrange, **kwargs)
 
         # Flip image if flip_xy (can plot a descending orbit with north up)
         if flip_xy:
@@ -160,19 +192,27 @@ class L0(IIRSData):
             ax.xaxis.set_inverted(True)
         return ax
 
+    def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
+        return super().plot_spectra(bands, yrange, xrange, **kwargs)
+
     def calibrate_to_rad(self, denoise_gain=False, interp_bands=None, calib_dir=utils.DCALIB):
         """
         Perform IIRS L0 digital number to L1 radiance calibration.
 
+          L1_Radiance [mW/cm^2/sr/um] = Gain * L0_DN + Offset
+
+        Raw data is already dark subtracted and automatically retrieves correct gain and offset
+        corresponding to the instrument gain / exposure settings used during acquisition.
+
+        Note: Returns radiance in [W/m^2/sr/µm] which is a factor of 10 greater than [mW/cm^2/sr/um].
+
         Steps
         -----
-        0) (Raw data is already dark subtracted).
-        1) Find and apply gain and offset to convert to radiance [W/cm^2/sr/um].
+        1) Retrieve and apply gain and offset to convert to radiance [W/cm^2/sr/um].
         2) Convert to [W/m^2/sr/µm].
-        4) Drop invalid data (bad bands, order sorting filters, saturated pixels)
-        5) (Optional) Interpolate across band using the strategy in interp_bands (e.g. "linear")
-        4) (IIRS steps not implemented) Postprocessing (keystone correction, radiance adjustment in OSF and at edges).
-        5) Write to file as 32-bit floating point binary BSQ.
+        3) Set invalid data to NaN (bad bands, order sorting filters, saturated pixels)
+        4) (Optional) Fill NaNs by interpolating across band using strategy in interp_bands (e.g. "linear")
+        5) (NOT IMPLEMENTED) IIRS postprocessing steps (keystone correction, radiance adjustment in OSF and at edges).
 
         Returns
         -------
@@ -181,7 +221,7 @@ class L0(IIRSData):
         gain, offset = utils.get_gain_offset(self.qub, denoise_gain, calib_dir=calib_dir)
 
         # Apply gain and offset to convert DN -> Radiance
-        rad = 10 * self.img * gain + offset  # [W/m^2/sr/um]
+        rad = 10 * (self.img * gain + offset)  # [mW/cm^2/sr/μm] -> [W/m^2/sr/um]
 
         # Drop OSF and invalid bands. interp if specified
         rad = rad.where(~rad.band.isin((*utils.OSF, *utils.INVALID)))
@@ -224,8 +264,8 @@ class L1(IIRSData):
         self,
         basename,
         directory=".",
-        extent=(None, None, None, None),
-        latlonextent=(None, None, None, None),
+        xyextent=(None, None, None, None),
+        lonlatextent=(None, None, None, None),
         chunk=True,
     ):
         """
@@ -237,39 +277,55 @@ class L1(IIRSData):
             Basename of the image to read (e.g. 20201214T0844306700).
         directory : str
             Path to the directory containing IIRS data files.
-        extent : tuple
-            Extent in (minx, maxx, miny, maxy) format. Only one of xyextent and extent can be given.
-        latlonextent : tuple
+        xyextent : tuple
+            Extent in (minx, maxx, miny, maxy) format. Only one of xyextent and lonlatextent can be given.
+        lonlatextent : tuple
             Extent in (minlon, maxlon, minlat, maxlat) format.
         chunk : bool or dict
             Chunk image automatically (default: True). Or supply dict of x,y,band chunk sizes (see dask).
         """
-        super().__init__(basename, directory, extent, chunk, level=1)
-
-        if any(e is not None for e in extent) and any(e is not None for e in latlonextent):
-            raise ValueError("Only one of extent and xyextent can be given.")
+        if any(e is not None for e in xyextent) and any(e is not None for e in lonlatextent):
+            raise ValueError("Only one of lonlatextent and xyextent can be given.")
+        super().__init__(basename, directory, xyextent, chunk, level=1)
 
         # Parse geometry, store gcps and extent in x, y
-        self.gcps, xy_extent = utils.parse_geom(self.csv, latlonextent, as_gcps=True, center=True)
-        if all(e is None for e in extent):
-            self.extent = xy_extent
+        self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, center=False)
+        # replace any None in extent with values from xy_extent
+        self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent))
         self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
-        self.bounds = self.img.rio.bounds()
+        try:
+            self.bounds = self.img.rio.bounds()
+        except NoDataInBounds as e:
+            raise ValueError(f"No data found within extent {self.extent} for {self.basename}.") from e
+
+        self.shape = self.img.shape  # [nband, ny, nx]
 
         # Fix units
         self.img *= 0.01  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
 
-    def plot(self, band=12, y=(None, None), x=(None, None), north_up=True, **kwargs):
-        """Plot image at band and x, y indices if supplied."""
-        cbarlabel = kwargs.pop("cbarlabel", "Radiance [$W/m^2/sr/um$]")
-        p, ax = super().plot(band, (None, None), (None, None), **kwargs)
-        p.colorbar.ax.set_ylabel(cbarlabel, rotation=-90, va="bottom")
+        # Assign lat, lon coordinates
+        lon, lat = utils.geom2latlon_coords(self.geomdf, xy_extent, self.shape[2], self.shape[1])
 
-        # Flip image if collected on descending orbit
-        if north_up and self.metadata.get("orbit_direction", "").lower() == "descending":
-            ax.yaxis.set_inverted(True)
-            ax.xaxis.set_inverted(True)
+        # Get solar incidence for each line of image
+        inc, iaz = utils.get_iirs_inc_az(self.qub, self.spm, self.extent[2:])
+
+        # Assign new coords
+        self.img = self.img.assign_coords({
+            "lon": ("x", lon),
+            "lat": ("y", lat),
+            "solar_inc": ("y", inc),
+            "solar_az": ("y", iaz),
+        })
+
+    def plot(self, band=12, yrange=(None, None), xrange=(None, None), north_up=True, **kwargs):
+        """Plot image at band and x, y indices if supplied."""
+        if "cbarlabel" not in kwargs:
+            kwargs["cbarlabel"] = "Radiance [$W/m^2/sr/um$]"
+        p, ax = super().plot(band, yrange, xrange, x="lon", y="lat", **kwargs)
         return ax
+
+    def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
+        return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
     def calibrate_to_refl(self, dem=None, solar_flux=None, thermal_corr=""):
         """
@@ -288,19 +344,15 @@ class L1(IIRSData):
         # Compute solar inc, solar flux and thermal rad for I/f = (rad-trad) / (cos(inc) * solar_flux)
         rad = self.img
 
-        # Get solar inc
-        inc, iaz = utils.get_iirs_inc_az(self.qub, self.spm, self.extent[2:])
-
+        cos_inc = np.cos(np.radians(rad.solar_inc))
         # (Optional): adjust cos_inc relative to dem
-        if dem is None:
-            cos_inc = np.cos(np.radians(inc))
-        else:
+        if dem is not None:
             if not hasattr(dem, "sel"):
                 dem = xr.open_dataarray(dem, engine="rasterio")
             lat, _ = utils.get_iirs_latlon(self.csv)
-            lat = lat.interp_like(inc)
+            lat = lat.interp_like(rad.solar_inc)
             dem = dem.interp_like(rad.sel(band=dem.band), method="slinear")
-            cos_inc = utils.get_cos_inc_dem(dem, inc, iaz, lat)
+            cos_inc = utils.get_cos_inc_dem(dem, rad.solar_inc, rad.solar_az, lat)
         cos_inc = cos_inc * xr.ones_like(rad.isel(x=0, band=0))  # Add coords (along y)
         # cos_inc = cos_inc.where((cos_inc > 0.03) & (cos_inc < 0.999))
 
