@@ -998,7 +998,7 @@ def load_iirs_spm(fspm):
     df = pd.read_csv(fspm, sep="\\s+", header=None, usecols=range(0, 19), names=colnames)
     df["year"] = df["year"].astype(str).str.slice(3, None)
     df["datetime"] = pd.to_datetime(df.iloc[:, 2:9])
-    df["timestamp"] = df["datetime"].astype(int) / 1e9  # Equiv to .timestamp(), but faster
+    df["timestamp"] = df["datetime"].astype("int64") / 1e9  # Equiv to .timestamp(), but faster
     # df['timestamp'] = df['datetime'].apply(lambda x: x.timestamp())  # Slow
     return df
 
