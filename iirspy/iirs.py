@@ -389,7 +389,7 @@ class L1(IIRSData):
         # Parse geometry, store gcps and extent in x, y
         self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, xyextent, center=False)
         # replace any None in extent with values from xy_extent
-        self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent))
+        self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent, strict=False))
         self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
         try:
             self.bounds = self.img.rio.bounds()
@@ -626,7 +626,7 @@ class L2(IIRSData):
 
         if self.geomdf is not None:
             self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, center=False)
-            self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent))
+            self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent, strict=False))
 
         self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
         try:

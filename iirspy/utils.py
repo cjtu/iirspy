@@ -4,6 +4,7 @@ import warnings
 import zipfile
 from importlib.resources import files
 from pathlib import Path
+from typing import Any
 
 import cv2
 import matplotlib.pyplot as plt
@@ -476,9 +477,11 @@ def warp2grid(da, ext, gridlon, gridlat, method="bilinear"):
     out = target_grid
 
     # Write crs (Moon unprojected)
-    out.rio.write_crs(CRS.from_authority("IAU", "30100"), inplace=True)
-    out.rio.set_spatial_dims("lon", "lat", inplace=True)
-    out.rio.write_coordinate_system(inplace=True)
+    # NOTE: WIP — regridder above is disabled, so `out` is currently a dict and
+    # these .rio calls will fail at runtime until the regridder is restored.
+    out.rio.write_crs(CRS.from_authority("IAU", "30100"), inplace=True)  # type: ignore[attr-defined]
+    out.rio.set_spatial_dims("lon", "lat", inplace=True)  # type: ignore[attr-defined]
+    out.rio.write_coordinate_system(inplace=True)  # type: ignore[attr-defined]
     return out
 
 
@@ -689,7 +692,7 @@ def unzip_iirs(ddir, basename, level, md5checksum=True):
     paths = get_iirs_paths(f.parent, level=level, basenames=[basename])
     if "qub" not in paths:
         raise RuntimeError("Unzip failed.")
-    if checksum:
+    if md5checksum:
         print("Verifying unzipped image...", end=" ")
         checksum(paths["qub"][basename].as_posix())
         print("Success!")
@@ -699,10 +702,10 @@ def unzip_iirs(ddir, basename, level, md5checksum=True):
 def iirsbasename(input_str):
     """Return the image basename from str_in (e.g., 20201226T1745264921)"""
     pattern = r"\d{8}T\d{10}"
-    try:
-        return re.search(pattern, input_str).group()
-    except AttributeError as e:
-        raise ValueError(f"Can't parse basename: {input_str}") from e
+    match = re.search(pattern, input_str)
+    if match is None:
+        raise ValueError(f"Can't parse basename: {input_str}")
+    return match.group()
 
 
 def get_iirs_paths(
@@ -718,7 +721,7 @@ def get_iirs_paths(
         return img_path_obj.stem.split("_")[3]
 
     LVL2DIR = {0: "raw", 1: "calibrated", 2: "derived"}
-    out = {}
+    out: dict[str, Any] = {}
     for ext in exts:
         subdir = "."
         if ext in ("png", "xml-png"):
@@ -731,7 +734,7 @@ def get_iirs_paths(
             subdir = "miscellaneous/" + LVL2DIR[level]
         else:
             raise ValueError(f"Unknown IIRS file extension: {ext}")
-        paths = Path(ddir).glob(f'**/{subdir}/**/*.{ext.split("-")[0]}')
+        paths = Path(ddir).glob(f"**/{subdir}/**/*.{ext.split('-')[0]}")
 
         if basenames is not None:
             basenames = [basenames] if isinstance(basenames, str) else basenames
@@ -1354,10 +1357,10 @@ def fourier_filter(img, vthresh=0.8, vtilt=0.0, hthresh=0.0, htilt=0.0, get_filt
 
     # Draw all triangles
     mask = np.ones((y, x, 2))
-    cv2.fillPoly(mask, [left_triangle], 0)
-    cv2.fillPoly(mask, [right_triangle], 0)
-    cv2.fillPoly(mask, [top_triangle], 0)
-    cv2.fillPoly(mask, [bottom_triangle], 0)
+    cv2.fillPoly(mask, [left_triangle.astype(np.int32)], (0, 0))
+    cv2.fillPoly(mask, [right_triangle.astype(np.int32)], (0, 0))
+    cv2.fillPoly(mask, [top_triangle.astype(np.int32)], (0, 0))
+    cv2.fillPoly(mask, [bottom_triangle.astype(np.int32)], (0, 0))
 
     if get_filt_at_band is not None:
         img = img[get_filt_at_band, :, :].data
@@ -1403,7 +1406,7 @@ def smooth_savgol(data: xr.DataArray, savgol_window: int = 9, savgol_polyorder: 
         return spectrum
 
     # Apply combined filter
-    result = xr.apply_ufunc(
+    result: xr.DataArray = xr.apply_ufunc(
         filter_spectrum,
         data,
         input_core_dims=[["band"]],
@@ -1472,5 +1475,5 @@ if __name__ == "__main__":  # pragma: no cover
     gcps, gcps_crs = read_gcps(fpoints)
 
     # projected = warp2grid(da, xyext, gridlon, gridlat)
-    proj_from_gcps = warp2gcps(da, gcps, gcps_crs, "./test.tif")
+    proj_from_gcps = warp2gcps(fqub, da, gcps, gcps_crs, "./test.tif")
     pass
