@@ -37,6 +37,11 @@ Homepage = "https://cjtu.github.io/iirspy/"
 Repository = "https://github.com/cjtu/iirspy"
 Documentation = "https://cjtu.github.io/iirspy/"
 
+[project.optional-dependencies]
+download = [
+    "issdc",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=7.2.0",
@@ -127,3 +132,6 @@ ignore = [
 
 [tool.ruff.format]
 preview = true
+
+[tool.uv.sources]
+issdc = { git = "https://github.com/cjtu/issdc-requester" }
