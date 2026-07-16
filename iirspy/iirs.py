@@ -131,6 +131,63 @@ class IIRSData(ABC):
         """Mask invalid bands (OSF, bad bands)."""
         self.img = self.img.where(~self.img.band.isin((*utils.OSF, *utils.INVALID)))
 
+    def save(self, fout, sub_rows=1000):
+        """
+        Stream the image cube to disk with bounded memory.
+
+        ENVI (.img, default): float32 BIL, streamed sub_rows scanlines at a time. The dask
+        threaded scheduler computes each block across all cores; peak memory stays ~one block
+        regardless of image or machine size. GeoTIFF (.tif): float32 BigTIFF, windowed blocks.
+
+        Parameters
+        ----------
+        fout : str or Path
+            Output path. Extension selects the format (.tif -> GeoTIFF, else ENVI).
+        sub_rows : int
+            Scanlines computed/written per step (bounds peak memory).
+
+        Returns
+        -------
+        str : the path written.
+        """
+        fout = str(fout)
+        if fout.lower().endswith(".tif"):
+            return self._save_geotiff(fout, sub_rows)
+        description = f"IIRS {self.img.attrs.get('name', '')}".strip()
+        return utils.write_envi_bil(self.img, fout, sub_rows, description)
+
+    def _save_geotiff(self, fout, row_block):
+        """Write a float32 BigTIFF sequentially in windowed blocks (bounded memory)."""
+        import rasterio
+        from dask.diagnostics import ProgressBar
+        from rasterio.windows import Window
+
+        da = self.img
+        nband, ny, nx = da.shape
+        profile = {
+            "driver": "GTiff",
+            "height": ny,
+            "width": nx,
+            "count": nband,
+            "dtype": "float32",
+            "nodata": np.nan,
+            "crs": da.rio.crs if da.rio.crs else None,
+            "transform": da.rio.transform(),
+            "compress": "LZW",
+            "tiled": True,
+            "BIGTIFF": "YES",
+        }
+        wls = [f"{float(w):.2f}" for w in da.wl.values] if "wl" in da.coords else None
+        with rasterio.open(fout, "w", **profile) as dst, ProgressBar():
+            for y0 in range(0, ny, row_block):
+                y1 = min(y0 + row_block, ny)
+                block = da.isel(y=slice(y0, y1)).values.astype("float32", copy=False)
+                dst.write(block, window=Window(0, y0, nx, y1 - y0))
+            if wls:
+                for i, wl in enumerate(wls):
+                    dst.set_band_description(i + 1, wl)
+        return fout
+
     @abstractmethod
     def plot(self, band=12, yrange=(None, None), xrange=(None, None), **kwargs):
         """
@@ -171,7 +228,7 @@ class IIRSData(ABC):
         data = self.img.sel(band=slice(*bands), y=slice(*yrange), x=slice(*xrange))
         ax = utils.plot_spectra_with_sigma(data, **kwargs)
         ylabel = self.img.attrs.get("name", "")
-        ylabel += f' [${self.img.attrs.get("units", "")}$]' if self.img.attrs.get("units", "") else ""
+        ylabel += f" [${self.img.attrs.get('units', '')}$]" if self.img.attrs.get("units", "") else ""
         ax.set_ylabel(ylabel)
         return ax
 
@@ -241,7 +298,7 @@ class L0(IIRSData):
         -----
         1) Retrieve and apply gain and offset to convert to radiance [W/cm^2/sr/um].
         2) Convert to [W/m^2/sr/µm].
-        3) Set invalid data to NaN (bad bands, order sorting filters, saturated pixels)
+        3) Set invalid data to NaN (bad bands, order sorting filters, known bad pixels, saturated pixels)
         4) (Optional) Fill NaNs by interpolating across band using strategy in interp_bands (e.g. "linear")
         5) (NOT IMPLEMENTED) IIRS postprocessing steps (keystone correction, radiance adjustment in OSF and at edges).
 
@@ -257,6 +314,9 @@ class L0(IIRSData):
         # Drop OSF and invalid bands. interp if specified
         rad = rad.where(~rad.band.isin((*utils.OSF, *utils.INVALID)))
 
+        # Drop known bad detector elements (x, bands)
+        rad = rad.where(~utils.load_bad_pixel_mask())
+
         # Drop saturated pixels
         rad = rad.where(rad < utils.get_saturation_radiance(self.qub, calib_dir))
 
@@ -264,8 +324,8 @@ class L0(IIRSData):
         if interp_bands is not None:
             rad = rad.interpolate_na("band", max_gap=11, keep_attrs=True, method=interp_bands)
 
-        # Format and output Radiance DataArray
-        out = rad
+        # Format and output Radiance DataArray (float32: gain/offset LUTs are float32, keep graph float32)
+        out = rad.astype("float32")
         out.name = "Radiance [W/m^2/sr/µm]"
         out.attrs["name"] = "Radiance"
         out.attrs["units"] = "W/m^2/sr/um"
@@ -287,7 +347,6 @@ class L0(IIRSData):
                 stacklevel=2,
             )
             out = L1.from_xarray(img, self.basename, str(self.directory))
-
         return out
 
 

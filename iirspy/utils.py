@@ -29,9 +29,10 @@ warnings.filterwarnings("ignore", message="Dataset has no geotransform")
 ## Constants
 PKG_DATA = files("iirspy").joinpath("data")
 DCALIB = PKG_DATA.joinpath("iir/calibration")
-CHUNKSIZE = 200e6  # [MB] chunk large images into this size with dask to fit in RAM (typically between 100MB-1GB)
+CHUNKSIZE = 128 * 2**20  # [B] dask y-chunk target (dask's array.chunk-size default; profiled fastest + lowest RAM)
 FPOLISH = str(PKG_DATA.joinpath("spectral_polish_verma2022.csv"))
 FBADBANDS = str(PKG_DATA.joinpath("iirs_bad_bands.csv"))
+FBADPIXELS = str(PKG_DATA.joinpath("bad_pixel_mask.csv"))
 FSOLAR = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_solar_flux.txt"))
 FWAVELENGTHS = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_wavelength.csv"))
 # Projections used in the Ch2 IIRS selenoref tool https://doi.org/10.1007/s12524-024-01814-4
@@ -1038,6 +1039,13 @@ def load_bad_bands(fbad_bands=FBADBANDS):
     return ~pd.read_csv(fbad_bands, index_col=0).astype(bool)
 
 
+def load_bad_pixel_mask(fbad_pixels=FBADPIXELS):
+    """Return the per-detector-element bad pixel mask as a (band, x) DataArray, True where bad."""
+    mask = pd.read_csv(fbad_pixels, header=None).values.astype(bool)
+    coords = {"band": 1 + np.arange(0, 256), "x": 0.5 + np.arange(250)}
+    return xr.DataArray(mask, coords=coords, name="bad_pixel")
+
+
 def get_exposure_gain(fimg):
     """Return exposure (E1-E4) and gain (G2) as eXgY string."""
     img = pdr.open(fimg)
@@ -1119,7 +1127,7 @@ def get_gain_offset(fimg, denoise=False, gain_z=None, offset_z=None, calib_dir=D
         gain_z = zdefaults.get(Path(flut).name, (1, 1))[0]
     if offset_z is None:
         offset_z = zdefaults.get(Path(flut).name, (1, 1))[1]
-    lut = np.loadtxt(flut, delimiter=",").reshape((256, 250, 2))
+    lut = np.loadtxt(flut, delimiter=",").reshape((256, 250, 2)).astype("float32")
     coords = {"band": 1 + np.arange(0, 256), "x": 0.5 + np.arange(250)}
     gain = xr.DataArray(lut[:, :, 0], coords=coords, name="gain")
     off = xr.DataArray(lut[:, :, 1], coords=coords, name="offset")
@@ -1140,7 +1148,7 @@ def get_gain_offset(fimg, denoise=False, gain_z=None, offset_z=None, calib_dir=D
 def get_saturation_radiance(fimg, calib_dir=DCALIB):
     """Return IIRS saturation radiance file as 1D DataArray along band."""
     flut = get_lut_file(fimg, "saturations_radiance", calib_dir)
-    lut = np.loadtxt(flut, delimiter=",", usecols=2)  # band, wl, saturation [1000 mW/cm^2/sr/um]
+    lut = np.loadtxt(flut, delimiter=",", usecols=2).astype("float32")  # band, wl, saturation [1000 mW/cm^2/sr/um]
     return 0.01 * xr.DataArray(lut, coords={"band": np.arange(1, 257)}, name="saturation [W/m^2/sr/um]")
 
 
@@ -1188,6 +1196,42 @@ def write_envi(da, fout):
             dst.write(da.isel(band=i).values, i + 1)
             dst.set_band_description(i + 1, wls[i])
             # TODO fix wavelength metadata
+
+
+## ENVI BIL streaming writer
+def write_envi_hdr(fhdr, nx, ny, nband, wls, description="IIRS"):
+    """Write an ENVI header for a float32 BIL cube (data type 4, little-endian)."""
+    band_names = ", ".join(f"Band {i + 1}" for i in range(nband))
+    wl_str = ", ".join(f"{float(w):.4f}" for w in wls)
+    Path(fhdr).write_text(
+        "ENVI\n"
+        f"description = {{ {description} }}\n"
+        f"samples = {nx}\nlines = {ny}\nbands = {nband}\n"
+        "header offset = 0\nfile type = ENVI Standard\n"
+        "data type = 4\ninterleave = bil\nbyte order = 0\n"
+        "wavelength units = Nanometers\n"
+        f"band names = {{{band_names}}}\n"
+        f"wavelength = {{{wl_str}}}\n"
+    )
+
+
+def _write_bil_rows(f, da, i0, i1, sub_rows):
+    """Stream rows [i0:i1) of a (band, y, x) DataArray to open file f as ENVI BIL float32."""
+    for a in range(i0, i1, sub_rows):
+        b = min(a + sub_rows, i1)
+        blk = np.asarray(da.isel(y=slice(a, b)).values, dtype="float32")  # (band, rows, x)
+        blk.transpose(1, 0, 2).tofile(f)  # C-order of (row, band, x) == ENVI BIL
+
+
+def write_envi_bil(da, fout, sub_rows=1000, description="IIRS"):
+    """Sequentially stream a (band, y, x) DataArray to an ENVI BIL float32 file (bounded memory)."""
+    fout = str(fout)
+    nband, ny, nx = da.shape
+    with open(fout, "wb") as f:
+        _write_bil_rows(f, da, 0, ny, sub_rows)
+    wls = da.wl.values if "wl" in da.coords else np.arange(1, nband + 1)
+    write_envi_hdr(Path(fout).with_suffix(".hdr"), nx, ny, nband, wls, description)
+    return fout
 
 
 ## Checksums
