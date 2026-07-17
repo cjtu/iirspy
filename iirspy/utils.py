@@ -1046,6 +1046,23 @@ def load_bad_pixel_mask(fbad_pixels=FBADPIXELS):
     return xr.DataArray(mask, coords=coords, name="bad_pixel")
 
 
+def load_reference_flat(fimg, calib_dir=DCALIB):
+    """
+    Return the packaged sensor flat (band, x) for fimg's exposure/gain, or None if not given.
+
+    Prebuilt flat across multiple IIRS scenes (see iirspy.empirical.build_flat),
+    used as the fallback when a scene has no qualifying flat region of its own. 
+    Named ch2_iirs_flat_<expgain>.csv 
+    """
+    exp_gain = get_exposure_gain(fimg)  # e.g. "e1g2"
+    fflat = Path(calib_dir) / f"ch2_iirs_flat_{exp_gain}.csv"
+    if not fflat.exists():
+        return None
+    vals = np.loadtxt(fflat, delimiter=",").astype("float32")
+    coords = {"band": 1 + np.arange(0, 256), "x": 0.5 + np.arange(250)}
+    return xr.DataArray(vals, coords=coords, name="reference_flat")
+
+
 def get_exposure_gain(fimg):
     """Return exposure (E1-E4) and gain (G2) as eXgY string."""
     img = pdr.open(fimg)
