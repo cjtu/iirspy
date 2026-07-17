@@ -8,6 +8,7 @@ import xarray as xr
 from rioxarray.exceptions import NoDataInBounds
 
 import iirspy.utils as utils
+from iirspy.empirical import empirical_frames
 
 # Skip div 0 and 0/0 warnings
 np.seterr(divide="ignore", invalid="ignore")
@@ -283,7 +284,7 @@ class L0(IIRSData):
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
         return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
-    def calibrate_to_rad(self, denoise_gain=False, interp_bands=None, calib_dir=utils.DCALIB):
+    def calibrate_to_rad(self, empirical=False, interp_bands=None, mask_shadow=True, calib_dir=utils.DCALIB):
         """
         Perform IIRS L0 digital number to L1 radiance calibration.
 
@@ -294,6 +295,13 @@ class L0(IIRSData):
 
         Note: Returns radiance in [W/m^2/sr/µm] which is a factor of 10 greater than [mW/cm^2/sr/um].
 
+        The IIRS gain/offset LUT is per detector element (band, x), but its cross-track structure
+        is poorly correlated with the on-orbit response and injects striping/speckle. With
+        empirical=True, derive a per-scene dark + sensor flat + smile (see iirspy.empirical) and
+        use the LUT only for the per-band absolute scale:
+
+          rad = 10 * ((DN - dark) / flat / smile * gain_x_median + offset_x_median)
+
         Steps
         -----
         1) Retrieve and apply gain and offset to convert to radiance [W/cm^2/sr/um].
@@ -302,14 +310,32 @@ class L0(IIRSData):
         4) (Optional) Fill NaNs by interpolating across band using strategy in interp_bands (e.g. "linear")
         5) (NOT IMPLEMENTED) IIRS postprocessing steps (keystone correction, radiance adjustment in OSF and at edges).
 
+        Parameters
+        ----------
+        empirical : bool
+            Apply the on-orbit empirical dark/flat/smile correction with LUT band-average scale.
+        interp_bands : str or None
+            If set, fill masked bands by interpolating across band (e.g. "linear").
+        mask_shadow : bool
+            When empirical and the scene has shadow, null (zero) broadband-shadow pixels so
+            sub-noise-floor speckle (worst in low-signal long-wavelength bands) reads uniformly dark.
+
         Returns
         -------
         (xarray.DataArray): Radiance DataArray in [W/m^2/sr/µm].
         """
-        gain, offset = utils.get_gain_offset(self.qub, denoise_gain, calib_dir=calib_dir)
+        gain, offset = utils.get_gain_offset(self.qub, calib_dir=calib_dir)
 
-        # Apply gain and offset to convert DN -> Radiance
-        rad = 10 * (self.img * gain + offset)  # [mW/cm^2/sr/μm] -> [W/m^2/sr/um]
+        if empirical:
+            # Empirical correction: LUT gives per-band absolute scale, flat/smile handle cross-track
+            dark, flat, smile, shadow = empirical_frames(self.img)
+            gain, offset = gain.median("x"), offset.median("x")
+            rad = 10 * ((self.img - dark) / flat / smile * gain + offset)
+            if mask_shadow and shadow is not None:
+                rad = rad.where(~shadow, 0)  # null broadband-shadow pixels -> uniformly dark
+        else:
+            # Apply per-element gain and offset to convert DN -> Radiance
+            rad = 10 * (self.img * gain + offset)  # [mW/cm^2/sr/μm] -> [W/m^2/sr/um]
 
         # Drop OSF and invalid bands. interp if specified
         rad = rad.where(~rad.band.isin((*utils.OSF, *utils.INVALID)))
@@ -329,7 +355,7 @@ class L0(IIRSData):
         out.name = "Radiance [W/m^2/sr/µm]"
         out.attrs["name"] = "Radiance"
         out.attrs["units"] = "W/m^2/sr/um"
-        out.attrs["calibration_source"] = "user"
+        out.attrs["calibration_source"] = "empirical" if empirical else "user"
 
         return out
 
