@@ -1,6 +1,7 @@
 import json
 import warnings
 from abc import ABC, abstractmethod
+from importlib import metadata
 from pathlib import Path
 
 import numpy as np
@@ -395,9 +396,9 @@ class L0(IIRSData):
         rad = rad.where(~rad.band.isin((*utils.OSF, *utils.INVALID)))
 
         # Drop known bad detector elements (x, bands)
-        if bad_pixel_mask is True: # Load default bad pixel mask
+        if bad_pixel_mask is True:  # Load default bad pixel mask
             bad_pixel_mask = utils.load_bad_pixel_mask()
-        if bad_pixel_mask is not False: # Apply user-supplied mask
+        if bad_pixel_mask is not False:  # Apply user-supplied mask
             rad = rad.where(~bad_pixel_mask)
 
         # Drop saturated pixels
@@ -405,7 +406,7 @@ class L0(IIRSData):
 
         # Interpolate across bands
         if interp_bands is not None:
-            rad = rad.interpolate_na("band", max_gap=11, keep_attrs=True, method=interp_bands)
+            rad = rad.interpolate_na("band", max_gap=6, keep_attrs=True, method=interp_bands)
 
         # Format and output Radiance DataArray (float32: gain/offset LUTs are float32, keep graph float32)
         out = rad.astype("float32")
