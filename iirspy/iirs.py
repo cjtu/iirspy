@@ -1,3 +1,4 @@
+import json
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -8,7 +9,7 @@ import xarray as xr
 from rioxarray.exceptions import NoDataInBounds
 
 import iirspy.utils as utils
-from iirspy.empirical import empirical_frames
+from iirspy.empirical import FLAT_SMILE_MIN, empirical_frames
 
 # Skip div 0 and 0/0 warnings
 np.seterr(divide="ignore", invalid="ignore")
@@ -132,7 +133,7 @@ class IIRSData(ABC):
         """Mask invalid bands (OSF, bad bands)."""
         self.img = self.img.where(~self.img.band.isin((*utils.OSF, *utils.INVALID)))
 
-    def save(self, fout, sub_rows=1000):
+    def save(self, fout, sub_rows=1000, snr_sidecar=True):
         """
         Stream the image cube to disk with bounded memory.
 
@@ -140,22 +141,41 @@ class IIRSData(ABC):
         threaded scheduler computes each block across all cores; peak memory stays ~one block
         regardless of image or machine size. GeoTIFF (.tif): float32 BigTIFF, windowed blocks.
 
+        When the cube carries an empirical `snr` coordinate (from calibrate_to_rad with attach_snr),
+        a float32 sidecar `<basename>_snr.img` is written alongside it (ENVI coords don't survive the
+        BIL write), unless snr_sidecar is False.
+
         Parameters
         ----------
         fout : str or Path
             Output path. Extension selects the format (.tif -> GeoTIFF, else ENVI).
         sub_rows : int
             Scanlines computed/written per step (bounds peak memory).
+        snr_sidecar : bool
+            Write the broadband `snr` field (if present) to a float32 sidecar next to fout.
 
         Returns
         -------
         str : the path written.
         """
         fout = str(fout)
+        if snr_sidecar and "snr" in self.img.coords:
+            self._save_snr_sidecar(fout)
         if fout.lower().endswith(".tif"):
             return self._save_geotiff(fout, sub_rows)
         description = f"IIRS {self.img.attrs.get('name', '')}".strip()
         return utils.write_envi_bil(self.img, fout, sub_rows, description)
+
+    def _save_snr_sidecar(self, fout):
+        """Write the (y, x) empirical broadband SNR field to a float32 ENVI sidecar next to fout."""
+        import rasterio
+
+        snr = self.img.snr.values.astype("float32")
+        ny, nx = snr.shape
+        fsnr = Path(fout).with_name(Path(fout).stem + "_snr.img")
+        with rasterio.open(fsnr, "w", driver="ENVI", height=ny, width=nx, count=1, dtype="float32") as dst:
+            dst.write(snr, 1)
+        return str(fsnr)
 
     def _save_geotiff(self, fout, row_block):
         """Write a float32 BigTIFF sequentially in windowed blocks (bounded memory)."""
@@ -284,7 +304,15 @@ class L0(IIRSData):
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
         return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
-    def calibrate_to_rad(self, empirical=False, interp_bands=None, mask_shadow=True, calib_dir=utils.DCALIB):
+    def calibrate_to_rad(
+        self,
+        empirical=False,
+        interp_bands=None,
+        attach_snr=True,
+        empirical_kws=None,
+        bad_pixel_mask=True,
+        calib_dir=utils.DCALIB,
+    ):
         """
         Perform IIRS L0 digital number to L1 radiance calibration.
 
@@ -297,28 +325,47 @@ class L0(IIRSData):
 
         The IIRS gain/offset LUT is per detector element (band, x), but its cross-track structure
         is poorly correlated with the on-orbit response and injects striping/speckle. With
-        empirical=True, derive a per-scene dark + sensor flat + smile (see iirspy.empirical) and
-        use the LUT only for the per-band absolute scale:
+        empirical=True, derive a per-scene residual dark + sensor flat + band-relative smile (see
+        iirspy.empirical) and use the LUT only for the per-band absolute scale. The in-scene dark,
+        when present, anchors the zero point (no longer use the LUT offset):
 
-          rad = 10 * ((DN - dark) / flat / smile * gain_x_median + offset_x_median)
+          scene with dark rows   : rad = 10 * gain_med * (DN - dark_resid) / (flat * smile)
+          scene without dark rows: rad = 10 * (gain_med * DN / (flat * smile) + offset_med)
 
         Steps
         -----
-        1) Retrieve and apply gain and offset to convert to radiance [W/cm^2/sr/um].
-        2) Convert to [W/m^2/sr/µm].
-        3) Set invalid data to NaN (bad bands, order sorting filters, known bad pixels, saturated pixels)
-        4) (Optional) Fill NaNs by interpolating across band using strategy in interp_bands (e.g. "linear")
+        1) Retrieve the per-element gain/offset LUT for the scene's gain/exposure settings.
+        2) Convert DN -> radiance and scale [mW/cm^2/sr/um] -> [W/m^2/sr/µm] (factor of 10):
+           - empirical=False: apply the per-element LUT directly (rad = 10 * (DN * gain + offset)).
+           - empirical=True: derive per-scene residual dark + sensor flat (+ optional smile) via
+             empirical_frames, take the LUT band-median gain/offset, and divide out flat*smile.
+             Drop the LUT offset when in-scene dark rows anchor the zero point, else keep it.
+             Attach the broadband SNR field when attach_snr and dark rows exist.
+        3) Set invalid data to NaN (bad bands, order sorting filters, known bad pixels, saturated pixels).
+        4) (Optional) Fill NaNs by interpolating across band using strategy in interp_bands (e.g. "linear").
         5) (NOT IMPLEMENTED) IIRS postprocessing steps (keystone correction, radiance adjustment in OSF and at edges).
 
         Parameters
         ----------
         empirical : bool
-            Apply the on-orbit empirical dark/flat/smile correction with LUT band-average scale.
+            Apply the on-orbit empirical dark/flat (+ optional smile) correction with LUT band-median scale.
         interp_bands : str or None
             If set, fill masked bands by interpolating across band (e.g. "linear").
-        mask_shadow : bool
-            When empirical and the scene has shadow, null (zero) broadband-shadow pixels so
-            sub-noise-floor speckle (worst in low-signal long-wavelength bands) reads uniformly dark.
+        attach_snr : bool
+            When empirical and the scene has shadow, attach the per-pixel broadband SNR field (float32
+            (y, x)) as an `snr` coordinate on the returned DataArray. Radiance is left as measured:
+            downstream users threshold the SNR themselves (a typical cut is empirical.SHADOW_SNR) to
+            null, ignore, or study low-signal shadow pixels. save() can write it to a float32 sidecar
+            (ENVI coords don't survive the BIL write).
+        empirical_kws : dict or None
+            Extra keyword arguments forwarded to empirical.empirical_frames, e.g.
+            dark_yrange=(ylow, yhigh) / flat_yrange=(ylow, yhigh) to override the auto dark-row /
+            flat-region detection with user-picked positional row ranges into this cube.
+            The smile correction is off by default; enable it with apply_smile=True.
+        bad_pixel_mask : bool or array-like
+            Mask known bad detector elements (x, band). True (default) uses the packaged mask
+            (utils.load_bad_pixel_mask); False skips masking; or pass a custom boolean mask
+            (True where bad) to null instead.
 
         Returns
         -------
@@ -328,11 +375,18 @@ class L0(IIRSData):
 
         if empirical:
             # Empirical correction: LUT gives per-band absolute scale, flat/smile handle cross-track
-            dark, flat, smile, shadow = empirical_frames(self.img)
-            gain, offset = gain.median("x"), offset.median("x")
-            rad = 10 * ((self.img - dark) / flat / smile * gain + offset)
-            if mask_shadow and shadow is not None:
-                rad = rad.where(~shadow, 0)  # null broadband-shadow pixels -> uniformly dark
+            ref_flat = utils.load_reference_flat(self.qub, calib_dir=calib_dir)
+            dark, flat, smile, snr, emp_notes = empirical_frames(self.img, ref_flat, **(empirical_kws or {}))
+            gain_med, offset_med = gain.median("x"), offset.median("x")
+            fs = (flat * smile).clip(min=FLAT_SMILE_MIN)  # avoid divide by 0
+            if snr is not None:
+                # Shadow scene: the in-scene zero anchors the zero point, so drop the LUT offset
+                rad = 10 * gain_med * (self.img - dark) / fs
+                if attach_snr:
+                    rad = rad.assign_coords(snr=(("y", "x"), snr.values))
+            else:
+                # No zero reference: the lab offset is the only zero-point info, so keep it
+                rad = 10 * (gain_med * self.img / fs + offset_med)
         else:
             # Apply per-element gain and offset to convert DN -> Radiance
             rad = 10 * (self.img * gain + offset)  # [mW/cm^2/sr/μm] -> [W/m^2/sr/um]
@@ -341,7 +395,10 @@ class L0(IIRSData):
         rad = rad.where(~rad.band.isin((*utils.OSF, *utils.INVALID)))
 
         # Drop known bad detector elements (x, bands)
-        rad = rad.where(~utils.load_bad_pixel_mask())
+        if bad_pixel_mask is True: # Load default bad pixel mask
+            bad_pixel_mask = utils.load_bad_pixel_mask()
+        if bad_pixel_mask is not False: # Apply user-supplied mask
+            rad = rad.where(~bad_pixel_mask)
 
         # Drop saturated pixels
         rad = rad.where(rad < utils.get_saturation_radiance(self.qub, calib_dir))
@@ -356,6 +413,9 @@ class L0(IIRSData):
         out.attrs["name"] = "Radiance"
         out.attrs["units"] = "W/m^2/sr/um"
         out.attrs["calibration_source"] = "empirical" if empirical else "user"
+        out.attrs["iirspy_version"] = metadata.version("iirspy")
+        if empirical:
+            out.attrs["empirical_notes"] = json.dumps(emp_notes)  # provenance: how the product was made
 
         return out
 
