@@ -45,6 +45,8 @@ IIRS_PROJ_DICT = {
 LVL2MTC = {0: "nri", 1: "nci", 2: "ndi"}
 OSF = (*range(29, 35), *range(69, 76), *range(162, 172))  # Order sorting filters
 INVALID = (*range(1, 7), *range(252, 257))  # Invalid band list
+# IIRS L1 radiance is stored in [1000 mW/cm^2/sr/um]; multiply to get physical [W/m^2/sr/um].
+RAD_NATIVE_SCALE = 0.01  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
 
 
 ## Reflectance corr
@@ -163,7 +165,7 @@ def preprocess_input_data(fqub, fgeom, fspm, ftif, extent, yrange, ychunks):
         da.coords["y"] = min(da.y) - da.y
 
     # IIRS L1 radiance is in [1000 mW/cm^2/sr/um]
-    da = 0.01 * da  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
+    da = RAD_NATIVE_SCALE * da  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
     return da
 
 
@@ -286,7 +288,7 @@ def iirs_refl_verma(da, inc=None, smoothing=3, fflux=FSOLAR, fpolish=FPOLISH):
     fflux (str): Path to IIRS solar flux input file.
     """
     # Unscale IIRS L1 radiance from [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
-    da = da * 0.01
+    da = da * RAD_NATIVE_SCALE
 
     # Get solar spectrum
     L = pd.read_csv(fflux, sep="\t", header=None, names=["wl", "flux"])
@@ -1051,8 +1053,8 @@ def load_reference_flat(fimg, calib_dir=DCALIB):
     Return the packaged sensor flat (band, x) for fimg's exposure/gain, or None if not given.
 
     Prebuilt flat across multiple IIRS scenes (see iirspy.empirical.build_flat),
-    used as the fallback when a scene has no qualifying flat region of its own. 
-    Named ch2_iirs_flat_<expgain>.csv 
+    used as the fallback when a scene has no qualifying flat region of its own.
+    Named ch2_iirs_flat_<expgain>.csv
     """
     exp_gain = get_exposure_gain(fimg)  # e.g. "e1g2"
     fflat = Path(calib_dir) / f"ch2_iirs_flat_{exp_gain}.csv"
@@ -1166,7 +1168,7 @@ def get_saturation_radiance(fimg, calib_dir=DCALIB):
     """Return IIRS saturation radiance file as 1D DataArray along band."""
     flut = get_lut_file(fimg, "saturations_radiance", calib_dir)
     lut = np.loadtxt(flut, delimiter=",", usecols=2).astype("float32")  # band, wl, saturation [1000 mW/cm^2/sr/um]
-    return 0.01 * xr.DataArray(lut, coords={"band": np.arange(1, 257)}, name="saturation [W/m^2/sr/um]")
+    return RAD_NATIVE_SCALE * xr.DataArray(lut, coords={"band": np.arange(1, 257)}, name="saturation [W/m^2/sr/um]")
 
 
 def get_solar_flux(sdist=1.0, fflux=FSOLAR):

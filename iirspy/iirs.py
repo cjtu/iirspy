@@ -197,6 +197,7 @@ class IIRSData(ABC):
             "transform": da.rio.transform(),
             "compress": "LZW",
             "tiled": True,
+            "interleave": "band",  # per-band planes: viewers read one band without decompressing all 256
             "BIGTIFF": "YES",
         }
         wls = [f"{float(w):.2f}" for w in da.wl.values] if "wl" in da.coords else None
@@ -309,6 +310,7 @@ class L0(IIRSData):
         self,
         empirical=False,
         interp_bands=None,
+        interp_spatial=False,
         attach_snr=True,
         empirical_kws=None,
         bad_pixel_mask=True,
@@ -352,6 +354,11 @@ class L0(IIRSData):
             Apply the on-orbit empirical dark/flat (+ optional smile) correction with LUT band-median scale.
         interp_bands : str or None
             If set, fill masked bands by interpolating across band (e.g. "linear").
+        interp_spatial : bool
+            After interp_bands, fill isolated single-column NaN gaps (detector columns that are
+            NaN across every band, so band interpolation cannot reach them) by interpolating
+            across x. Only single-column gaps are filled: wider seams (e.g. OSF, multi-column
+            bad-pixel runs) and image-edge columns (no neighbour on one side) are left as NaN.
         attach_snr : bool
             When empirical and the scene has shadow, attach the per-pixel broadband SNR field (float32
             (y, x)) as an `snr` coordinate on the returned DataArray. Radiance is left as measured:
@@ -407,6 +414,11 @@ class L0(IIRSData):
         # Interpolate across bands
         if interp_bands is not None:
             rad = rad.interpolate_na("band", max_gap=6, keep_attrs=True, method=interp_bands)
+
+        # Fill single-column all-band NaN gaps across x (max_gap=2 in 0.5-based x coords spans
+        # exactly one missing column; wider seams and edge columns have no bounded gap to fill)
+        if interp_spatial:
+            rad = rad.interpolate_na("x", max_gap=2, keep_attrs=True, method="linear")
 
         # Format and output Radiance DataArray (float32: gain/offset LUTs are float32, keep graph float32)
         out = rad.astype("float32")
@@ -496,12 +508,59 @@ class L1(IIRSData):
             instance.img = instance.img.assign_coords({"lon": ("x", lon), "lat": ("y", lat)})
 
         if instance.spm is not None:
-            inc, iaz = utils.get_iirs_inc_az(None, instance.spm, instance.extent[2:])
-            instance.img = instance.img.assign_coords({
-                "solar_inc": ("y", inc),
-                "solar_az": ("y", iaz),
-            })
+            # Solar incidence/azimuth need the scene's per-line clock times, which come from the
+            # L1 qub/xml label metadata (start time, exposure, line count, orbit direction). Locate
+            # the label for this basename; the tiny .xml suffices if the bulky .qub was cleaned up.
+            paths = utils.get_iirs_paths(
+                instance.directory, exts=("qub", "xml"), level=1, basenames=[instance.basename]
+            )
+            fimg = paths.get("qub", {}).get(instance.basename) or paths.get("xml", {}).get(instance.basename)
+            if fimg is not None:
+                # yrange as contiguous absolute line indices matching this cube's y, so the
+                # incidence array lines up exactly (extent min/max int-truncation can be off by 1).
+                y0 = int(round(float(instance.img.y.min()) - 0.5))
+                yr = (y0, y0 + instance.img.sizes["y"])
+                inc, iaz = utils.get_iirs_inc_az(fimg, instance.spm, yr)
+                instance.img = instance.img.assign_coords({
+                    "solar_inc": ("y", inc),
+                    "solar_az": ("y", iaz),
+                })
 
+        return instance
+
+    @classmethod
+    def from_geotiff(cls, path, basename, directory="."):
+        """Load a cropped empirical-L1 GeoTIFF (written in native [1000 mW/cm^2/sr/um]) as an L1.
+
+        The GeoTIFF transform carries the original absolute line/sample offset, so the reloaded
+        cube keeps full-scene pixel coordinates and its geometry (solar angles, lat/lon) can be
+        re-derived from the ancillary spm/csv in `directory`. Radiance is rescaled to physical
+        [W/m^2/sr/um] exactly as the ISSDC L1 reader does (utils.RAD_NATIVE_SCALE), so the result
+        feeds L2 identically to a downloaded L1. See L0.calibrate + run_l1_polar.py for the writer.
+
+        Parameters
+        ----------
+        path : str or Path
+            Cropped L1 GeoTIFF written by the polar pipeline (radiance in [1000 mW/cm^2/sr/um]).
+        basename : str
+            Image basename (e.g. 20210723T1445053074), used to find spm/geometry in `directory`.
+        directory : str
+            Directory holding the IIRS bundle (nci ancillary: spm + geometry csv).
+        """
+        da = xr.open_dataarray(path, engine="rasterio").sortby("y").sortby("x")
+        nband = da.shape[0]
+        da = da.assign_coords(band=np.arange(1, nband + 1), wl=("band", utils.get_wls()[:nband]))
+        da = da * utils.RAD_NATIVE_SCALE  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
+        da.attrs["name"] = "Radiance"
+        da.attrs["units"] = "W/m^2/sr/um"
+        da.attrs["calibration_source"] = "empirical"
+
+        instance = cls.from_xarray(da, basename, directory)
+        # from_xarray only attaches lat/lon when given a latlonextent; derive them for the actual
+        # absolute crop extent instead (mirrors L1.__init__), so polar analysis has lat/lon coords.
+        if instance.geomdf is not None:
+            lon, lat = utils.geom2latlon_coords(instance.geomdf, instance.extent, instance.nx, instance.ny)
+            instance.img = instance.img.assign_coords({"lon": ("x", lon), "lat": ("y", lat)})
         return instance
 
     def __init__(
@@ -545,7 +604,7 @@ class L1(IIRSData):
         self.shape = self.img.shape  # [nband, ny, nx]
 
         # Fix units
-        self.img *= 0.01  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
+        self.img *= utils.RAD_NATIVE_SCALE  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
         self.img.attrs["name"] = "Radiance"
         self.img.attrs["units"] = "W/m^2/sr/um"
         self.img.attrs["calibration_source"] = "issdc"
