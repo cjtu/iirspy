@@ -201,7 +201,11 @@ class IIRSData(ABC):
             "BIGTIFF": "YES",
         }
         wls = [f"{float(w):.2f}" for w in da.wl.values] if "wl" in da.coords else None
+        # Provenance: scalar attrs (incl. empirical_notes JSON) round-trip as GDAL metadata tags
+        tags = {k: str(v) for k, v in da.attrs.items() if isinstance(v, str | int | float | bool)}
         with rasterio.open(fout, "w", **profile) as dst, ProgressBar():
+            if tags:
+                dst.update_tags(**tags)
             for y0 in range(0, ny, row_block):
                 y1 = min(y0 + row_block, ny)
                 block = da.isel(y=slice(y0, y1)).values.astype("float32", copy=False)
