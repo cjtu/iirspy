@@ -13,7 +13,7 @@ step use the LUT only for the per-band absolute scale (see iirs.L0.calibrate_to_
   flat(band, x)       : sensor high-frequency response, R / lowpass_x(R), median-composited over
                         the flattest scene region in each of several DN bins. A hardware property,
                         so it is transferable; falls back to a packaged reference flat when the
-                        scene has no qualifying flat region (rough/shadowed south-polar scenes).
+                        scene has no qualifying flat region.
   smile(band, x)      : band-relative smooth cross-track field. Only spectrally-varying smooth
                         structure is divided out; the broadband scene gradient is preserved.
 
@@ -22,7 +22,7 @@ Correction model (shadow anchors the zero point; see SPEC / calibrate_to_rad):
   shadow scene   : rad = 10 * gain_med * (DN - dark_resid) / (flat * smile)   # LUT offset dropped
   no-shadow scene: rad = 10 * (gain_med * DN / (flat * smile) + offset_med)   # LUT offset kept
 
-Everything here operates on the raw DN DataArray (band, y, x) and depends only on iirspy.utils.
+Everything here operates on the raw DN DataArray (band, y, x).
 """
 
 import warnings
@@ -232,9 +232,15 @@ def derive_sensor_flat(img, dark, a, b):
 
 
 def _flat_rms(flat, ref):
-    """Per-detector-element RMS deviation of a per-scene flat from the packaged reference flat."""
-    d = (flat - ref).values
-    return float(np.sqrt(np.nanmean(d**2)))
+    """Per-detector-element RMS deviation of a per-scene flat from the packaged reference flat.
+
+    float64: squaring the float32 difference overflows to inf on the handful of elements where
+    lowpass_x(R) rounds to ~0, which turned the whole diagnostic into inf. Non-finite elements are
+    dropped rather than propagated - this is a provenance metric, not part of the correction.
+    """
+    d = (flat - ref).values.astype("float64")
+    d = d[np.isfinite(d)]
+    return float(np.sqrt(np.mean(d**2))) if d.size else float("nan")
 
 
 def build_flat(img, dark, rs, r_raw, lit, row_bright, ref_flat=None):
