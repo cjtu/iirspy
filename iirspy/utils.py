@@ -47,6 +47,7 @@ OSF = (*range(29, 35), *range(69, 76), *range(162, 172))  # Order sorting filter
 INVALID = (*range(1, 7), *range(252, 257))  # Invalid band list
 # IIRS L1 radiance is stored in [1000 mW/cm^2/sr/um]; multiply to get physical [W/m^2/sr/um].
 RAD_NATIVE_SCALE = 0.01  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
+E1_EXPOSURE_MS = 1.0  # exposure duration the e1g2 gain LUT was measured at (see get_gain_offset)
 
 
 ## Reflectance corr
@@ -1124,9 +1125,33 @@ def get_lut_file(fimg, lut_type="lut_coeff", calib_dir=DCALIB):
     raise FileNotFoundError(f"IIRS calibration file {flut} not found.")
 
 
+def get_exposure_duration(fimg):
+    """Return the commanded exposure duration [ms] from the IIRS label (e1 -> 1, e2 -> 3, ...).
+
+    Not to be confused with isda:line_exposure_duration (the 53.06 ms line period, identical
+    across exposure settings).
+    """
+    return float(pdr.open(fimg).metaget("isda:exposure_duration"))
+
+
 def get_gain_offset(fimg, denoise=False, gain_z=None, offset_z=None, calib_dir=DCALIB):
     """
-    Return the IIRS gain and offset for fimg as DataArrays.
+    Return the IIRS gain and offset for fimg as DataArrays, in [mW/cm^2/sr/um] per DN.
+
+    Only ch2_iirs_cal_e1g2_lut_coeff.csv is a real calibration. The e2g2/e3g2/e4g2 tables are
+    placeholders: gain ~ 1.0 at every (band, x) with no spectral structure at all, ~360x flatter
+    across band than the true response. Used as shipped they put radiance ~1000x high, every pixel
+    trips the saturation cut in calibrate_to_rad, and the whole cube is nulled.
+
+    ISSDC's own L1 product does not use them either. Differencing the e2g2 scene
+    20201203T1859574285 against its nci L1 gives L1 = 333.6 +/- 3.8 * gain_e1g2 * DN over bands
+    5-20 (a flat ratio, so the e1g2 spectral AND cross-track shape is what ISSDC applied), i.e.
+    exactly gain_e1g2 / 3 in this module's units - and that scene's label reads
+    isda:exposure_duration = 3 ms against e1's 1 ms. So this function always loads the e1g2 table
+    and scales gain by E1_EXPOSURE_MS / exposure_duration - a no-op for e1g2 itself (1 ms).
+
+    Note the e2g2/e3g2/e4g2 saturations_radiance tables sit ~3x above the resulting full-scale
+    radiance, so the saturation cut cannot fire for those scenes (safe, but not a real check).
 
     Parameters
     ----------
@@ -1135,18 +1160,14 @@ def get_gain_offset(fimg, denoise=False, gain_z=None, offset_z=None, calib_dir=D
     denoise: bool
         Replace speckly noise from gain / offset with NaN.
     """
-    flut = get_lut_file(fimg, "lut_coeff", calib_dir)
-    zdefaults = {  # Empirically selected z-thresholds for gain, offset
-        "ch2_iirs_cal_e1g2_lut_coeff.csv": (0.01, 0.5),
-        "ch2_iirs_cal_e2g2_lut_coeff.csv": (0.5, 0.1),
-        "ch2_iirs_cal_e3g2_lut_coeff.csv": (1, 0.1),
-        "ch2_iirs_cal_e4g2_lut_coeff.csv": (1, 1),
-    }
+    flut = str(Path(calib_dir) / "ch2_iirs_cal_e1g2_lut_coeff.csv")
+    gain_scale = E1_EXPOSURE_MS / get_exposure_duration(fimg)
     if gain_z is None:
-        gain_z = zdefaults.get(Path(flut).name, (1, 1))[0]
+        gain_z = 0.01  # Empirically selected z-thresholds for gain, offset
     if offset_z is None:
-        offset_z = zdefaults.get(Path(flut).name, (1, 1))[1]
+        offset_z = 0.5
     lut = np.loadtxt(flut, delimiter=",").reshape((256, 250, 2)).astype("float32")
+    lut[:, :, 0] *= gain_scale
     coords = {"band": 1 + np.arange(0, 256), "x": 0.5 + np.arange(250)}
     gain = xr.DataArray(lut[:, :, 0], coords=coords, name="gain")
     off = xr.DataArray(lut[:, :, 1], coords=coords, name="offset")
