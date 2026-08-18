@@ -474,7 +474,7 @@ def warp2grid(da, ext, gridlon, gridlat, method="bilinear"):
     dlon = (maxlon - minlon) / len(src.x)
     target_grid = {
         "lon": np.arange(minlon, maxlon + dlon, dlon, dtype="float32"),
-        "lat": np.arange(minlat, maxlat + dlat, dlat, "float32"),
+        "lat": np.arange(minlat, maxlat + dlat, dlat, dtype="float32"),
     }
     # TODO: need to replace regridder
     # regridder = xe.Regridder(src, target_grid, method, unmapped_to_nan=True)
