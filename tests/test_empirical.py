@@ -113,16 +113,17 @@ def test_broadband_snr_is_high_in_lit_rows_and_low_in_dark():
     assert float(snr.isel(y=slice(200, None)).median()) > 50
 
 
-def test_row_roughness_and_flattest_window(real_cube):
+def test_row_roughness_and_flattest_rows(real_cube):
     P = emp.panchromatic(real_cube)
     rs = emp.row_roughness(P)
     lit = emp.lit_rows(P, None)  # fixture is a fully lit crop: no dark block to measure noise in
     assert rs.shape == lit.shape == (real_cube.sizes["y"],)
-    a, b = emp.flattest_window(rs, lit)
-    assert b - a == emp.MIN_ROWS
-    best = float(np.nanmean(rs[a:b]))  # no other window of that length is flatter
-    others = [float(np.nanmean(rs[i : i + emp.MIN_ROWS])) for i in range(0, len(rs) - emp.MIN_ROWS, 25)]
-    assert best <= min(others) + 1e-9
+    rows = emp.flattest_rows(rs, lit)
+    assert rows.size == emp.MIN_ROWS
+    assert (np.diff(rows) > 0).all(), "rows come back sorted"
+    # every row taken is at least as flat as every row left behind
+    rest = np.setdiff1d(np.flatnonzero(np.isfinite(rs) & lit), rows)
+    assert rs[rows].max() <= rs[rest].min() + 1e-9
 
 
 def test_signal_free_rows_do_not_poison_the_roughness_profile():
@@ -134,13 +135,46 @@ def test_signal_free_rows_do_not_poison_the_roughness_profile():
     lit = emp.lit_rows(P, (0, 200))
     assert np.isinf(rs[300:340]).all(), "signal-free rows must be maximally rough"
     assert np.isfinite(rs[400:]).all(), "the rest of the roughness profile must survive"
-    win = emp.flattest_window(rs, lit)
-    assert win is not None and not (win[0] < 340 and win[1] > 300), "must not straddle the dead rows"
+    rows = emp.flattest_rows(rs, lit)
+    assert rows is not None and not ((rows >= 300) & (rows < 340)).any(), "must not take dead rows"
 
 
-def test_flattest_window_without_enough_rows_returns_none():
-    assert emp.flattest_window(np.zeros(500), np.zeros(500, dtype=bool)) is None
-    assert emp.flattest_window(np.zeros(50), np.ones(50, dtype=bool)) is None
+def test_flattest_rows_without_enough_rows_returns_none():
+    assert emp.flattest_rows(np.zeros(500), np.zeros(500, dtype=bool)) is None
+    assert emp.flattest_rows(np.zeros(50), np.ones(50, dtype=bool)) is None
+
+
+def test_flattest_rows_survives_fragmented_lit_rows():
+    """Qualifying rows need not be adjacent."""
+    rs = np.linspace(1.0, 2.0, 1000)
+    lit = np.zeros(1000, dtype=bool)
+    lit[::2] = True  # 500 lit rows, no two adjacent
+    rows = emp.flattest_rows(rs, lit)
+    assert rows is not None and rows.size == emp.MIN_ROWS
+    assert lit[rows].all()
+
+
+def test_dn_bins_never_starves_a_bin_below_min_rows():
+    row_bright = np.linspace(0, 100, 1000)
+    lit = np.zeros(1000, dtype=bool)
+    lit[:500] = True  # 500 lit rows -> 2 bins of 250, not 4 of 125
+    assert len(emp.dn_bins(row_bright, lit)) == 2
+    lit[:] = True
+    assert len(emp.dn_bins(row_bright, lit)) == emp.N_DN_BINS
+    assert emp.dn_bins(row_bright, np.zeros(1000, dtype=bool)) == []
+
+
+def test_refine_dark_block_ignores_a_dim_patch_elsewhere_in_the_scene():
+    """A dim patch longer than the true shadow must not be adopted as the dark block: lit pixels
+    in the dark frame over-subtract the residual dark and inflate the noise scale."""
+    cube = synth_cube(ny=1400, dark_rows=400)
+    cube[:, 800:1050, :] = 40.0  # a dim patch, longer than the true shadow but 25 DN above it
+    P = emp.panchromatic(cube)
+    mask, _, _ = emp.detect_dark_rows(P)
+    block = emp.longest_run(mask)
+    assert block == (0, 400)
+    d0, d1 = emp.refine_dark_block(P, block)
+    assert d1 <= 400, f"refined block {(d0, d1)} must stay on the true shadow, not jump to the patch"
 
 
 def test_spatial_outlier_mask_flags_injected_spikes(real_cube):
