@@ -140,6 +140,8 @@ cython_debug/
 #.idea/
 tmp/
 *.tif
+# except small committed test fixtures
+!tests/data/*.tif
 notebooks/
 .idea/
 

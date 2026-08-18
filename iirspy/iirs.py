@@ -10,7 +10,7 @@ import xarray as xr
 from rioxarray.exceptions import NoDataInBounds
 
 import iirspy.utils as utils
-from iirspy.empirical import FLAT_SMILE_MIN, empirical_frames
+from iirspy.empirical import empirical_frames
 
 # Skip div 0 and 0/0 warnings
 np.seterr(divide="ignore", invalid="ignore")
@@ -62,6 +62,9 @@ def _apply_envi_start(da):
         if start is not None and float(da[dim][0]) < 1:
             da = da.assign_coords({dim: da[dim].values + int(start) - 1})
     return da
+
+
+FLAT_SMILE_MIN = 0.2  # clip flat*smile away from 0 before dividing (avoids blow-ups)
 
 
 class IIRSData(ABC):
