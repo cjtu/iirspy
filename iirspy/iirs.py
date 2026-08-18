@@ -45,6 +45,25 @@ def _try_load_next_level_metadata(basename, target_level, directory, xyextent):
     return result
 
 
+def _band_numbers(img):
+    """Original IIRS band numbers, from the GeoTIFF band_numbers tag or ENVI band names, else 1..N."""
+    for attr in ("band_numbers", "band_names"):
+        val = img.attrs.get(attr, "")
+        if isinstance(val, str) and all(b.strip().isdigit() for b in val.split(",")):
+            return [int(b) for b in val.split(",")]
+    return img.band.values
+
+
+def _apply_envi_start(da):
+    """Shift x/y by the ENVI `x start`/`y start` offset, which GDAL reports but does not apply."""
+    for dim, attr in (("x", "x_start"), ("y", "y_start")):
+        start = da.attrs.get(attr)
+        # Only when the file carried no transform (coords still 0-based); else it is already applied
+        if start is not None and float(da[dim][0]) < 1:
+            da = da.assign_coords({dim: da[dim].values + int(start) - 1})
+    return da
+
+
 class IIRSData(ABC):
     """Abstract base class for IIRS data products."""
 
@@ -90,11 +109,13 @@ class IIRSData(ABC):
 
         # Read image
         self.img = xr.open_dataarray(self.qub, engine="rasterio")
+        # Band subsets are not 1-indexed; without their true numbers every sel(band=N) is off
+        self.img = self.img.assign_coords(band=_band_numbers(self.img))
         self.shape = self.img.shape
         self.nband, self.ny, self.nx = self.shape
 
-        # Assign wavelength [nm] as coordinate
-        self.img = self.img.assign_coords(wl=("band", utils.get_wls()))
+        # Wavelength [nm], indexed by band number so subsets get their own wls, not the first N
+        self.img = self.img.assign_coords(wl=("band", utils.get_wls()[self.img.band.values - 1]))
 
         # Chunk with dask if needed
         if chunk and self.nband * self.ny * self.nx * 4 > utils.CHUNKSIZE:
@@ -203,6 +224,8 @@ class IIRSData(ABC):
         wls = [f"{float(w):.2f}" for w in da.wl.values] if "wl" in da.coords else None
         # Provenance: scalar attrs (incl. empirical_notes JSON) round-trip as GDAL metadata tags
         tags = {k: str(v) for k, v in da.attrs.items() if isinstance(v, str | int | float | bool)}
+        # Which IIRS bands these planes are: 1..256 on a full cube, arbitrary on a subset
+        tags["band_numbers"] = ",".join(str(int(b)) for b in da.band.values)
         with rasterio.open(fout, "w", **profile) as dst, ProgressBar():
             if tags:
                 dst.update_tags(**tags)
@@ -299,7 +322,7 @@ class L0(IIRSData):
         """Plot image at band and x, y indices if supplied."""
         if "cbarlabel" not in kwargs:
             kwargs["cbarlabel"] = "Digital Number"
-        p, ax = super().plot(band, yrange, xrange, **kwargs)
+        _, ax = super().plot(band, yrange, xrange, **kwargs)
 
         # Flip image if flip_xy (can plot a descending orbit with north up)
         if flip_xy:
@@ -522,7 +545,7 @@ class L1(IIRSData):
             if fimg is not None:
                 # yrange as contiguous absolute line indices matching this cube's y, so the
                 # incidence array lines up exactly (extent min/max int-truncation can be off by 1).
-                y0 = int(round(float(instance.img.y.min()) - 0.5))
+                y0 = round(float(instance.img.y.min()) - 0.5)
                 yr = (y0, y0 + instance.img.sizes["y"])
                 inc, iaz = utils.get_iirs_inc_az(fimg, instance.spm, yr)
                 instance.img = instance.img.assign_coords({
@@ -533,27 +556,25 @@ class L1(IIRSData):
         return instance
 
     @classmethod
-    def from_geotiff(cls, path, basename, directory="."):
-        """Load a cropped empirical-L1 GeoTIFF (written in native [1000 mW/cm^2/sr/um]) as an L1.
+    def from_file(cls, path, basename, directory="."):
+        """Load a cropped empirical-L1 GeoTIFF or ENVI cube (native [1000 mW/cm^2/sr/um]) as an L1.
 
-        The GeoTIFF transform carries the original absolute line/sample offset, so the reloaded
-        cube keeps full-scene pixel coordinates and its geometry (solar angles, lat/lon) can be
-        re-derived from the ancillary spm/csv in `directory`. Radiance is rescaled to physical
-        [W/m^2/sr/um] exactly as the ISSDC L1 reader does (utils.RAD_NATIVE_SCALE), so the result
-        feeds L2 identically to a downloaded L1. See L0.calibrate + run_l1_polar.py for the writer.
+        Restores the band numbers, wavelengths and absolute line/sample offset, rescales radiance to
+        physical [W/m^2/sr/um] (utils.RAD_NATIVE_SCALE) and attaches geometry from the ancillary
+        spm/csv in `directory`, so the result feeds L2 identically to a downloaded L1.
 
         Parameters
         ----------
         path : str or Path
-            Cropped L1 GeoTIFF written by the polar pipeline (radiance in [1000 mW/cm^2/sr/um]).
+            Cropped L1 raster written by the polar pipeline (radiance in [1000 mW/cm^2/sr/um]).
         basename : str
             Image basename (e.g. 20210723T1445053074), used to find spm/geometry in `directory`.
         directory : str
             Directory holding the IIRS bundle (nci ancillary: spm + geometry csv).
         """
-        da = xr.open_dataarray(path, engine="rasterio").sortby("y").sortby("x")
-        nband = da.shape[0]
-        da = da.assign_coords(band=np.arange(1, nband + 1), wl=("band", utils.get_wls()[:nband]))
+        da = _apply_envi_start(xr.open_dataarray(path, engine="rasterio").sortby("y").sortby("x"))
+        bands = np.asarray(_band_numbers(da), dtype=int)
+        da = da.assign_coords(band=bands, wl=("band", utils.get_wls()[bands - 1]))
         da = da * utils.RAD_NATIVE_SCALE  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
         da.attrs["name"] = "Radiance"
         da.attrs["units"] = "W/m^2/sr/um"
@@ -632,7 +653,7 @@ class L1(IIRSData):
         if "cbarlabel" not in kwargs:
             kwargs["cbarlabel"] = "Radiance [$W/m^2/sr/um$]"
         x, y = ("lon", "lat") if "lon" in self.img.coords and "lat" in self.img.coords else ("x", "y")
-        p, ax = super().plot(band, yrange, xrange, x=x, y=y, **kwargs)
+        _, ax = super().plot(band, yrange, xrange, x=x, y=y, **kwargs)
         return ax
 
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
@@ -858,7 +879,7 @@ class L2(IIRSData):
         if "cbarlabel" not in kwargs:
             kwargs["cbarlabel"] = "Reflectance"
         x, y = ("lon", "lat") if "lon" in self.img.coords and "lat" in self.img.coords else ("x", "y")
-        p, ax = super().plot(band, yrange, xrange, x=x, y=y, **kwargs)
+        _, ax = super().plot(band, yrange, xrange, x=x, y=y, **kwargs)
         return ax
 
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):

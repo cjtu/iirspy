@@ -75,9 +75,18 @@ def robust_z(resid, axis):
     return np.divide(resid, robust_std, out=np.full_like(resid, np.nan), where=robust_std > 0)
 
 
+def avail(img, bands):
+    """Intersect `bands` with the bands the cube carries, so band subsets calibrate. Empty raises."""
+    have = set(np.asarray(img.band.values).tolist())
+    sel = [b for b in bands if b in have]
+    if not sel:
+        raise ValueError(f"cube carries none of bands {bands[:5]}...; cannot derive the empirical correction")
+    return sel
+
+
 def panchromatic(img):
     """Band-averaged (y, x) brightness over PAN_BANDS (eager)."""
-    return img.sel(band=PAN_BANDS).mean("band").compute()
+    return img.sel(band=avail(img, PAN_BANDS)).mean("band").compute()
 
 
 def _xr_yx(mask_yx, like):
@@ -217,7 +226,7 @@ def spatial_outlier_mask(fsub):
     structure - crater walls/shadows, bright rims, residual bad pixels - excluded so the flat's
     median over y isn't biased by real spatial features rather than sensor response.
     """
-    cb = fsub.sel(band=CLEAN_BANDS)
+    cb = fsub.sel(band=avail(fsub, CLEAN_BANDS))
     struct = (cb / cb.mean(("y", "x"))).median("band").values
     z = robust_z(struct - np.nanmedian(struct), axis=(0, 1))
     return np.abs(z) > 4.0
@@ -296,7 +305,7 @@ def estimate_smile(img, dark, flat, lit, stride=SMILE_STRIDE):
     y0, y1 = int(ys[0]), int(ys[-1]) + 1
     sub = ((img.isel(y=slice(y0, y1, stride)).astype("float32") - dark) / flat).compute()
     lp = lowpass_x(sub.median("y"))  # (band, x) smooth cross-track
-    ref = lp.sel(band=PAN_BANDS).median("band")  # (x,) broadband scene profile
+    ref = lp.sel(band=avail(lp, PAN_BANDS)).median("band")  # (x,) broadband scene profile
     smile = lp / ref
     smile = smile / smile.median("x")
     # Signal-free columns (ref ~ 0) give non-finite smile; leave those uncorrected (smile=1)

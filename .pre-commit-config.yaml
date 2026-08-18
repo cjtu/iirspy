@@ -7,9 +7,18 @@ repos:
       - id: check-toml
       - id: check-yaml
 
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: "v0.6.3"
+  # Use the project's own ruff (uv.lock) so the hook and `uv run ruff` can never disagree.
+  - repo: local
     hooks:
       - id: ruff
-        args: [--exit-non-zero-on-fix]
+        name: ruff
+        entry: uv run ruff check --force-exclude --exit-non-zero-on-fix
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
       - id: ruff-format
+        name: ruff-format
+        entry: uv run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
