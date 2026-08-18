@@ -246,7 +246,8 @@ def apply_smoothing(da, smoothing, swindow):
         gaussian = norm(loc=0, scale=1).pdf(np.arange(swindow) - swindow // 2)
         weights = xr.DataArray(gaussian / gaussian.sum(), dims=["window"])
         da = (
-            da.rolling({"band": swindow}, center=True, min_periods=1)
+            da
+            .rolling({"band": swindow}, center=True, min_periods=1)
             .construct("window")
             .interpolate_na("band")
             .dot(weights)
@@ -1239,9 +1240,16 @@ def write_envi(da, fout):
 
 
 ## ENVI BIL streaming writer
-def write_envi_hdr(fhdr, nx, ny, nband, wls, description="IIRS"):
-    """Write an ENVI header for a float32 BIL cube (data type 4, little-endian)."""
-    band_names = ", ".join(f"Band {i + 1}" for i in range(nband))
+def write_envi_hdr(fhdr, nx, ny, nband, wls, description="IIRS", bands=None, x_start=1, y_start=1):
+    """Write an ENVI header for a float32 BIL cube (data type 4, little-endian).
+
+    `bands` are the IIRS band numbers of the planes (default 1..nband); they go in `band names` so
+    a band subset reads back as itself rather than 1..N. `x_start`/`y_start` are the 1-indexed
+    sample/line of this crop in the parent scene: ENVI carries no transform, so they are the only
+    place a crop's absolute position survives (GeoTIFF uses the geotransform instead).
+    """
+    bands = range(1, nband + 1) if bands is None else bands
+    band_names = ", ".join(str(int(b)) for b in bands)
     wl_str = ", ".join(f"{float(w):.4f}" for w in wls)
     Path(fhdr).write_text(
         "ENVI\n"
@@ -1249,6 +1257,7 @@ def write_envi_hdr(fhdr, nx, ny, nband, wls, description="IIRS"):
         f"samples = {nx}\nlines = {ny}\nbands = {nband}\n"
         "header offset = 0\nfile type = ENVI Standard\n"
         "data type = 4\ninterleave = bil\nbyte order = 0\n"
+        f"x start = {int(x_start)}\ny start = {int(y_start)}\n"
         "wavelength units = Nanometers\n"
         f"band names = {{{band_names}}}\n"
         f"wavelength = {{{wl_str}}}\n"
@@ -1270,7 +1279,9 @@ def write_envi_bil(da, fout, sub_rows=1000, description="IIRS"):
     with open(fout, "wb") as f:
         _write_bil_rows(f, da, 0, ny, sub_rows)
     wls = da.wl.values if "wl" in da.coords else np.arange(1, nband + 1)
-    write_envi_hdr(Path(fout).with_suffix(".hdr"), nx, ny, nband, wls, description)
+    # Pixel centres (n + 0.5) -> ENVI's 1-indexed sample/line of the crop's upper-left pixel
+    x_start, y_start = (int(np.floor(float(da[d].min()))) + 1 for d in ("x", "y"))
+    write_envi_hdr(Path(fout).with_suffix(".hdr"), nx, ny, nband, wls, description, da.band.values, x_start, y_start)
     return fout
 
 
