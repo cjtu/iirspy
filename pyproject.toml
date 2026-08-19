@@ -1,6 +1,6 @@
 [project]
 name = "iirspy"
-version = "0.0.4"
+version = "0.0.5"
 description = "Handling and correcting Chandrayaan-2 IIRS data in Python."
 authors = [{ name = "Christian J. Tai Udovicic", email = "cj.taiudovicic@gmail.com" }]
 readme = "README.md"
@@ -26,6 +26,7 @@ dependencies = [
     "opencv-python>=4.11.0.86",
     "pandas>=2.2.3",
     "pdr>=1.3.0",
+    "pyproj>=3.7.1",
     "rioxarray>=0.15.0",
     "scipy>=1.13.1",
     "xarray>=2024.7.0",
