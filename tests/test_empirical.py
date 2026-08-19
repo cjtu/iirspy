@@ -21,12 +21,20 @@ FIXTURE_BANDS = [10, 18, 26, 42, 110, 111, 112]
 PAN = [b for b in FIXTURE_BANDS if b in emp.PAN_BANDS]  # [10, 18, 26, 42]
 
 
-def synth_cube(nband=7, ny=600, nx=250, bands=None, dark_rows=200, seed=0):
-    """Synthetic (band, y, x) DN cube: `dark_rows` dark rows then a lit, gently textured scene."""
+def synth_cube(nband=7, ny=600, nx=250, bands=None, dark_rows=200, seed=0, texture=0.0, pedestal=0.0):
+    """Synthetic (band, y, x) DN cube: `dark_rows` dark rows then a lit, gently textured scene.
+
+    `texture` adds cross-track albedo contrast to the lit rows only - the scene's own sine is
+    smooth enough that a CROSS_WIN high-pass removes it, so a shadow/terrain test needs real
+    high-frequency structure to bite. `pedestal` lifts every row, standing in for a scene whose
+    onboard dark subtraction never ran (20201203T1859574285 sits ~290 DN up).
+    """
     rng = np.random.default_rng(seed)
     bands = FIXTURE_BANDS[:nband] if bands is None else bands
-    data = np.full((len(bands), ny, nx), 15.0, dtype="float32")  # dark level
+    data = np.full((len(bands), ny, nx), 15.0 + pedestal, dtype="float32")  # dark level
     scene = 300 + 20 * np.sin(np.linspace(0, 6, nx))[None, :] + rng.normal(0, 3, (ny - dark_rows, nx))
+    if texture:
+        scene = scene + rng.normal(0, texture, (ny - dark_rows, nx))
     data[:, dark_rows:, :] += scene[None].astype("float32")
     data += rng.normal(0, 1.0, data.shape).astype("float32")
     return xr.DataArray(
@@ -80,10 +88,38 @@ def test_dark_floor_and_detect_dark_rows_find_the_dark_block():
     assert row_bright.shape == (cube.sizes["y"],)
 
 
-def test_detect_dark_rows_returns_nothing_when_scene_is_uniformly_lit():
-    cube = synth_cube(dark_rows=0)
-    mask, _, _ = emp.detect_dark_rows(emp.panchromatic(cube))
-    assert not mask.any()
+def test_uniformly_lit_scene_yields_no_dark_subtraction():
+    """The level bootstrap always returns its dimmest rows; is_shadow is what rejects them."""
+    P = emp.panchromatic(synth_cube(dark_rows=0, texture=12.0))
+    mask, _, _ = emp.detect_dark_rows(P)
+    assert mask.any(), "the bootstrap is a level cut, so a lit scene still offers candidates"
+    assert not emp.is_shadow(P, emp.longest_run(mask)), "dim lit rows keep their terrain contrast"
+    *_, notes = emp.empirical_frames(synth_cube(dark_rows=0, texture=12.0))
+    assert notes["has_shadow"] is False
+
+
+def test_shadow_is_found_through_an_unsubtracted_dark_pedestal():
+    """The failure 20201203T1859574285 shows: shadow at ~290 DN, which any level cut calls lit.
+
+    Structure, not level, has to make the call - and the derived dark must carry the pedestal so
+    the radiance still comes out zero-anchored.
+    """
+    cube = synth_cube(texture=12.0, pedestal=290.0)
+    dark, _, _, snr, notes = emp.empirical_frames(cube)
+    assert notes["has_shadow"] is True
+    assert snr is not None
+    a, b = notes["dark_rows"]
+    assert a < 50 and b > 150, f"expected the leading 200 shadow rows, got {notes['dark_rows']}"
+    assert notes["dark_level"] > emp.DARK_PEDESTAL_DN  # flagged as an unsubtracted dark
+    assert float(dark.median()) == pytest.approx(305.0, abs=3.0)  # 15 DN dark + the 290 pedestal
+    # ... and the same scene without the pedestal must land on the same rows
+    plain = emp.empirical_frames(synth_cube(texture=12.0))[-1]
+    assert plain["dark_rows"] == notes["dark_rows"]
+
+
+def test_pedestal_scene_warns_that_the_onboard_dark_is_missing():
+    with pytest.warns(UserWarning, match="onboard dark subtraction looks absent"):
+        emp.empirical_frames(synth_cube(texture=12.0, pedestal=290.0))
 
 
 def test_lit_rows_uses_per_pixel_snr_not_row_median_scatter():

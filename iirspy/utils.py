@@ -834,12 +834,12 @@ def parse_geom(
     Examples
     --------
     >>> # Filter by lat/lon, snapping to nearest GCP grid
-    >>> gcps, xyext = parse_geom(fgeom, latlonextent=(-10, 10, 20, 40))
+    >>> gcps, xyext = parse_geom(fgeom, latlonextent=(-10, 10, 20, 40))  # doctest: +SKIP
 
     >>> # Filter by pixel coordinates, snapping to nearest GCP grid
     >>> # If xyextent is (101, 200, 499, 601) and GCPs are every 50,
     >>> # returns GCPs with x from 100 to 200 and y from 450 to 650
-    >>> gcps, xyext = parse_geom(fgeom, xyextent=(101, 200, 499, 601), as_gcps=True)
+    >>> gcps, xyext = parse_geom(fgeom, xyextent=(101, 200, 499, 601), as_gcps=True)  # doctest: +SKIP
     """
     # Check that only one extent type is provided
     latlon_given = any(e is not None for e in latlonextent)
@@ -1006,7 +1006,8 @@ def load_iirs_spm(fspm):
     df = pd.read_csv(fspm, sep="\\s+", header=None, usecols=range(0, 19), names=colnames)
     df["year"] = df["year"].astype(str).str.slice(3, None)
     df["datetime"] = pd.to_datetime(df.iloc[:, 2:9])
-    df["timestamp"] = df["datetime"].astype("int64") / 1e9  # Equiv to .timestamp(), but faster
+    # Conversion to epoch time (like .timestamp() but faster)
+    df["timestamp"] = df["datetime"].astype("datetime64[ns]").astype("int64") / 1e9
     # df['timestamp'] = df['datetime'].apply(lambda x: x.timestamp())  # Slow
     return df
 
@@ -1017,16 +1018,13 @@ def get_line_times(fimg):
     tstart = pd.to_datetime(img.metaget("start_date_time")).timestamp()
     _, lines, _ = get_iirs_shape_meta(fimg)
     dt = float(img.metaget("isda:line_exposure_duration")) / 1000  # [ms]->[s]
-    orbit_dir = img.metaget("isda:orbit_limb_direction").lower()  # Ascending or Descending
 
     # Note: clock not precise - sometimes nlines != (tstop - tstart) / dt
     # For this reason, don't do np.arange(tstart, tstop+dt, dt) nor linspace(tstart, tstop, nlines)
     # tstop = pd.to_datetime(img.metaget('stop_date_time')).timestamp()
 
-    # Data collection time is bottom up for ascending orbit, top down for descending
+    # Note: Data collection time follows spacecraft collect direction
     line_times = tstart + dt * np.arange(lines)
-    if orbit_dir == "Ascending":
-        line_times = line_times[::-1]
     return line_times
 
 

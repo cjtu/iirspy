@@ -47,7 +47,8 @@ N_CLEAN_BANDS = 8  # how many least-bad bands clean_bands() picks for spatial-ou
 DARK_PCT = 0.5  # darkest percentile of rows used to estimate the shadow floor + noise
 DARK_K = 8.0  # row shadow threshold = floor + DARK_K * sigma
 DARK_SIGMA_FLOOR = 0.15  # min row-median scatter [DN], keeps the bootstrap threshold off zero
-DARK_MAX_FRAC = 0.3  # darkest rows count as shadow only if floor < this * scene median
+DARK_SMOOTH_FRAC = 0.25  # shadow rows carry under this share of the scene's typical cross-track structure
+DARK_PEDESTAL_DN = 25.0  # a dark frame above this did not have its onboard subtraction applied
 NOISE_FLOOR = 0.5  # min noise [DN] to avoid divide-by-zero in the SNR
 SHADOW_SNR = 2.0  # broadband SNR below this is shadow (per-pixel dark noise, as LIT_SNR)
 
@@ -133,6 +134,41 @@ def longest_run(mask):
     return max(runs(mask), key=lambda r: r[1] - r[0], default=(0, 0))
 
 
+def live_cols(P):
+    """Columns carrying real response: those above DEAD_COL_FRAC of the median column profile."""
+    prof = np.nanmedian(P.values, axis=0)
+    return prof > DEAD_COL_FRAC * np.nanmedian(prof)
+
+
+def cross_track_hf(P, win=CROSS_WIN):
+    """Per-row scatter [DN] left by a cross-track high-pass: terrain contrast, independent of level.
+
+    The one shadow signature that survives a missing dark subtraction. A shadowed row holds no
+    albedo structure, so neighbouring samples differ only by detector noise whatever DN the row
+    sits at, while a merely dim row keeps its terrain contrast. Measured on 20201203T1859574285
+    (e2g2, dark pedestal): shadow rows 1.7 DN against a scene median of 16.3, i.e. 0.6% of level
+    against lit terrain's 3.0%.
+    """
+    from scipy.ndimage import uniform_filter1d
+
+    v = P.values[:, live_cols(P)]
+    hp = v - uniform_filter1d(v, win, axis=1, mode="nearest")
+    return np.nanmedian(np.abs(hp - np.nanmedian(hp, axis=1, keepdims=True)), axis=1) * MAD_TO_SIGMA
+
+
+def is_shadow(P, block, hf=None):
+    """True when `block` holds no cross-track scene structure - shadow, not merely dim terrain.
+
+    Level cannot decide this. A scene whose onboard dark subtraction never happened puts its
+    shadow at hundreds of DN (20201203T1859574285: 291-347, against 0-10 across every e1g2 scene
+    here), which any absolute or scene-relative level cut reads as "too bright to be shadow" and
+    throws the dark frame away. Structure decides it at any pedestal.
+    """
+    hf = cross_track_hf(P) if hf is None else hf
+    a, b = block
+    return bool(np.nanmedian(hf[a:b]) < DARK_SMOOTH_FRAC * np.nanmedian(hf[np.isfinite(hf)]))
+
+
 def dark_floor(row_bright):
     """Return (floor, sigma): dark level and robust scatter of the darkest DARK_PCT of rows."""
     lo = row_bright[row_bright <= np.nanpercentile(row_bright, DARK_PCT)]
@@ -146,14 +182,12 @@ def detect_dark_rows(P):
     Return (dark_mask_y, threshold, row_bright): a first pass at the shadow rows, from raw DN.
 
     Cuts DARK_K robust standard deviations above the dark floor, wherever in the scene the darkest
-    rows sit (no assumption of a leading shadow). Returns an empty mask when the floor is not well
-    below the scene as a whole (floor >= DARK_MAX_FRAC * scene median), i.e. the scene holds no
-    shadow and the dark step is skipped. refine_dark_block sharpens the edge on the SNR scale.
+    rows sit (no assumption of a leading shadow). This is a bootstrap on level alone and says
+    nothing about whether the scene holds a shadow at all - `is_shadow` rules on that, after
+    refine_dark_block sharpens the edge on the SNR scale.
     """
     row_bright = np.nanmedian(P.values, axis=1)
     floor, sigma = dark_floor(row_bright)
-    if floor >= DARK_MAX_FRAC * np.nanmedian(row_bright):
-        return np.zeros_like(row_bright, dtype=bool), floor, row_bright
     thresh = floor + DARK_K * sigma
     return row_bright < thresh, thresh, row_bright
 
@@ -210,7 +244,7 @@ def row_roughness(P):
 
     vals = P.values
     global_prof = np.nanmedian(vals, axis=0)
-    good = global_prof > DEAD_COL_FRAC * np.nanmedian(global_prof)
+    good = live_cols(P)
     N = vals[:, good] / global_prof[good]
     hp = N - uniform_filter1d(N, CROSS_WIN, axis=1, mode="nearest")
     plo, phi = np.nanpercentile(hp, ROUGH_PCTL, axis=1)
@@ -389,10 +423,28 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
         d0, d1 = longest_run(dark_mask)
         if d1 - d0 >= MIN_ROWS:
             d0, d1 = refine_dark_block(P, (d0, d1))
+        if d1 - d0 >= MIN_ROWS and is_shadow(P, (d0, d1)):
             dark = img.isel(y=slice(d0, d1)).median("y").compute().astype("float32")
             snr = broadband_snr(P, d0, d1)
             dark_block = (d0, d1)
-            emp_notes.update(has_shadow=True, dark_rows=[d0, d1], dark_threshold=float(thresh), dark_source="auto")
+            level = float(np.nanmedian(row_bright[d0:d1]))
+            emp_notes.update(
+                has_shadow=True,
+                dark_rows=[d0, d1],
+                dark_threshold=float(thresh),
+                dark_source="auto",
+                dark_level=round(level, 3),
+            )
+            if level > DARK_PEDESTAL_DN:
+                # The shadow anchors the zero point either way, so the product is still calibrated
+                # - but a pedestal this large drifts with the detector, and the single frame
+                # derived here only holds near the rows it came from.
+                warnings.warn(
+                    f"shadow rows sit at {level:.0f} DN, not ~0: the onboard dark subtraction looks "
+                    f"absent for this scene, so the empirical dark carries the full pedestal",
+                    UserWarning,
+                    stacklevel=2,
+                )
         else:
             warnings.warn("no shadow rows found; skipping empirical dark subtraction", UserWarning, stacklevel=2)
             dark = xr.zeros_like(P.isel(y=0), dtype="float32").drop_vars("y")

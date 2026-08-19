@@ -9,6 +9,7 @@ import pdr
 import xarray as xr
 from rioxarray.exceptions import NoDataInBounds
 
+import iirspy.photometry as photometry
 import iirspy.utils as utils
 from iirspy.empirical import empirical_frames
 
@@ -360,7 +361,7 @@ class L0(IIRSData):
         is poorly correlated with the on-orbit response and injects striping/speckle. With
         empirical=True, derive a per-scene residual dark + sensor flat + band-relative smile (see
         iirspy.empirical) and use the LUT only for the per-band absolute scale. The in-scene dark,
-        when present, anchors the zero point (no longer use the LUT offset):
+        when present, anchors the zero point in place of the LUT offset:
 
           scene with dark rows   : rad = 10 * gain_med * (DN - dark_resid) / (flat * smile)
           scene without dark rows: rad = 10 * (gain_med * DN / (flat * smile) + offset_med)
@@ -662,8 +663,23 @@ class L1(IIRSData):
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
         return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
-    def calibrate(self, inc=None, dem=None, solar_flux=None, thermal_corr=""):
-        """Calibrate to L2 reflectance object (requires SPM file for solar angles)."""
+    def calibrate(
+        self,
+        inc=None,
+        dem=None,
+        solar_flux=None,
+        thermal_corr="",
+        topo=None,
+        photom="lambert",
+        min_lit=0.9,
+        sun_az_offset=0.0,
+    ):
+        """Calibrate to L2 reflectance object (requires SPM file for solar angles).
+
+        `topo` (camera-space slope/aspect, see iirspy.photometry.load_topo) and `photom` (a
+        iirspy.photometry model name or callable) select the photometric normalization; the
+        defaults reproduce the flat-surface Lambert I/F this pipeline has always produced.
+        """
         if self.spm is None:
             raise FileNotFoundError(
                 f"SPM file required for reflectance calibration. Expected: "
@@ -676,6 +692,10 @@ class L1(IIRSData):
             dem=dem,
             solar_flux=solar_flux,
             thermal_corr=thermal_corr,
+            topo=topo,
+            photom=photom,
+            min_lit=min_lit,
+            sun_az_offset=sun_az_offset,
         )
 
 
@@ -740,7 +760,18 @@ class L2(IIRSData):
         return instance
 
     @classmethod
-    def _from_l1(cls, l1_instance, inc=None, dem=None, solar_flux=None, thermal_corr=""):
+    def _from_l1(
+        cls,
+        l1_instance,
+        inc=None,
+        dem=None,
+        solar_flux=None,
+        thermal_corr="",
+        topo=None,
+        photom="lambert",
+        min_lit=0.9,
+        sun_az_offset=0.0,
+    ):
         """Internal method to create L2 from L1 instance."""
         instance = cls.__new__(cls)
         instance.basename = l1_instance.basename
@@ -763,12 +794,29 @@ class L2(IIRSData):
             dem=dem,
             solar_flux=solar_flux,
             thermal_corr=thermal_corr,
+            topo=topo,
+            photom=photom,
+            min_lit=min_lit,
+            sun_az_offset=sun_az_offset,
         )
         instance.img.attrs["calibration_source"] = "user"
 
         return instance
 
-    def _compute_reflectance(self, rad, qub_path, csv_path, inc=None, dem=None, solar_flux=None, thermal_corr=""):
+    def _compute_reflectance(
+        self,
+        rad,
+        qub_path,
+        csv_path,
+        inc=None,
+        dem=None,
+        solar_flux=None,
+        thermal_corr="",
+        topo=None,
+        photom="lambert",
+        min_lit=0.9,
+        sun_az_offset=0.0,
+    ):
         """
         Compute I/f reflectance from radiance data and solar geometry.
 
@@ -794,6 +842,19 @@ class L2(IIRSData):
             Thermal correction method. Currently supports:
             - "" (empty string): No thermal correction (default)
             - "verma": Apply Verma thermal correction method
+        topo : str, Path, xarray object or tuple, optional
+            Camera-space slope, aspect and (optionally) lit fraction on this cube's grid, as
+            written by iirspy.georef.save_topo. See iirspy.photometry.load_topo. Default None: the
+            surface is the flat local horizontal.
+        photom : str or callable, optional
+            Photometric model, by name from iirspy.photometry.MODELS or as any f(mu0, mu, g)
+            callable. Default "lambert".
+        min_lit : float, optional
+            Null pixels the terrain leaves less than this fraction of the solar disk illuminated,
+            from the topo product's `lit` band. Default 0.9. No-op without `topo`.
+        sun_az_offset : float, optional
+            Degrees added to the spm solar azimuth, which is measured from local north, to bring
+            it into the grid-north frame the topo product's aspect uses. Default 0.0.
         Returns
         -------
         xarray.DataArray
@@ -829,7 +890,29 @@ class L2(IIRSData):
         elif thermal_corr:
             raise ValueError('thermal_corr must be "" or "verma"')
 
-        refl = (rad - trad) / (cos_inc * solar_flux)
+        # Photometric normalization. Without topography the surface is the flat local horizontal:
+        # mu0 is the per-line solar cosine, the view is nadir (mu = 1), phase = incidence. With
+        # `topo`, mu0/mu are the local cosines about each facet.
+        sun_az = (rad.solar_az if "solar_az" in rad.coords else 0.0) + sun_az_offset
+        lit = 1.0
+        if topo is not None:
+            # cos_inc is per-line (y,); the topo fields are (y, x), so match them to the image
+            slope, aspect, lit, sun = photometry.load_topo(topo, like=rad.isel(band=0, drop=True))
+            # Slope/aspect are referenced to the DEM's tangent plane, the spm's angles to each
+            # pixel's local horizontal, so the product's own sun is used whenever it carries one.
+            az, elev = sun if sun is not None else (sun_az, 90 - rad.solar_inc)
+            mu0, mu, g = photometry.topo_angles(slope, aspect, az, elev)
+        else:
+            inc_deg = np.degrees(np.arccos(np.clip(cos_inc, -1.0, 1.0)))
+            mu0, mu, g = cos_inc, xr.ones_like(cos_inc), photometry.phase_angle(sun_az, 90 - inc_deg)
+        # photfn is the disk function times the lit fraction. Facets the sun does not reach have
+        # no direct beam to normalize by, so they are nulled rather than clipped.
+        photfn = photometry.get_model(photom)(mu0, mu, g) * lit
+        if min_lit > 0.0:
+            photfn = photfn.where(np.asarray(lit) >= min_lit) if hasattr(photfn, "where") else photfn
+        photfn = photfn.where(photfn > 0) if hasattr(photfn, "where") else photfn
+
+        refl = (rad - trad) / (photfn * solar_flux)
         # add wl array as coordinate if missing
         if "wl" not in refl.coords:
             refl = refl.assign_coords(wl=rad.wl)
