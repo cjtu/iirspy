@@ -1070,7 +1070,7 @@ wheels = [
 
 [[package]]
 name = "iirspy"
-version = "0.0.4"
+version = "0.0.5"
 source = { editable = "." }
 dependencies = [
     { name = "bottleneck" },

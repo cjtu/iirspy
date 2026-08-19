@@ -13,16 +13,24 @@ registered L1/L2 with a single resample of the raw band -- never a resample of a
 
 Typical use:
 
-    reg = register("ch2_iir_<sid>_l1_polar.tif", fgeom, fspm)
-    arr = warp(cube, reg)                  # (band, y, x) on reg.transform / reg.crs
+    reg = register("ch2_iir_<sid>_l1_polar.tif", fgeom, fspm, cfg)
+    arr = warp(cube, reg, cfg)             # (band, y, x) on reg.transform / reg.crs
 
-`register` needs `arosics`, which needs `osgeo.gdal`, so it resolves only in a conda env.
-Everything above the matcher -- DEM, hillshade, horizons, GCP lattice, warp -- runs without it.
+The matcher needs `arosics`, which needs `osgeo.gdal`, which PyPI does not ship. `register` handles
+that itself: where arosics is not importable it runs the solve in a conda env through
+:mod:`iirspy.coreg` (see that module). Everything else here -- DEM, hillshade, horizons, GCP
+lattice, warp -- is pure PyPI.
 
 Method and measurements: local-workspace/arosics/REPORT.md.
 """
 
-from dataclasses import dataclass, field
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +46,7 @@ from scipy.spatial import cKDTree
 
 import iirspy.utils as utils
 
+AROSICS_ENV = os.environ.get("IIRSPY_AROSICS_ENV", "arosics")  # conda env iirspy.coreg runs in
 MOON_RADIUS_M = 1737400.0
 SOLAR_RADIUS_DEG = 0.266  # nominal; the true value per epoch comes from SPICE
 LONLAT = CRS.from_authority("IAU", "30100")
@@ -90,6 +99,10 @@ class GeorefConfig:
     # Along-track GCP spacing in image rows; 25 rows is ~2 km, fine enough to carry the
     # tie-point field (1.6 km spacing) without resampling it away.
     row_step: int = 25
+
+    def __post_init__(self):
+        # json round-trips (iirspy.coreg) stringify the keys of max_shift
+        self.max_shift = {int(k): v for k, v in self.max_shift.items()}
 
     def max_shift_for(self, k):
         """Search radius for iteration k; past the table, hold the tightest and keep refining."""
@@ -709,14 +722,47 @@ def _to_gcps(jj, ii, x, y):
     ]
 
 
-def project(band, gcps, cfg, resampling=Resampling.bilinear):
-    """One reproject of a camera-space band onto the AOI grid through `gcps`.
-
-    METHOD=GCP_TPS: a plain GCP list makes GDAL fit one global polynomial, which smooths the
-    correction away; TPS interpolates the GCPs instead.
-    """
+def window_of(cfg, window=None):
+    """(shape, transform) of the AOI grid, or of `window` = (r0, r1, c0, c1) cut out of it."""
     xs, ys, tr, _ = grid_of(cfg)
-    out = np.full((len(ys), len(xs)), np.nan, "float32")
+    if window is None:
+        return (len(ys), len(xs)), tr
+    r0, r1, c0, c1 = window
+    return (r1 - r0, c1 - c0), tr * rasterio.Affine.translation(c0, r0)
+
+
+def data_window(arr, pad=8):
+    """(r0, r1, c0, c1) bounding the finite pixels of a projected band, padded by `pad`."""
+    r, c = np.where(np.isfinite(arr))
+    h, w = arr.shape[-2:]
+    return (
+        max(int(r.min()) - pad, 0),
+        min(int(r.max()) + 1 + pad, h),
+        max(int(c.min()) - pad, 0),
+        min(int(c.max()) + 1 + pad, w),
+    )
+
+
+def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None):
+    """One reproject of a camera-space band -- or a whole (band, y, x) cube -- onto the AOI grid.
+
+    Pass the cube, not one band at a time: GDAL solves the ~1300-point thin-plate spline once per
+    call, and that solve is essentially the entire cost (measured 5x on a 5-band cube; identical
+    pixels where both are finite). `window` crops the output to (r0, r1, c0, c1) of the AOI grid,
+    which for a cube is the difference between a few GB and tens of them -- a strip covers ~10% of
+    the AOI. The transformer is exact, so a windowed warp equals the same window of a full one.
+
+    SRC_METHOD=GCP_TPS: a plain GCP list makes GDAL fit one global polynomial, which smooths the
+    correction away; TPS interpolates the GCPs instead. The option must be spelled SRC_METHOD --
+    rasterio 1.4 honoured METHOD as well, 1.5 silently ignores it (corr 0.9918 -> 0.9581).
+
+    tolerance=0 is the exact transformer. rasterio defaults to 0.125, i.e. the TPS is replaced by a
+    polynomial fitted per destination chunk to within an eighth of a pixel -- 5 m of slop at 40
+    m/px against a solve whose p95 is 16.6 m, and worse, the chunking follows the output extent, so
+    the same scene warped at two windows disagrees (measured max 0.24 in reflectance).
+    """
+    shape, tr = window_of(cfg, window)
+    out = np.full(np.shape(band)[:-2] + shape, np.nan, "float32")
     reproject(
         source=band,
         destination=out,
@@ -727,9 +773,84 @@ def project(band, gcps, cfg, resampling=Resampling.bilinear):
         resampling=resampling,
         src_nodata=np.nan,
         dst_nodata=np.nan,
-        METHOD="GCP_TPS",
+        tolerance=0.0,
+        num_threads=os.cpu_count() or 1,  # the exact TPS is ~1700 gcps per destination pixel
+        SRC_METHOD="GCP_TPS",
     )
     return out
+
+
+def save_grid(fout, arr, cfg, nodata=np.nan):
+    """Write a single AOI-grid band (hillshade, projected product) as a georeferenced float32 tif."""
+    _, _, tr, _ = grid_of(cfg)
+    with rasterio.open(
+        fout,
+        "w",
+        driver="GTiff",
+        height=arr.shape[0],
+        width=arr.shape[1],
+        count=1,
+        dtype="float32",
+        crs=STEREO,
+        transform=tr,
+        nodata=nodata,
+        compress="LZW",
+    ) as dst:
+        dst.write(np.asarray(arr, dtype="float32"), 1)
+    return fout
+
+
+def arosics_python():
+    """Interpreter of the arosics conda environment. Raises if that environment is missing."""
+    exe = os.environ.get("IIRSPY_AROSICS_PYTHON")
+    if exe and Path(exe).exists():
+        return Path(exe)
+    conda = shutil.which("conda") or shutil.which("mamba") or os.environ.get("CONDA_EXE", "")
+    if conda:
+        out = subprocess.run([conda, "env", "list", "--json"], capture_output=True, text=True)  # noqa: S603
+        for e in json.loads(out.stdout or "{}").get("envs", []):
+            if Path(e).name == AROSICS_ENV and Path(e, "bin", "python").exists():
+                return Path(e, "bin", "python")
+    raise RuntimeError(
+        f"co-registration needs the '{AROSICS_ENV}' conda environment: arosics needs osgeo.gdal, "
+        "which PyPI does not ship. Create it from the repository root with\n"
+        "    mamba env create -f arosics-environment.yml\n"
+        "or set IIRSPY_AROSICS_PYTHON to an interpreter that has arosics."
+    )
+
+
+def _register_subprocess(ftif, fgeom, fspm, cfg, kernels, reference, verbose):
+    """Run the solve through iirspy.coreg in the arosics environment; rebuild it from the json."""
+    py = arosics_python()
+    root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory() as tmp:
+        ref = reference
+        if ref is not None and not isinstance(ref, str | Path):
+            ref = save_grid(Path(tmp, "reference.tif"), ref, cfg)
+        job = Path(tmp, "job.json")
+        out = Path(tmp, "gcps.json")
+        job.write_text(
+            json.dumps({
+                "ftif": str(ftif),
+                "fgeom": str(fgeom),
+                "fspm": str(fspm),
+                "cfg": asdict(cfg),
+                "kernels": [str(k) for k in kernels or []],
+                "reference": None if ref is None else str(ref),
+                "verbose": verbose,
+                "out": str(out),
+            })
+        )
+        subprocess.run([str(py), "-m", "iirspy.coreg", str(job)], check=True, cwd=str(root))  # noqa: S603
+        d = json.loads(out.read_text())
+    xs, ys, tr, _ = grid_of(cfg)
+    return Registration(
+        gcps=[GroundControlPoint(row=r, col=c, x=x, y=y) for r, c, x, y in d["gcps"]],
+        crs=STEREO,
+        transform=tr,
+        shape=(len(ys), len(xs)),
+        stats=d["stats"],
+    )
 
 
 def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False):
@@ -739,9 +860,20 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
     The correction is composed into the GCP *targets*, one iteration at a time -- each tie-point
     field maps a current map position to the correction needed there, so applying field k at the
     position field k-1 produced is the right order, and the image is only ever resampled once.
+
+    `reference` is the hillshade to match against, as an array or the path to one; without it the
+    scene's own is rendered. When arosics is not importable the solve runs in the arosics conda
+    environment through :mod:`iirspy.coreg`.
     """
+    if importlib.util.find_spec("arosics") is None:
+        return _register_subprocess(ftif, fgeom, fspm, cfg, kernels, reference, verbose)
+
     ref = reference
     info = {}
+    if isinstance(ref, str | Path):
+        with rasterio.open(ref) as src:
+            a = src.read(1, masked=True).filled(np.nan).astype("float32")
+        ref = np.where(a == -9999.0, np.nan, a)
     if ref is None:
         ref, hs_info = render_reference(fgeom, fspm, cfg, kernels)
         info["reference"] = hs_info
@@ -802,12 +934,14 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
     )
 
 
-def warp(cube, reg, cfg, resampling=Resampling.bilinear):
+def warp(cube, reg, cfg, resampling=Resampling.bilinear, window=None):
     """
     Apply a :class:`Registration` to a cube or single band. Returns a DataArray on the AOI grid.
 
     `cube` may be a path to an IIRS product or a (band, y, x) DataArray in camera space. Every
-    band is resampled once, straight from camera space.
+    band is resampled once, straight from camera space. A strip fills ~10% of the AOI, so pass
+    `window` (see :func:`data_window`) unless the whole 160 km box is wanted -- a 256-band cube on
+    the full grid is tens of GB.
     """
     if isinstance(cube, str | Path):
         da = xr.open_dataarray(cube, engine="rasterio")
@@ -819,10 +953,11 @@ def warp(cube, reg, cfg, resampling=Resampling.bilinear):
     if "band" not in da.dims:
         da = da.expand_dims("band")
 
-    xs, ys, tr, _ = grid_of(cfg)
-    out = np.stack([
-        project(da.isel(band=i).values.astype("float32"), reg.gcps, cfg, resampling) for i in range(da.sizes["band"])
-    ])
+    xs, ys, _, _ = grid_of(cfg)
+    (ny, nx), tr = window_of(cfg, window)
+    r0, c0 = (window[0], window[2]) if window else (0, 0)
+    ys, xs = ys[r0 : r0 + ny], xs[c0 : c0 + nx]
+    out = project(da.values.astype("float32"), reg.gcps, cfg, resampling, window)
     res = xr.DataArray(
         out,
         dims=("band", "y", "x"),
