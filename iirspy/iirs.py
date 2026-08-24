@@ -457,7 +457,10 @@ class L0(IIRSData):
         out.attrs["name"] = "Radiance"
         out.attrs["units"] = "W/m^2/sr/um"
         out.attrs["calibration_source"] = "empirical" if empirical else "user"
-        out.attrs["iirspy_version"] = metadata.version("iirspy")
+        try:
+            out.attrs["iirspy_version"] = metadata.version("iirspy")
+        except metadata.PackageNotFoundError:  # running from a source tree not pip-installed, e.g. iirspy.coreg
+            out.attrs["iirspy_version"] = "0+source"
         if empirical:
             out.attrs["empirical_notes"] = json.dumps(emp_notes)  # provenance: how the product was made
 
@@ -624,6 +627,21 @@ class L1(IIRSData):
         self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, xyextent, center=False)
         # replace any None in extent with values from xy_extent
         self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent, strict=False))
+        # ...but the geometry csv always describes the WHOLE strip, while the cube may be a crop of
+        # it (our own polar L1 products are). Where the caller named no extent, take the line range
+        # from the image itself -- `_apply_envi_start` has already put its y coords into strip
+        # numbering via the ENVI `y start` field, which is what that field is for. Without this,
+        # per-line solar geometry is built for the full strip and collides with the cropped cube:
+        # "conflicting sizes for dimension 'y': length 49013 ... and length 3600".
+        if all(e is None for e in xyextent) and all(e is None for e in lonlatextent):
+            # floor/ceil, not int(): rasterio hands back pixel-CENTRE coords (0.5 .. n-0.5), so
+            # truncating both ends drops a row and a column off the crop.
+            self.extent = (
+                int(np.floor(self.img.x.values[0])),
+                int(np.ceil(self.img.x.values[-1])),
+                int(np.floor(self.img.y.values[0])),
+                int(np.ceil(self.img.y.values[-1])),
+            )
         self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
         try:
             self.bounds = self.img.rio.bounds()
@@ -639,7 +657,9 @@ class L1(IIRSData):
         self.img.attrs["calibration_source"] = "issdc"
 
         # Assign lat, lon coordinates
-        lon, lat = utils.geom2latlon_coords(self.geomdf, xy_extent, self.shape[2], self.shape[1])
+        # `self.extent`, not `xy_extent`: the latter spans the whole strip even when the cube is a
+        # crop, which put +44 deg latitudes on a south-polar product.
+        lon, lat = utils.geom2latlon_coords(self.geomdf, self.extent, self.shape[2], self.shape[1])
 
         # Get solar incidence for each line of image
         inc, iaz = utils.get_iirs_inc_az(self.qub, self.spm, self.extent[2:])

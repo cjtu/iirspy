@@ -30,7 +30,9 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +49,8 @@ from scipy.spatial import cKDTree
 import iirspy.utils as utils
 
 AROSICS_ENV = os.environ.get("IIRSPY_AROSICS_ENV", "arosics")  # conda env iirspy.coreg runs in
+MAX_RAM_BYTES = float(os.environ.get("IIRSPY_MAX_RAM_BYTES", 4e9))  # past this, project() spills to disk
+
 MOON_RADIUS_M = 1737400.0
 SOLAR_RADIUS_DEG = 0.266  # nominal; the true value per epoch comes from SPICE
 LONLAT = CRS.from_authority("IAU", "30100")
@@ -55,11 +59,29 @@ TO_STEREO = Transformer.from_crs(LONLAT, STEREO, always_xy=True)
 TO_LONLAT = Transformer.from_crs(STEREO, LONLAT, always_xy=True)
 
 
+@lru_cache
+def stereo_crs(pole: str = "south") -> CRS:
+    """The IIRS projected CRS for `pole` ("south", "north", or "equatorial" equidistant cylindrical)."""
+    key = "equatorial" if pole == "equatorial" else f"polarstereographic{pole}pole"
+    return CRS.from_wkt(utils.IIRS_PROJ_DICT[key])
+
+
+@lru_cache
+def to_stereo(pole: str = "south") -> Transformer:
+    return Transformer.from_crs(LONLAT, stereo_crs(pole), always_xy=True)
+
+
+@lru_cache
+def to_lonlat(pole: str = "south") -> Transformer:
+    return Transformer.from_crs(stereo_crs(pole), LONLAT, always_xy=True)
+
+
 @dataclass
 class GeorefConfig:
     """Everything tunable in one place."""
 
     # --- output grid
+    pole: str = "south"  # "south", "north", or "equatorial" -- selects the projected CRS
     aoi: tuple = (0.0, 0.0, 0.0, 0.0)  # xmin, ymin, xmax, ymax in stereo m; set by aoi_around()
     ps: float = 40.0  # m/px, between LOLA (20) and IIRS (76.5) so neither is badly aliased
     band: int = 54  # 1605.5 nm: strongest reflected-solar contrast, clear of the thermal tail
@@ -68,7 +90,11 @@ class GeorefConfig:
     dem_near: str = ""  # LDEM_80S_20M .LBL
     dem_far: str = ""  # LDEM_60S_240M_JP2 .LBL; "" renders the near tier alone
     near_m: float = 20_000.0  # near-tier up-sun reach, and the far tier's min range
-    far_m: float = 200_000.0  # past this no lunar relief is tall enough to cast
+    far_m: float = 206_000.0  # hard ceiling on the up-sun search; see `shadow_reach_m`
+    max_relief_m: float = 12_180.0  # tallest peak above a point, within reach; see `shadow_reach_m`
+    far_dec: int = 4  # far-tier read decimation; horizon-blocker search doesn't need native res,
+    # and this lets dem_far point at the same product as dem_near -- reads its overview pyramid
+    # (JP2 ships one) instead of needing a separate, coarser DEM product for reach alone
     margin_m: float = 2_000.0
     iirs_gsd_m: float = 76.5  # reconstructed from the IK+SPK; blur the reference to this
 
@@ -109,9 +135,9 @@ class GeorefConfig:
         return self.max_shift.get(k, min(self.max_shift.values()))
 
 
-def aoi_around(lon, lat, half_m=80_000.0):
+def aoi_around(lon, lat, half_m=80_000.0, pole="south"):
     """Square AOI in stereo metres centred on a lon/lat -- e.g. Haworth / the LRM landing site."""
-    x, y = TO_STEREO.transform(lon, lat)
+    x, y = to_stereo(pole).transform(lon, lat)
     return (x - half_m, y - half_m, x + half_m, y + half_m)
 
 
@@ -126,7 +152,7 @@ def grid_of(cfg):
         "width": len(xs),
         "count": 1,
         "dtype": "float32",
-        "crs": STEREO,
+        "crs": stereo_crs(cfg.pole),
         "transform": tr,
         "nodata": np.nan,
         "compress": "LZW",
@@ -137,7 +163,7 @@ def grid_of(cfg):
 # ------------------------------------------------------------------------------------------
 # 1. DEM
 # ------------------------------------------------------------------------------------------
-def load_lola_elev(path, bounds=None):
+def load_lola_elev(path, bounds=None, dec=1):
     """
     Elevation [m] above the 1737.4 km sphere, for either LOLA polar GDR packaging.
 
@@ -146,25 +172,39 @@ def load_lola_elev(path, bounds=None):
     scaling, while the .IMG ones carry the radius offset. So read the raw band and apply the
     label's own SCALING_FACTOR/OFFSET.
 
+    `dec` > 1 decimates the read via `out_shape`, which pulls from the file's own overview
+    pyramid instead of decoding at native resolution -- cheap on a JP2, which ships one.
+
     Returns (elev float64, rasterio transform, pixel_size_m).
     """
     import re
 
-    txt = Path(path).read_text(errors="ignore")
+    if Path(path).suffix.lower() in (".tif", ".tiff"):
+        # COG rebuild of a GDR (local-workspace/make_dem_cogs.py) -- the raw int16 counts are
+        # copied through untouched, and every LOLA GDR label carries these same two constants,
+        # so they are inlined rather than shipped in a sidecar. GDAL's own scale/offset tags stay
+        # untrusted here for the same reason as above.
+        scale, offset = 0.5, MOON_RADIUS_M
+    else:
+        txt = Path(path).read_text(errors="ignore")
 
-    def lbl(key, default):
-        m = re.search(rf"^\s*{key}\s*=\s*([-\d.]+)", txt, re.M)
-        return float(m.group(1)) if m else default
+        def lbl(key, default):
+            m = re.search(rf"^\s*{key}\s*=\s*([-\d.]+)", txt, re.M)
+            return float(m.group(1)) if m else default
 
-    scale, offset = lbl("SCALING_FACTOR", 0.5), lbl("OFFSET", MOON_RADIUS_M)
+        scale, offset = lbl("SCALING_FACTOR", 0.5), lbl("OFFSET", MOON_RADIUS_M)
     with rasterio.open(path) as src:
         win = None
         if bounds is not None:
             win = rasterio.windows.from_bounds(*bounds, transform=src.transform).round_offsets().round_lengths()
             win = win.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
-        raw = src.read(1, window=win).astype("float64")
+        win_w, win_h = (win.width, win.height) if win is not None else (src.width, src.height)
+        out_shape = (max(1, round(win_h / dec)), max(1, round(win_w / dec))) if dec > 1 else None
+        raw = src.read(1, window=win, out_shape=out_shape).astype("float64")
         tr = src.window_transform(win) if win is not None else src.transform
-        ps = abs(src.res[0])
+        if out_shape is not None:
+            tr = tr * tr.scale(win_w / out_shape[1], win_h / out_shape[0])
+        ps = abs(src.res[0]) * (win_w / out_shape[1] if out_shape is not None else 1)
     return raw * scale + offset - MOON_RADIUS_M, tr, ps
 
 
@@ -293,7 +333,7 @@ def sun_geometry(fgeom, fspm, cfg, kernels=None):
 
     df = pd.read_csv(fgeom)
     lon = np.where(df.Longitude > 180, df.Longitude - 360, df.Longitude)
-    gx, gy = TO_STEREO.transform(lon, df.Latitude.values)
+    gx, gy = to_stereo(cfg.pole).transform(lon, df.Latitude.values)
     ins = (gx > cfg.aoi[0]) & (gx < cfg.aoi[2]) & (gy > cfg.aoi[1]) & (gy < cfg.aoi[3])
     spm = utils.load_iirs_spm(fspm)
     sub = spm[(spm.row >= df.Scan.values[ins].min()) & (spm.row <= df.Scan.values[ins].max())] if ins.any() else spm
@@ -303,13 +343,61 @@ def sun_geometry(fgeom, fspm, cfg, kernels=None):
     v, _ = sp.spkpos("SUN", et, "IAU_MOON", "LT+S", "MOON")
     u = np.asarray(v) / np.linalg.norm(v)
     cx, cy = (cfg.aoi[0] + cfg.aoi[2]) / 2, (cfg.aoi[1] + cfg.aoi[3]) / 2
-    clon, clat = TO_LONLAT.transform(cx, cy)
+    clon, clat = to_lonlat(cfg.pole).transform(cx, cy)
     east, north, up = _enu(clon, clat)
-    lon0 = STEREO.to_dict().get("lon_0", 0.0)
-    az_grid = (np.degrees(np.arctan2(u @ east, u @ north)) + (clon - lon0)) % 360
+    lon0 = stereo_crs(cfg.pole).to_dict().get("lon_0", 0.0)
+    # True-north bearing -> grid bearing needs (clon - lon0) added at the south pole but SUBTRACTED
+    # at the north pole: true north points radially *outward* from a south-pole-centred map but
+    # radially *inward* on a north-pole-centred one, which flips the handedness of the correction.
+    # Measured directly against both CRS's (verified against a finite-difference "which way does
+    # increasing latitude move on the map" probe, exact to 1e-9 deg at 8 test azimuths per pole).
+    # The equatorial equidistant-cylindrical CRS has no convergence at all -- meridians are straight
+    # vertical lines on that map, so grid north equals true north everywhere and the term drops out.
+    grid_sign = 0.0 if cfg.pole == "equatorial" else (-1.0 if cfg.pole == "north" else 1.0)
+    az_grid = (np.degrees(np.arctan2(u @ east, u @ north)) + grid_sign * (clon - lon0)) % 360
     el = np.degrees(np.arcsin(u @ up))
     r_sun = np.degrees(np.arcsin(695_700_000.0 / (np.linalg.norm(v) * 1000.0)))
     return float(az_grid), float(el), float(r_sun)
+
+
+def shadow_reach_m(elev_deg, relief_m=12_180.0, radius=MOON_RADIUS_M):
+    """Farthest a blocker of height `relief_m` can still cast, at sun elevation `elev_deg` [m].
+
+    A blocker at range d clears the line of sight when its height exceeds ``d*tan(e)`` plus the
+    ``d^2/2R`` the surface has already curved away, so
+
+        d = R * (-tan(e) + sqrt(tan(e)^2 + 2h/R))
+
+    At e -> 0 this is the curvature horizon ``sqrt(2*R*h)``, and no sun angle can reach past it.
+
+    `relief_m` defaults to the tallest peak standing above any point within reach, measured off the
+    LOLA polar tiles themselves (12.180 km, LDEM_45S_100M; LDEM_75S_30M gives 11.87 km). That is
+    deliberately *peak-above-the-shadowed-point*, not tile-wide peak-to-trough (14.7-15.7 km) --
+    the latter pairs a summit with a basin floor up to twice the reach apart, which cannot shadow
+    each other, and would oversize the read by ~17%.
+
+    >>> round(shadow_reach_m(0.0))          # curvature horizon, sqrt(2Rh)
+    205726
+    >>> round(shadow_reach_m(3.16))         # deep polar chunk, sun barely up
+    131069
+    >>> round(shadow_reach_m(34.28))        # far end of a polar strip
+    17736
+    >>> shadow_reach_m(-5.0) == shadow_reach_m(0.0)   # sun below the horizon: no less reach
+    True
+    """
+    t = np.tan(np.radians(max(float(elev_deg), 0.0)))
+    return float(radius * (-t + np.sqrt(t * t + 2 * relief_m / radius)))
+
+
+def _far_reach(cfg, elev_deg):
+    """Per-render up-sun distance for the far tier, rounded UP to the next kilometre.
+
+    Missing a blocker leaves the reference too bright, which is a correctness error in the thing
+    the tie points match against; carrying a slightly oversized DEM window costs ~1% of a chunk's
+    wall clock (the near tier dominates the read). So every rounding here goes outward.
+    """
+    d = min(float(cfg.far_m), shadow_reach_m(elev_deg, cfg.max_relief_m))
+    return float(np.ceil(d / 1000.0) * 1000.0)
 
 
 def _upsun_box(aoi, az_deg, reach_m, margin):
@@ -333,10 +421,10 @@ def _onto(arr, tr_src, tr_dst, shape_dst):
     )
 
 
-def _tier(path, cfg, az, el, r_sun, reach_m, min_range_m):
+def _tier(path, cfg, az, el, r_sun, reach_m, min_range_m, dec=1):
     """Lit fraction for one DEM tier, on that DEM's own grid."""
     cx, cy = (cfg.aoi[0] + cfg.aoi[2]) / 2, (cfg.aoi[1] + cfg.aoi[3]) / 2
-    z_raw, tr, ps = load_lola_elev(path, bounds=_upsun_box(cfg.aoi, az, reach_m, cfg.margin_m))
+    z_raw, tr, ps = load_lola_elev(path, bounds=_upsun_box(cfg.aoi, az, reach_m, cfg.margin_m), dec=dec)
     z = tangent_z(z_raw, ps, origin=((cy - tr.f) / tr.e, (cx - tr.c) / tr.a))
     lad = penumbra_ladder(el, r_sun)
     lit = lit_fraction(lad[horizon_1az(z, ps, az, lad, min_range_m)], el, r_sun)
@@ -361,7 +449,7 @@ def render_reference(fgeom, fspm, cfg, kernels=None):
     lit_n, tr_n, ps_n, z_n = _tier(cfg.dem_near, cfg, az, el, r_sun, cfg.near_m, 0.0)
     lit = lit_n
     if cfg.dem_far:
-        lit_f, tr_f, _, _ = _tier(cfg.dem_far, cfg, az, el, r_sun, cfg.far_m, cfg.near_m)
+        lit_f, tr_f, _, _ = _tier(cfg.dem_far, cfg, az, el, r_sun, _far_reach(cfg, el), cfg.near_m, dec=cfg.far_dec)
         lit = np.minimum(lit_n, _onto(lit_f, tr_f, tr_n, lit_n.shape))
     fine = lambert_shade(z_n, ps_n, az, el) * lit
 
@@ -404,7 +492,7 @@ def render_topo(fgeom, fspm, cfg, kernels=None):
     az, el, r_sun = sun_geometry(fgeom, fspm, cfg, kernels)
     lit, tr_n, ps_n, z_n = _tier(cfg.dem_near, cfg, az, el, r_sun, cfg.near_m, 0.0)
     if cfg.dem_far:
-        lit_f, tr_f, _, _ = _tier(cfg.dem_far, cfg, az, el, r_sun, cfg.far_m, cfg.near_m)
+        lit_f, tr_f, _, _ = _tier(cfg.dem_far, cfg, az, el, r_sun, _far_reach(cfg, el), cfg.near_m, dec=cfg.far_dec)
         lit = np.minimum(lit, _onto(lit_f, tr_f, tr_n, lit.shape))
     dzdy_row, dzdx = np.gradient(z_n, ps_n)
     gx, gy = _to_gsd(dzdx, ps_n, cfg), _to_gsd(-dzdy_row, ps_n, cfg)  # east, north
@@ -567,9 +655,8 @@ def tie_points(ref, tgt, transform, cfg, max_shift_px):
         r, rm = grad_mag(r, rm, cfg.grad_sigma)
         t, tm = grad_mag(t, tm, cfg.grad_sigma)
     gt = (transform.c, transform.a, 0.0, transform.f, 0.0, transform.e)
-    mk = lambda arr, m: GeoArray(
-        _standardize(arr, m, nodata), geotransform=gt, projection=STEREO.to_wkt(), nodata=nodata
-    )
+    proj = stereo_crs(cfg.pole).to_wkt()
+    mk = lambda arr, m: GeoArray(_standardize(arr, m, nodata), geotransform=gt, projection=proj, nodata=nodata)
 
     crl = COREG_LOCAL(
         mk(r, rm),
@@ -701,16 +788,35 @@ class Registration:
         return bool(self.stats.get("converged"))
 
 
+POLE_LAT_BAND: dict[str, tuple[float, float]] = {
+    "south": (-90.0, -80.0),
+    "north": (80.0, 90.0),
+    "equatorial": (-60.0, 60.0),
+}
+for _pole in POLE_LAT_BAND:
+    _override = os.environ.get(f"IIRSPY_POLE_LAT_BAND_{_pole.upper()}")
+    if _override:
+        # Env var, not a runtime dict assignment, so a subprocess that re-imports this module
+        # (register()'s arosics-conda path) also picks up the override.
+        _lo, _hi = (float(v) for v in _override.split(","))
+        POLE_LAT_BAND[_pole] = (_lo, _hi)
+
+
 def gcp_lattice(fgeom, ny, nx, cfg):
-    """Camera (row, col) -> map (x, y) lattice from the supplied geometry csv, uncorrected."""
-    glon, glat, _ = utils.geom2grid(fgeom, (-180, 180, -90, -80.0))
+    """Camera (row, col) -> map (x, y) lattice from the supplied geometry csv, uncorrected.
+
+    The lat band must reproduce exactly the crop `run_l1_polar.run_one` applied when it built the
+    cube (`POLE_LAT_BAND` mirrors its per-pole `extent`), or GCP `row` stops lining up with the
+    cube's own rows.
+    """
+    glon, glat, _ = utils.geom2grid(fgeom, (-180, 180, *POLE_LAT_BAND[cfg.pole]))
     glon, glat = glon[:ny], glat[:ny]
     # The last row must be a GCP row: arange(0, ny, row_step) stops short, leaving the final ~1 km
     # beyond every GCP where GDAL's TPS extrapolates freely -- i.e. the along-track image edge.
     rows = np.unique(np.r_[np.arange(0, ny, cfg.row_step), ny - 1])
     cols = np.unique(np.linspace(0, nx - 1, cfg.ncol).astype(int))
     jj, ii = np.meshgrid(rows, cols, indexing="ij")
-    x, y = TO_STEREO.transform(glon[jj, ii], glat[jj, ii])
+    x, y = to_stereo(cfg.pole).transform(glon[jj, ii], glat[jj, ii])
     return jj, ii, x, y
 
 
@@ -729,6 +835,45 @@ def window_of(cfg, window=None):
         return (len(ys), len(xs)), tr
     r0, r1, c0, c1 = window
     return (r1 - r0, c1 - c0), tr * rasterio.Affine.translation(c0, r0)
+
+
+def unify_nodata(cube):
+    """Stack a cube with its own hole indicator, both under one shared nodata mask.
+
+    Returns a (2 * nband, y, x) array: the data bands, then a 0/1 plane per band marking where
+    that band had nodata. Warp it in one :func:`project` call and drop every output pixel whose
+    indicator came back above zero -- exactly the set whose resampling footprint touched a hole in
+    *that* band. `unstack_nodata` does that.
+
+    Why not just warp the cube. GDAL's multi-band warp does not mask bands independently: a band
+    with a smaller valid footprint is pulled down toward the others (measured on an L2 cube, band
+    27 beside band 251: 165,783 px kept against 171,428 alone -- 3.3% lost, values bit-identical).
+    Band-at-a-time is correct but pays the ~1700-point TPS solve 256 times.
+
+    So remove the disagreement rather than the sharing. Nodata becomes the pixels where *no* band
+    has data, which every band then shares, and a per-band hole inside that footprint becomes 0 in
+    the data half and 1 in the indicator half. A fill value alone cannot mark those holes:
+    resampling blends it into a continuum, so any cut-off leaves surviving contamination of its own
+    magnitude (measured: -999.185 survived a -1000 cut-off).
+
+    Stacked rather than warped separately because GDAL transforms each destination pixel once per
+    *call*, not once per band -- the per-band cost is only the resampling (measured: 5 bands cost
+    94.6 s one at a time against 19.6 s in one call). So carrying the indicator alongside is
+    nearly free, where a second call would pay the whole transform again.
+    """
+    nan = np.isnan(cube)
+    dead = nan.all(axis=0)
+    out = np.empty((2 * len(cube), *cube.shape[1:]), "float32")
+    out[: len(cube)] = np.where(nan, np.float32(0), cube)
+    out[len(cube) :] = nan
+    out[:, dead] = np.nan
+    return out
+
+
+def unstack_nodata(warped, band):
+    """One band out of a warped :func:`unify_nodata` stack, its touched-a-hole pixels set NaN."""
+    n = len(warped) // 2
+    return np.where(warped[n + band] > 0, np.nan, warped[band])
 
 
 def data_window(arr, pad=8):
@@ -762,14 +907,27 @@ def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None):
     the same scene warped at two windows disagrees (measured max 0.24 in reflectance).
     """
     shape, tr = window_of(cfg, window)
-    out = np.full(np.shape(band)[:-2] + shape, np.nan, "float32")
+    shape = np.shape(band)[:-2] + shape
+    # A cube covering most of the AOI is 12+ GB of destination, which a 23 GB box cannot hold
+    # alongside the source. Splitting the call into band groups would be the obvious fix and is
+    # wrong: GDAL's multi-band warp masks a band with a small valid footprint down toward the
+    # others, so which bands share a call changes the nodata pattern. Spill to disk instead and
+    # keep every band in one call.
+    out: np.ndarray
+    if np.prod(shape) * 4 > MAX_RAM_BYTES:
+        tmp = tempfile.NamedTemporaryFile(suffix=".f32", delete=False)  # noqa: SIM115
+        out = np.memmap(tmp.name, dtype="float32", mode="w+", shape=shape)
+        out[:] = np.nan
+        Path(tmp.name).unlink()  # unlinked but held open: the pages die with the array
+    else:
+        out = np.full(shape, np.nan, "float32")
     reproject(
         source=band,
         destination=out,
-        src_crs=STEREO,
+        src_crs=stereo_crs(cfg.pole),
         gcps=gcps,
         dst_transform=tr,
-        dst_crs=STEREO,
+        dst_crs=stereo_crs(cfg.pole),
         resampling=resampling,
         src_nodata=np.nan,
         dst_nodata=np.nan,
@@ -791,13 +949,27 @@ def save_grid(fout, arr, cfg, nodata=np.nan):
         width=arr.shape[1],
         count=1,
         dtype="float32",
-        crs=STEREO,
+        crs=stereo_crs(cfg.pole),
         transform=tr,
         nodata=nodata,
         compress="LZW",
     ) as dst:
         dst.write(np.asarray(arr, dtype="float32"), 1)
     return fout
+
+
+def _has_arosics():
+    """True only for a real, importable `arosics` -- not a same-named directory on `sys.path`.
+
+    A directory called `arosics/` with no `__init__.py` anywhere on the path makes `find_spec`
+    succeed as a *namespace* package, whose `loader` is None and which of course has no
+    `COREG_LOCAL`. `local-workspace/arosics/` in this repo is exactly that, so the plain
+    `find_spec(...) is None` test used to report the package present and send the solve down the
+    in-process branch, dying with "cannot import name 'COREG_LOCAL' from 'arosics' (unknown
+    location)" instead of subprocessing to the conda environment that actually has it.
+    """
+    spec = importlib.util.find_spec("arosics")
+    return spec is not None and spec.loader is not None
 
 
 def arosics_python():
@@ -846,7 +1018,7 @@ def _register_subprocess(ftif, fgeom, fspm, cfg, kernels, reference, verbose):
     xs, ys, tr, _ = grid_of(cfg)
     return Registration(
         gcps=[GroundControlPoint(row=r, col=c, x=x, y=y) for r, c, x, y in d["gcps"]],
-        crs=STEREO,
+        crs=stereo_crs(cfg.pole),
         transform=tr,
         shape=(len(ys), len(xs)),
         stats=d["stats"],
@@ -865,7 +1037,7 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
     scene's own is rendered. When arosics is not importable the solve runs in the arosics conda
     environment through :mod:`iirspy.coreg`.
     """
-    if importlib.util.find_spec("arosics") is None:
+    if not _has_arosics():
         return _register_subprocess(ftif, fgeom, fspm, cfg, kernels, reference, verbose)
 
     ref = reference
@@ -891,6 +1063,7 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
 
     iters, converged = [], False
     for k in range(1, cfg.niter + 1):
+        t_iter = time.time()
         img = project(band, _to_gcps(jj, ii, x, y), cfg)
         tp = tie_points(ref, img, tr, cfg, cfg.max_shift_for(k))
         tp = _reject_shift_cap(tp, cfg.max_shift_for(k))
@@ -898,7 +1071,7 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
         if cfg.mad_from_iter and k >= cfg.mad_from_iter:
             tp, n_mad, mad_lim = _reject_mad(tp, cfg.mad_k, cfg.ps)
         if not len(tp):
-            iters.append({"iter": k, "n_kept": 0, "note": "no tie points"})
+            iters.append({"iter": k, "n_kept": 0, "note": "no tie points", "iter_s": round(time.time() - t_iter, 2)})
             break
 
         d = np.hypot(tp.Y_SHIFT_PX, tp.X_SHIFT_PX).to_numpy(float) * cfg.ps
@@ -915,6 +1088,7 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
             "shift_m": {"median": round(float(np.median(d)), 1), "p95": round(p95, 1)},
             "applied_med_m": round(float(np.median(np.hypot(s[..., 0], s[..., 1]))), 1),
             "field": finfo,
+            "iter_s": round(time.time() - t_iter, 2),
         })
         if verbose:
             print(iters[-1], flush=True)
@@ -927,7 +1101,7 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
     xs, ys, tr, _ = grid_of(cfg)
     return Registration(
         gcps=_to_gcps(jj, ii, x, y),
-        crs=STEREO,
+        crs=stereo_crs(cfg.pole),
         transform=tr,
         shape=(len(ys), len(xs)),
         stats=info | {"iters": iters, "converged": converged, "band": cfg.band},

@@ -83,3 +83,42 @@ def test_a_windowed_warp_is_the_same_pixels_as_the_full_one():
     # ... and a cube goes through in one call, band for band
     cube = np.stack([band, band * 2.0])
     np.testing.assert_array_equal(georef.project(cube, gcps, cfg)[1], full * 2.0)
+
+
+def test_a_bands_warp_does_not_depend_on_which_bands_share_the_call():
+    """GDAL masks a narrow-footprint band down toward its neighbours in a multi-band warp, so a
+    bare cube's nodata depends on its own band list. unify_nodata removes that dependence."""
+    cfg = georef.GeorefConfig(aoi=(0.0, 0.0, 4000.0, 4000.0), ps=40.0)
+    ny, nx = 60, 20
+    gcps = [
+        GroundControlPoint(row=float(r), col=float(c), x=500.0 + 30.0 * c, y=3500.0 - 50.0 * r)
+        for r in np.arange(0, ny, 5)
+        for c in np.arange(0, nx, 2)
+    ]
+    holed = np.arange(ny * nx, dtype="float32").reshape(ny, nx)
+    holed[20:30, 5:12] = np.nan  # a hole this band has and the others do not
+    full = np.full((ny, nx), 7.0, "float32")
+    both_nan = np.s_[:5, :]  # nodata in every band, so it stays the shared mask
+    holed[both_nan] = np.nan
+    full[both_nan] = np.nan
+
+    def warp(cube):
+        return georef.unstack_nodata(georef.project(georef.unify_nodata(cube), gcps, cfg), 0)
+
+    # Every companion set must give band 0 the same answer. (A one-band cube is deliberately not
+    # in this set: with nothing to disagree with, its hole IS the shared mask, so GDAL renormalises
+    # over it instead of marking it -- the documented "warped alone" difference.)
+    with_one = warp(np.stack([holed, full]))
+    with_two = warp(np.stack([holed, full, full * 2.0]))
+    with_other = warp(np.stack([holed, full * 3.0]))
+    np.testing.assert_array_equal(with_one, with_two)
+    np.testing.assert_array_equal(with_one, with_other)
+
+    # ... nothing that touched the hole survives: the fill is 0, below every real value here
+    kept = with_two[np.isfinite(with_two)]
+    assert kept.size > 100
+    assert kept.min() > 0.0
+
+    # The contamination this guards against needs real per-band footprints to reproduce and does
+    # not show on a constant companion; it was measured on an L2 cube (band 27: 165,783 px beside
+    # band 251 against 171,428 alone). What this test pins is the invariant, not the bug.
