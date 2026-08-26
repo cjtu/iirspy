@@ -170,11 +170,12 @@ class GeorefConfig:
     # `POLE_LAT_BAND` global, which is only right when the caller has already set it.
     lat_band: tuple | None = None
     # The rows this solve actually cares about (a chunk's row0, row1), and how many rows either
-    # side of them to keep in the lattice. -1 keeps the whole cube, which is the default and what
-    # the pipeline shipped before the knob existed. Clipping cuts the per-iteration TPS cost, which
-    # grows cubically in GCP count.
+    # side of them to keep in the lattice; -1 keeps the whole cube. Clipping cuts the per-iteration
+    # TPS cost, which grows cubically in GCP count. At 250 both measured chunks matched a full
+    # lattice in every along-track slab at ~2.5x the speed, while a margin of 0 left an 89 m
+    # residual in the trailing slab (local-workspace/alliance_georef_pipeline/runs/margin_test.json).
     gcp_rows: tuple | None = None
-    gcp_row_margin: int = -1
+    gcp_row_margin: int = 250
 
     def __post_init__(self):
         # json round-trips (iirspy.coreg) stringify the keys of max_shift
@@ -967,6 +968,8 @@ def _lattice_row_bounds(ny: int, cfg) -> tuple[int, int]:
     (0, 14399)
     >>> _lattice_row_bounds(14400, SimpleNamespace(gcp_rows=(4350, 6100), gcp_row_margin=0))
     (4350, 6100)
+    >>> _lattice_row_bounds(14400, SimpleNamespace(gcp_rows=(4350, 6100), gcp_row_margin=250))
+    (4100, 6350)
     >>> _lattice_row_bounds(14400, SimpleNamespace(gcp_rows=(4350, 6100), gcp_row_margin=1000))
     (3350, 7100)
     >>> _lattice_row_bounds(14400, SimpleNamespace(gcp_rows=None, gcp_row_margin=250))

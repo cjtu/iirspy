@@ -96,7 +96,7 @@ TWEAK_DEFAULTS = {
     "edge_fit_k": 0,
     "p95_plateau_frac": 0.0,
     "min_iter": 0,
-    "gcp_row_margin": -1,
+    "gcp_row_margin": 250,
 }
 
 
@@ -430,9 +430,9 @@ def _parser():
     ap.add_argument(
         "--gcp-row-margin",
         type=int,
-        default=-1,
+        default=250,
         help="rows of GCP lattice kept either side of a chunk's own rows (GeorefConfig."
-        "gcp_row_margin; -1 = the whole cube, the default). Clipping cuts per-iteration TPS cost.",
+        "gcp_row_margin; -1 = the whole cube). Clipping cuts per-iteration TPS cost.",
     )
     ap.add_argument(
         "--decay-m",
