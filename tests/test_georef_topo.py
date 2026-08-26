@@ -122,3 +122,48 @@ def test_a_bands_warp_does_not_depend_on_which_bands_share_the_call():
     # The contamination this guards against needs real per-band footprints to reproduce and does
     # not show on a constant companion; it was measured on an L2 cube (band 27: 165,783 px beside
     # band 251 against 171,428 alone). What this test pins is the invariant, not the bug.
+
+
+def test_local_plane_extrapolates_the_local_gradient_and_stays_bounded():
+    """`_local_plane` is the off-support fallback: local level + local slope, clipped."""
+    from scipy.spatial import cKDTree
+
+    from iirspy.georef import _local_plane
+
+    pts = np.stack(np.meshgrid(np.arange(5) * 1000.0, np.arange(5) * 1000.0), -1).reshape(-1, 2)
+    disp = np.c_[1e-3 * pts[:, 0], np.full(len(pts), 7.0)]  # dx ramps 0->4 m, dy constant
+    far = _local_plane(pts, disp, cKDTree(pts), 8)
+
+    inside = far(np.array([[2000.0, 2000.0]]))
+    assert np.allclose(inside, [2.0, 7.0], atol=1e-6)  # recovers the ramp where support surrounds it
+
+    out = far(np.array([[8000.0, 2000.0]]))  # 4 km past the last column, support one-sided
+    assert out[0, 1] == 7.0  # the constant component stays constant
+    assert 3.0 < out[0, 0] <= 4.0  # extrapolates outward, clipped to the neighbours' own range
+
+
+def test_load_lola_elev_scales_gld100_unscaled_and_fills_its_nodata(tmp_path):
+    """GLD100 DN is metres above the sphere already, and its declared nodata must not survive."""
+    import rasterio
+
+    a = np.array([[100, 200], [-32768, 400]], dtype="int16")
+    p = tmp_path / "WAC_GLD100_P900N0000_100M.tif"
+    with rasterio.open(
+        p,
+        "w",
+        driver="GTiff",
+        height=2,
+        width=2,
+        count=1,
+        dtype="int16",
+        crs="EPSG:4326",
+        transform=from_origin(0.0, 0.0, 100.0, 100.0),
+        nodata=-32768,
+    ) as dst:
+        dst.write(a, 1)
+
+    z, _, ps = georef.load_lola_elev(p)
+    assert ps == 100.0
+    assert z[0, 0] == 100.0  # unity scale, no radius offset -- not the LOLA 0.5/1737400 rule
+    assert z[1, 1] == 400.0
+    assert z[1, 0] == pytest.approx(np.median([100.0, 200.0, 400.0]))  # flat fill, not a -32 km pit

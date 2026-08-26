@@ -43,7 +43,14 @@ from pyproj import CRS, Transformer
 from rasterio.control import GroundControlPoint
 from rasterio.warp import Resampling, reproject
 from scipy.interpolate import RBFInterpolator, RectBivariateSpline
-from scipy.ndimage import binary_erosion, gaussian_filter, map_coordinates, rotate, uniform_filter
+from scipy.ndimage import (
+    binary_erosion,
+    distance_transform_edt,
+    gaussian_filter,
+    map_coordinates,
+    rotate,
+    uniform_filter,
+)
 from scipy.spatial import cKDTree
 
 import iirspy.utils as utils
@@ -106,10 +113,36 @@ class GeorefConfig:
     # --- tie points
     niter: int = 5
     p95_stop_m: float = 20.0  # 1/2 output px; the matcher floor is 18.6-19.2 m
+    # The residual plateaus well before it crosses `p95_stop_m`, and the threshold sits inside that
+    # plateau (chunk 8 of the south run: p95 24.4 -> 21.0 -> 20.2 -> 19.8 over three iterations that
+    # cost ~300 s each), so which iteration trips it is close to a coin flip -- 26 of 43 archive
+    # scenes finish between 17 and 20 m. With `p95_plateau_frac` set, `p95_stop_m` demotes to a
+    # sanity ceiling and the stop is instead "p95 improved by less than this fraction of the
+    # previous iteration's". `min_iter` is the floor: `mad_from_iter + 1` guarantees at least one
+    # MAD-culled field is applied *and* its effect measured (two of nine chunks in the validated
+    # south run stopped at iteration 2, so no MAD cull ever ran). Both off by default.
+    p95_plateau_frac: float = 0.0  # 0 = off
+    min_iter: int = 0  # 0 = off
     win: int = 128  # px = 5.1 km matching window
     grid_res: int = 40  # px = 1.6 km tie-point spacing
     max_shift: dict = field(default_factory=lambda: {1: 50, 2: 15, 3: 6, 4: 4})  # px, then floor
     min_reliability: int = 30
+    # RELIABILITY is blind to both of the failures below -- it is *highest* exactly where the
+    # match is worst. Measured on chunk 0 of the south run by injecting a known (3, -4) px shift
+    # and re-matching (local-workspace/arosics_edge_optimizer):
+    #   reference window >90% shadowed : reliability 80-83 (top of any bin), median error 4.9 px
+    #   centre <1 km from the swath edge: only 10% survive, and 58% of those are >1 px wrong
+    # A shadowed reference window is constant, so its cross-power spectrum is DC-dominated and
+    # peaks sharply at a shift that means nothing; a window straddling the swath edge is shrunk
+    # by arosics (down to 16 px) until it no longer holds enough terrain to match on.
+    edge_reject_m: float = 0.0  # 0 = off; drop points this close to the target's nodata edge
+    shadow_max: float = 1.0  # 1 = off; drop points whose reference window is more shadowed
+    # A second pass at half `grid_res` within this far of the swath edge, `win` unchanged. The
+    # uniform grid is anchored to the array origin, so the outermost point lands up to grid_res
+    # (1.6 km) inboard of where the window quality actually runs out; halving the spacing there
+    # halves that loss. Shrinking `win` instead is measured worse everywhere (win 64: 20% of kept
+    # points >1 px wrong vs 14%; win 48: 31%) -- the window, not the grid, is what carries terrain.
+    edge_dense_m: float = 0.0  # 0 = off
     grad: bool = True  # match on gradient magnitude, not radiance
     grad_sigma: float = 1.0
     mad_from_iter: int = 3  # global MAD cull, only once the field is flat
@@ -117,6 +150,13 @@ class GeorefConfig:
 
     # --- displacement field
     decay_m: float = 5_000.0  # blend to the bulk median outside tie-point support
+    # What the field decays *to* off-support. The bulk median is one constant for the whole chunk,
+    # so the swath margin -- which sits entirely inside `decay_m` -- gets no local information at
+    # all, which is the visible edge offset. With `edge_fit_k` > 0 the fallback is instead a plane
+    # least-squares-fitted to the k nearest tie points, so the margin keeps the local level *and*
+    # the local gradient. Clipped to those k points' own range, because support at a swath edge is
+    # always one-sided and an unclipped plane extrapolates without bound.
+    edge_fit_k: int = 0  # 0 = off, use the bulk median
     smooth_cv: bool = True  # pick TPS regularisation by k-fold CV
     smooth_fixed: float = 1.0  # used when smooth_cv is False
 
@@ -125,6 +165,16 @@ class GeorefConfig:
     # Along-track GCP spacing in image rows; 25 rows is ~2 km, fine enough to carry the
     # tie-point field (1.6 km spacing) without resampling it away.
     row_step: int = 25
+    # The latitude crop the cube being registered was built with. Must match it exactly or GCP row
+    # stops mapping to the right latitude and the whole product shifts. None falls back to the
+    # `POLE_LAT_BAND` global, which is only right when the caller has already set it.
+    lat_band: tuple | None = None
+    # The rows this solve actually cares about (a chunk's row0, row1), and how many rows either
+    # side of them to keep in the lattice. -1 keeps the whole cube, which is the default and what
+    # the pipeline shipped before the knob existed. Clipping cuts the per-iteration TPS cost, which
+    # grows cubically in GCP count.
+    gcp_rows: tuple | None = None
+    gcp_row_margin: int = -1
 
     def __post_init__(self):
         # json round-trips (iirspy.coreg) stringify the keys of max_shift
@@ -179,7 +229,12 @@ def load_lola_elev(path, bounds=None, dec=1):
     """
     import re
 
-    if Path(path).suffix.lower() in (".tif", ".tiff"):
+    if "GLD100" in Path(path).name.upper():
+        # WAC GLD100 is not a LOLA GDR: its DN *is* metres above the 1737.4 km sphere (unity scale,
+        # no radius offset -- see make_wac_gld100_cog.sh). Applying the LOLA 0.5/1737400 trick here
+        # halves every height and is silent about it.
+        scale, offset = 1.0, MOON_RADIUS_M
+    elif Path(path).suffix.lower() in (".tif", ".tiff"):
         # COG rebuild of a GDR (local-workspace/make_dem_cogs.py) -- the raw int16 counts are
         # copied through untouched, and every LOLA GDR label carries these same two constants,
         # so they are inlined rather than shipped in a sidecar. GDAL's own scale/offset tags stay
@@ -201,11 +256,20 @@ def load_lola_elev(path, bounds=None, dec=1):
         win_w, win_h = (win.width, win.height) if win is not None else (src.width, src.height)
         out_shape = (max(1, round(win_h / dec)), max(1, round(win_w / dec))) if dec > 1 else None
         raw = src.read(1, window=win, out_shape=out_shape).astype("float64")
+        nodata = src.nodata
         tr = src.window_transform(win) if win is not None else src.transform
         if out_shape is not None:
             tr = tr * tr.scale(win_w / out_shape[1], win_h / out_shape[0])
         ps = abs(src.res[0]) * (win_w / out_shape[1] if out_shape is not None else 1)
-    return raw * scale + offset - MOON_RADIUS_M, tr, ps
+    elev = raw * scale + offset - MOON_RADIUS_M
+    # A DEM that declares nodata (GLD100 stops at ~+/-79 and outside its inscribed circle) would
+    # otherwise carry its fill DN straight through as a -32 km pit that shadows the whole render.
+    # Flat fill at the window's own median: no relief to cast with, no cliff at the coverage edge.
+    if nodata is not None:
+        gap = raw == nodata
+        if gap.any():
+            elev[gap] = np.median(elev[~gap]) if (~gap).any() else 0.0
+    return elev, tr, ps
 
 
 def tangent_z(dem, pixel_size, origin=None, radius=MOON_RADIUS_M):
@@ -639,13 +703,75 @@ def coarse_shift(img, ref, cfg):
     )
 
 
+def _rowcol(tp, transform, shape):
+    """(row, col) of each tie point in an array on `transform`, clipped into `shape`."""
+    row = ((tp.Y_MAP - transform.f) / transform.e).round().astype(int).clip(0, shape[0] - 1)
+    col = ((tp.X_MAP - transform.c) / transform.a).round().astype(int).clip(0, shape[1] - 1)
+    return row.to_numpy(), col.to_numpy()
+
+
+def edge_dist_m(mask, ps):
+    """Metres from every pixel to the nearest False in `mask` -- i.e. to the swath's own data edge.
+
+    The target's finite footprint, not the AOI box: the hillshade reference covers the whole box,
+    so the swath boundary is the only edge a match window can fall off. Shadow is finite data, not
+    nodata, so it does not count as an edge (same distinction as the shadow gate).
+    """
+    return distance_transform_edt(mask) * ps
+
+
+def _window_shadow(ref, row, col, win):
+    """Shadowed fraction of each point's `win`-square reference window, via a summed-area table."""
+    ny, nx = ref.shape
+    ii = np.cumsum(np.cumsum(np.pad((ref <= 0).astype("float64"), ((1, 0), (1, 0))), 0), 1)
+    h = win // 2
+    r0, r1 = np.clip(row - h, 0, ny), np.clip(row + h, 0, ny)
+    c0, c1 = np.clip(col - h, 0, nx), np.clip(col + h, 0, nx)
+    area = ii[r1, c1] - ii[r0, c1] - ii[r1, c0] + ii[r0, c0]
+    return area / np.maximum((r1 - r0) * (c1 - c0), 1)
+
+
+def _coreg_pass(gref, gtgt, cfg, max_shift_px, grid_res, bad_tgt=None):
+    """One COREG_LOCAL pass, optionally with the target's interior masked off so only the grid
+    points near the swath edge are scored (`bad_tgt` True = skip)."""
+    from arosics import COREG_LOCAL
+    from geoarray import GeoArray
+
+    kw = {}
+    if bad_tgt is not None:
+        kw["mask_baddata_tgt"] = GeoArray(bad_tgt.astype("uint8"), geotransform=gtgt.gt, projection=gtgt.projection)
+    crl = COREG_LOCAL(
+        gref,
+        gtgt,
+        grid_res=grid_res,
+        window_size=(cfg.win, cfg.win),
+        max_shift=max_shift_px,
+        nodata=(gref.nodata, gtgt.nodata),
+        q=True,
+        progress=False,
+        min_reliability=cfg.min_reliability,
+        tieP_filter_level=3,
+        # arosics defaults `CPUs` to `multiprocessing.cpu_count()`, which reports the machine's
+        # cores and not the cgroup's -- inside a Slurm allocation that is the whole node (192 on
+        # Nibi) no matter how few `--cpus-per-task` were granted, so the default oversubscribes by
+        # ~50x and thrashes. `sched_getaffinity` is the count this process may actually use.
+        CPUs=len(os.sched_getaffinity(0)),
+        **kw,
+    )
+    tp = crl.CoRegPoints_table
+    return tp[(gtgt.nodata != tp.ABS_SHIFT) & tp.X_SHIFT_PX.notna() & (cfg.min_reliability <= tp.RELIABILITY)]
+
+
 def tie_points(ref, tgt, transform, cfg, max_shift_px):
     """One AROSICS COREG_LOCAL pass on two arrays already sharing a grid, filtered to usable points.
 
     Both are standardised (and optionally reduced to gradient magnitude) before matching; nodata is
     a sentinel because arosics does not take NaN.
+
+    `cfg.edge_dense_m` adds a second, denser pass confined to the swath margin, and
+    `cfg.edge_reject_m` / `cfg.shadow_max` drop the two classes of confidently-wrong point that
+    `min_reliability` cannot see (see :class:`GeorefConfig`). All three are off by default.
     """
-    from arosics import COREG_LOCAL
     from geoarray import GeoArray
 
     nodata = -9999.0
@@ -657,21 +783,26 @@ def tie_points(ref, tgt, transform, cfg, max_shift_px):
     gt = (transform.c, transform.a, 0.0, transform.f, 0.0, transform.e)
     proj = stereo_crs(cfg.pole).to_wkt()
     mk = lambda arr, m: GeoArray(_standardize(arr, m, nodata), geotransform=gt, projection=proj, nodata=nodata)
+    gref, gtgt = mk(r, rm), mk(t, tm)
 
-    crl = COREG_LOCAL(
-        mk(r, rm),
-        mk(t, tm),
-        grid_res=cfg.grid_res,
-        window_size=(cfg.win, cfg.win),
-        max_shift=max_shift_px,
-        nodata=(nodata, nodata),
-        q=True,
-        progress=False,
-        min_reliability=cfg.min_reliability,
-        tieP_filter_level=3,
-    )
-    tp = crl.CoRegPoints_table
-    return tp[(nodata != tp.ABS_SHIFT) & tp.X_SHIFT_PX.notna() & (cfg.min_reliability <= tp.RELIABILITY)]
+    tp = _coreg_pass(gref, gtgt, cfg, max_shift_px, cfg.grid_res)
+    dist = edge_dist_m(tm, abs(transform.a))
+    if cfg.edge_dense_m and cfg.grid_res > 1:
+        # Split rather than concatenate: the half-spacing grid is a superset of the coarse one
+        # (both anchored at the array origin), so taking the coarse pass outside the margin and
+        # the dense pass inside it covers every point exactly once.
+        margin = dist <= cfg.edge_dense_m
+        dense = _coreg_pass(gref, gtgt, cfg, max_shift_px, cfg.grid_res // 2, bad_tgt=~margin)
+        keep = [tp[~margin[_rowcol(tp, transform, tm.shape)]], dense[margin[_rowcol(dense, transform, tm.shape)]]]
+        tp = pd.concat(keep, ignore_index=True)
+
+    row, col = _rowcol(tp, transform, tm.shape)
+    if cfg.edge_reject_m:
+        tp = tp[dist[row, col] >= cfg.edge_reject_m]
+        row, col = _rowcol(tp, transform, tm.shape)
+    if cfg.shadow_max < 1.0:
+        tp = tp[_window_shadow(ref, row, col, cfg.win) <= cfg.shadow_max]
+    return tp
 
 
 def _reject_shift_cap(tp, cap_px):
@@ -736,6 +867,26 @@ def choose_smoothing(pts, disp, k=5, seed=0):
     return best, best_err, baseline
 
 
+def _local_plane(pts, disp, tree, k):
+    """Off-support fallback: the plane fitted to the `k` tie points nearest each query point.
+
+    Returns f(q) -> (dx, dy) in metres, the plane evaluated *at* q and clipped component-wise to
+    the range of those k displacements, so a one-sided margin cannot extrapolate without bound.
+    """
+    k = min(k, len(pts))
+
+    def far(q):
+        _, idx = tree.query(q, k=k)
+        idx = idx.reshape(len(q), k)
+        # Centre the neighbours on the query so the fitted intercept *is* the value at q.
+        a = np.concatenate([np.ones((len(q), k, 1)), pts[idx] - np.asarray(q)[:, None, :]], axis=-1)
+        d = disp[idx]  # (n, k, 2)
+        coef = np.linalg.pinv(a) @ d  # pinv, not solve: k collinear neighbours are rank-deficient
+        return np.clip(coef[:, 0, :], d.min(axis=1), d.max(axis=1))
+
+    return far
+
+
 def displacement_field(tp, cfg):
     """
     Tie-point displacement field q -> (dx, dy) metres, decaying to the bulk median off-support.
@@ -762,10 +913,13 @@ def displacement_field(tp, cfg):
         }
     rbf = RBFInterpolator(pts, disp, kernel="thin_plate_spline", smoothing=smooth)
     tree = cKDTree(pts)
+    far = _local_plane(pts, disp, tree, cfg.edge_fit_k) if cfg.edge_fit_k else None
+    info["off_support"] = f"local_plane_k{cfg.edge_fit_k}" if far else "bulk_median"
 
     def fieldfn(q):
         w = np.exp(-((tree.query(q)[0] / cfg.decay_m) ** 2))[:, None]
-        return w * rbf(q) + (1 - w) * np.repeat(bulk[None], len(q), axis=0)
+        out = np.repeat(bulk[None], len(q), axis=0) if far is None else far(q)
+        return w * rbf(q) + (1 - w) * out
 
     return fieldfn, info
 
@@ -802,6 +956,30 @@ for _pole in POLE_LAT_BAND:
         POLE_LAT_BAND[_pole] = (_lo, _hi)
 
 
+def _lattice_row_bounds(ny: int, cfg) -> tuple[int, int]:
+    """Inclusive first and last cube row the GCP lattice spans.
+
+    The whole cube unless `gcp_rows` names a sub-range and `gcp_row_margin` is non-negative, in
+    which case the lattice is clipped to those rows plus that margin either side.
+
+    >>> from types import SimpleNamespace
+    >>> _lattice_row_bounds(14400, SimpleNamespace(gcp_rows=(4350, 6100), gcp_row_margin=-1))
+    (0, 14399)
+    >>> _lattice_row_bounds(14400, SimpleNamespace(gcp_rows=(4350, 6100), gcp_row_margin=0))
+    (4350, 6100)
+    >>> _lattice_row_bounds(14400, SimpleNamespace(gcp_rows=(4350, 6100), gcp_row_margin=1000))
+    (3350, 7100)
+    >>> _lattice_row_bounds(14400, SimpleNamespace(gcp_rows=None, gcp_row_margin=250))
+    (0, 14399)
+    >>> _lattice_row_bounds(500, SimpleNamespace(gcp_rows=(100, 400), gcp_row_margin=9999))
+    (0, 499)
+    """
+    if cfg.gcp_rows is None or cfg.gcp_row_margin < 0:
+        return 0, ny - 1
+    row0, row1 = cfg.gcp_rows
+    return max(0, row0 - cfg.gcp_row_margin), min(ny - 1, row1 + cfg.gcp_row_margin)
+
+
 def gcp_lattice(fgeom, ny, nx, cfg):
     """Camera (row, col) -> map (x, y) lattice from the supplied geometry csv, uncorrected.
 
@@ -809,11 +987,21 @@ def gcp_lattice(fgeom, ny, nx, cfg):
     cube (`POLE_LAT_BAND` mirrors its per-pole `extent`), or GCP `row` stops lining up with the
     cube's own rows.
     """
-    glon, glat, _ = utils.geom2grid(fgeom, (-180, 180, *POLE_LAT_BAND[cfg.pole]))
+    lat_band = cfg.lat_band or POLE_LAT_BAND[cfg.pole]
+    glon, glat, _ = utils.geom2grid(fgeom, (-180, 180, *lat_band))
+    # `lat_band` has to be the crop the cube was built with. Too narrow and this indexes off the
+    # end; too wide and the truncation below silently pairs each row with the wrong latitude, which
+    # shows up as the whole product shifted rather than as an error.
+    if len(glon) < ny:
+        raise ValueError(
+            f"lat_band {lat_band} spans {len(glon)} geometry rows but the cube has {ny} -- "
+            "pass the crop the cube was built with as GeorefConfig.lat_band"
+        )
     glon, glat = glon[:ny], glat[:ny]
-    # The last row must be a GCP row: arange(0, ny, row_step) stops short, leaving the final ~1 km
-    # beyond every GCP where GDAL's TPS extrapolates freely -- i.e. the along-track image edge.
-    rows = np.unique(np.r_[np.arange(0, ny, cfg.row_step), ny - 1])
+    r0, r1 = _lattice_row_bounds(ny, cfg)
+    # The bounding rows must themselves be GCP rows: arange stops short of r1, leaving the last
+    # ~1 km beyond every GCP where GDAL's TPS extrapolates freely.
+    rows = np.unique(np.r_[np.arange(r0, r1 + 1, cfg.row_step), r1])
     cols = np.unique(np.linspace(0, nx - 1, cfg.ncol).astype(int))
     jj, ii = np.meshgrid(rows, cols, indexing="ij")
     x, y = to_stereo(cfg.pole).transform(glon[jj, ii], glat[jj, ii])
@@ -1061,7 +1249,7 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
     info["coarse"] = cinfo
     x, y = x + dx, y + dy
 
-    iters, converged = [], False
+    iters, converged, prev_p95 = [], False, np.inf
     for k in range(1, cfg.niter + 1):
         t_iter = time.time()
         img = project(band, _to_gcps(jj, ii, x, y), cfg)
@@ -1094,9 +1282,11 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
             print(iters[-1], flush=True)
         # p95 of iteration k is the residual measured on product k-1; under a pixel means the
         # product this iteration just produced is converged.
-        if p95 < cfg.p95_stop_m:
+        plateau = (prev_p95 - p95) < cfg.p95_plateau_frac * prev_p95  # False at k=1 (prev is inf)
+        if p95 < cfg.p95_stop_m and k >= cfg.min_iter and (not cfg.p95_plateau_frac or plateau):
             converged = True
             break
+        prev_p95 = p95
 
     xs, ys, tr, _ = grid_of(cfg)
     return Registration(
