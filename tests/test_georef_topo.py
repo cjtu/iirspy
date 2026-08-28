@@ -167,3 +167,66 @@ def test_load_lola_elev_scales_gld100_unscaled_and_fills_its_nodata(tmp_path):
     assert z[0, 0] == 100.0  # unity scale, no radius offset -- not the LOLA 0.5/1737400 rule
     assert z[1, 1] == 400.0
     assert z[1, 0] == pytest.approx(np.median([100.0, 200.0, 400.0]))  # flat fill, not a -32 km pit
+
+
+def test_displacement_field_falls_back_to_the_bulk_median_on_collinear_tie_points():
+    """A low-texture chunk can leave tie points on a line; the TPS trend term is then rank-deficient.
+
+    scipy raises `LinAlgError` rather than returning a degenerate fit, so an uncaught one aborts the
+    whole scene solve.
+    """
+    import pandas as pd
+
+    from iirspy.georef import GeorefConfig, displacement_field
+
+    cfg = GeorefConfig()
+    q = np.array([[-4e5, -8.5e5], [-3e5, -7e5]])  # on and far off the support
+    # n=1 and n=2 raise ValueError (too few for the trend term), 10 collinear raise LinAlgError;
+    # every one of them must degrade to the bulk median rather than propagate.
+    for n in (1, 2, 10):
+        tp = pd.DataFrame({
+            "X_MAP": np.full(n, -4e5),  # one column of points: no independent x spread
+            "Y_MAP": np.linspace(-9e5, -8e5, n),
+            "X_SHIFT_PX": np.linspace(-1.0, 1.0, n),
+            "Y_SHIFT_PX": np.full(n, 0.5),
+        })
+        fieldfn, info = displacement_field(tp, cfg)
+
+        assert "tps_unfittable" in info["degenerate"], n
+        assert np.allclose(fieldfn(q), [np.median(tp.X_SHIFT_PX) * cfg.ps, -0.5 * cfg.ps]), n
+
+
+def test_gcp_lattice_samples_the_geometry_spline_at_the_right_rows(tmp_path):
+    """The lattice evaluates the geometry TPS only where GCPs go, so row->Scan must line up.
+
+    A linear geometry is reproduced exactly by a thin-plate spline, so the lattice's lon/lat are
+    analytic and a row/Scan off-by-one fails hard instead of shifting the product slightly.
+    """
+    from dataclasses import replace
+
+    import pandas as pd
+
+    scan0, ny, nx = 500, 200, 250  # cube row r is geometry Scan scan0 + r
+    scans = np.arange(scan0, scan0 + ny)
+    pixels = np.array([0, 50, 100, 150, 200, nx - 1])  # the 6-point cross-track sampling
+    pg, sg = np.meshgrid(pixels, scans)
+    lon = 0.01 * pg + 0.002 * sg  # linear: reproduced exactly by a thin-plate spline
+    lat = -60.0 + 0.001 * sg
+    fgeom = tmp_path / "geom.csv"
+    pd.DataFrame({
+        "Pixel": pg.ravel(),
+        "Scan": sg.ravel(),
+        "Longitude": lon.ravel(),
+        "Latitude": lat.ravel(),
+    }).to_csv(fgeom, index=False)
+
+    cfg = replace(georef.GeorefConfig(), pole="equatorial", lat_band=(lat.min(), lat.max()), row_step=25, ncol=13)
+    jj, ii, x, y = georef.gcp_lattice(fgeom, ny, nx, cfg)
+
+    want_lon = 0.01 * ii + 0.002 * (scan0 + jj)
+    want_lat = -60.0 + 0.001 * (scan0 + jj)
+    wx, wy = georef.to_stereo(cfg.pole).transform(want_lon, want_lat)
+    assert np.allclose(x, wx, atol=1e-3) and np.allclose(y, wy, atol=1e-3)  # sub-mm, on metres
+
+    with pytest.raises(ValueError, match="pass the crop the cube was built with"):
+        georef.gcp_lattice(fgeom, ny + 50, nx, cfg)  # geometry shorter than the cube it is given

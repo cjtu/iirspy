@@ -757,11 +757,12 @@ wheels = [
 
 [[package]]
 name = "iirspy"
-version = "0.0.5"
+version = "0.0.6"
 source = { editable = "." }
 dependencies = [
     { name = "bottleneck" },
     { name = "dask" },
+    { name = "issdc" },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "opencv-python" },
@@ -775,11 +776,6 @@ dependencies = [
     { name = "spiceypy" },
     { name = "xarray" },
     { name = "xarray-regrid" },
-]
-
-[package.optional-dependencies]
-download = [
-    { name = "issdc" },
 ]
 
 [package.dev-dependencies]
@@ -800,7 +796,7 @@ dev = [
 requires-dist = [
     { name = "bottleneck", specifier = ">=1.5.0" },
     { name = "dask", specifier = ">=2025.2.0" },
-    { name = "issdc", marker = "extra == 'download'", git = "https://github.com/cjtu/issdc-requester" },
+    { name = "issdc", git = "https://github.com/cjtu/issdc-requester" },
     { name = "matplotlib", specifier = ">=3.9.4" },
     { name = "numpy", specifier = ">=2.0.2" },
     { name = "opencv-python", specifier = ">=4.11.0.86" },
@@ -815,7 +811,6 @@ requires-dist = [
     { name = "xarray", specifier = ">=2024.7.0" },
     { name = "xarray-regrid", specifier = ">=0.4.0" },
 ]
-provides-extras = ["download"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -912,8 +907,8 @@ wheels = [
 
 [[package]]
 name = "issdc"
-version = "0.2.1"
-source = { git = "https://github.com/cjtu/issdc-requester#635af1000011d98206000ffe784a901f84b764ac" }
+version = "0.4.3"
+source = { git = "https://github.com/cjtu/issdc-requester#b0acea0f2661e6ba6e487926b861016c61833065" }
 dependencies = [
     { name = "requests" },
     { name = "tqdm" },

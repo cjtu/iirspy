@@ -1,10 +1,9 @@
 """
 Co-register an IIRS strip to LOLA topography and hand back GCPs + a geotransform.
 
-The supplied geometry csv is off by 4.8-8.8 km at the lunar south pole, and the error does not
-share a sign between scenes, so every scene needs its own solve. This module runs that solve and
-returns the result as ground control points in *camera* space, so the pipeline can produce a
-registered L1/L2 with a single resample of the raw band -- never a resample of a resample.
+The supplied geometry csv is off by up to 10 km, particularly at the poles. Use image feature
+matching to produce ground control points in camera (x,y) space, so the pipeline can produce a
+registered L1/L2 directly from the GCPs.
 
     reference   two-tier tangent-plane hillshade rendered from LOLA at the scene's SPICE sun
     coarse      unbounded masked phase correlation, injection-gated  (kills the 5-9 km bulk error)
@@ -16,12 +15,8 @@ Typical use:
     reg = register("ch2_iir_<sid>_l1_polar.tif", fgeom, fspm, cfg)
     arr = warp(cube, reg, cfg)             # (band, y, x) on reg.transform / reg.crs
 
-The matcher needs `arosics`, which needs `osgeo.gdal`, which PyPI does not ship. `register` handles
-that itself: where arosics is not importable it runs the solve in a conda env through
-:mod:`iirspy.coreg` (see that module). Everything else here -- DEM, hillshade, horizons, GCP
-lattice, warp -- is pure PyPI.
-
-Method and measurements: local-workspace/arosics/REPORT.md.
+The matcher needs `arosics`, which needs `osgeo.gdal`, which needs conda. `register` handles
+that (if arosics not importable it runs the solve in a conda env through :mod:`iirspy.coreg`).
 """
 
 import importlib.util
@@ -109,39 +104,29 @@ class GeorefConfig:
     coarse_dec: int = 4  # decimation; 160 m/px keeps the unbounded search fast
     inject_px: tuple = ((30, -20), (-45, 25))  # injected control shifts, at the decimated scale
     inject_tol_px: int = 3
+    # How far the initial shift can look (capped at ~2x the largest geometry error, ~9 km)
+    coarse_max_m: float = 20_000.0
+
+    # --- quality gates
+    # Fraction of tie-point candidates that must survive reliability check for chunk to be registered
+    min_match_frac: float = 0.10  # Registered chunks keep 0.68-0.86, broken ones keep 0.003-0.009
+    min_kept: int = 50  # a p95 over fewer points than this is not evidence of convergence
 
     # --- tie points
     niter: int = 5
-    p95_stop_m: float = 20.0  # 1/2 output px; the matcher floor is 18.6-19.2 m
-    # The residual plateaus well before it crosses `p95_stop_m`, and the threshold sits inside that
-    # plateau (chunk 8 of the south run: p95 24.4 -> 21.0 -> 20.2 -> 19.8 over three iterations that
-    # cost ~300 s each), so which iteration trips it is close to a coin flip -- 26 of 43 archive
-    # scenes finish between 17 and 20 m. With `p95_plateau_frac` set, `p95_stop_m` demotes to a
-    # sanity ceiling and the stop is instead "p95 improved by less than this fraction of the
-    # previous iteration's". `min_iter` is the floor: `mad_from_iter + 1` guarantees at least one
-    # MAD-culled field is applied *and* its effect measured (two of nine chunks in the validated
-    # south run stopped at iteration 2, so no MAD cull ever ran). Both off by default.
-    p95_plateau_frac: float = 0.0  # 0 = off
-    min_iter: int = 0  # 0 = off
+    p95_stop_m: float = 18.0  # Stop if the p85 error is below this, e.g. fit already excellent
+    p95_plateau_frac: float = 0.02  # Stop if fit improved by less than this fraction per iter (0 = off)
+    min_iter: int = 0  # Minimum number of iterations (0 = off)
     win: int = 128  # px = 5.1 km matching window
     grid_res: int = 40  # px = 1.6 km tie-point spacing
     max_shift: dict = field(default_factory=lambda: {1: 50, 2: 15, 3: 6, 4: 4})  # px, then floor
     min_reliability: int = 30
-    # RELIABILITY is blind to both of the failures below -- it is *highest* exactly where the
-    # match is worst. Measured on chunk 0 of the south run by injecting a known (3, -4) px shift
-    # and re-matching (local-workspace/arosics_edge_optimizer):
-    #   reference window >90% shadowed : reliability 80-83 (top of any bin), median error 4.9 px
-    #   centre <1 km from the swath edge: only 10% survive, and 58% of those are >1 px wrong
-    # A shadowed reference window is constant, so its cross-power spectrum is DC-dominated and
-    # peaks sharply at a shift that means nothing; a window straddling the swath edge is shrunk
-    # by arosics (down to 16 px) until it no longer holds enough terrain to match on.
-    edge_reject_m: float = 0.0  # 0 = off; drop points this close to the target's nodata edge
-    shadow_max: float = 1.0  # 1 = off; drop points whose reference window is more shadowed
-    # A second pass at half `grid_res` within this far of the swath edge, `win` unchanged. The
-    # uniform grid is anchored to the array origin, so the outermost point lands up to grid_res
-    # (1.6 km) inboard of where the window quality actually runs out; halving the spacing there
-    # halves that loss. Shrinking `win` instead is measured worse everywhere (win 64: 20% of kept
-    # points >1 px wrong vs 14%; win 48: 31%) -- the window, not the grid, is what carries terrain.
+    edge_reject_m: float = 1000  # 0 = off; drop tie points within this dist of the swath's nodata (edge or shadow)
+    shadow_max: float = 0.75  # 1 = off; drop points whose reference window is more shadowed than this
+    # Second pass at half `grid_res` within this far of the swath edge, `win` unchanged: the grid is
+    # anchored to the array origin, so the outermost point can sit a full grid_res inboard of where
+    # window quality runs out. Widening the margin this way beats shrinking `win`, which carries the
+    # terrain the match needs.
     edge_dense_m: float = 0.0  # 0 = off
     grad: bool = True  # match on gradient magnitude, not radiance
     grad_sigma: float = 1.0
@@ -149,33 +134,21 @@ class GeorefConfig:
     mad_k: float = 3.0
 
     # --- displacement field
-    decay_m: float = 5_000.0  # blend to the bulk median outside tie-point support
-    # What the field decays *to* off-support. The bulk median is one constant for the whole chunk,
-    # so the swath margin -- which sits entirely inside `decay_m` -- gets no local information at
-    # all, which is the visible edge offset. With `edge_fit_k` > 0 the fallback is instead a plane
-    # least-squares-fitted to the k nearest tie points, so the margin keeps the local level *and*
-    # the local gradient. Clipped to those k points' own range, because support at a swath edge is
-    # always one-sided and an unclipped plane extrapolates without bound.
-    edge_fit_k: int = 0  # 0 = off, use the bulk median
+    # how to treat pixels far from identified tie points
+    decay_m: float = 5_000.0  # distance at which the field falls back on overall median (or local plane)
+    # Edge fit substitutes a local plan for the bulk median so swath margin trusts local tie points over global
+    edge_fit_k: int = 8  # 0 = off, use the bulk median
     smooth_cv: bool = True  # pick TPS regularisation by k-fold CV
     smooth_fixed: float = 1.0  # used when smooth_cv is False
 
     # --- GCP lattice
     ncol: int = 13  # cross-track GCP columns; 6 undersamples the smile
-    # Along-track GCP spacing in image rows; 25 rows is ~2 km, fine enough to carry the
-    # tie-point field (1.6 km spacing) without resampling it away.
-    row_step: int = 25
-    # The latitude crop the cube being registered was built with. Must match it exactly or GCP row
-    # stops mapping to the right latitude and the whole product shifts. None falls back to the
-    # `POLE_LAT_BAND` global, which is only right when the caller has already set it.
+    row_step: int = 25  # Along-track GCP spacing (rows); 25 is ~2km, so minimal resampling at 1.6 km tie-point spacing
+    # The latitude crop of current cube (needed to compute offset from raw to computed GCP grid)
     lat_band: tuple | None = None
-    # The rows this solve actually cares about (a chunk's row0, row1), and how many rows either
-    # side of them to keep in the lattice; -1 keeps the whole cube. Clipping cuts the per-iteration
-    # TPS cost, which grows cubically in GCP count. At 250 both measured chunks matched a full
-    # lattice in every along-track slab at ~2.5x the speed, while a margin of 0 left an 89 m
-    # residual in the trailing slab (local-workspace/alliance_georef_pipeline/runs/margin_test.json).
+    # The chunk rows this solve cares about (rows outside chunk mostly irrelevant after small margin)
     gcp_rows: tuple | None = None
-    gcp_row_margin: int = 250
+    gcp_row_margin: int = 250  # px, margin around gcp_rows to keep in the lattice; -1 = keep all rows
 
     def __post_init__(self):
         # json round-trips (iirspy.coreg) stringify the keys of max_shift
@@ -664,25 +637,49 @@ def grad_mag(a, m, sigma):
     return np.hypot(gy, gx), binary_erosion(m, iterations=int(np.ceil(3 * sigma)) + 1)
 
 
+def _bounded_peak(xcorr, shape, cap_px):
+    """Peak of a full-mode masked cross-correlation, searched only within `cap_px` of no shift.
+
+    `cross_correlate_masked(moving, reference, ..., mode="full")` holds shift `s` at index
+    `reference.shape - 1 - s`, so the admissible shifts are one contiguous window of `xcorr`.
+
+    >>> x = np.zeros((9, 9)); x[4, 4] = 1.0; x[0, 0] = 5.0  # zero shift, and a taller peak at +4
+    >>> [float(v) for v in _bounded_peak(x, (5, 5), 4)]
+    [4.0, 4.0]
+    >>> [float(v) for v in _bounded_peak(x, (5, 5), 2)]
+    [0.0, 0.0]
+    """
+    ny, nx = shape
+    r0, c0 = max(ny - 1 - cap_px, 0), max(nx - 1 - cap_px, 0)
+    win = xcorr[r0 : min(ny + cap_px, xcorr.shape[0]), c0 : min(nx + cap_px, xcorr.shape[1])]
+    i, j = np.unravel_index(np.argmax(win), win.shape)
+    return np.array([ny - 1 - (i + r0), nx - 1 - (j + c0)], dtype=float)
+
+
 def coarse_shift(img, ref, cfg):
     """
-    Unbounded masked phase correlation, with an injected-shift control gate.
+    Masked phase correlation bounded to `coarse_max_m`, with an injected-shift control gate.
 
-    The geometry error is 5-9 km, far past any bounded search, so this searches all shifts at
-    `coarse_dec` decimation. Every number is gated: inject a known shift, re-measure, and require
-    the answer to move by that much. Returns (dx_m, dy_m, info).
+    The geometry error is 5-9 km, so the search runs at `coarse_dec` decimation and the peak is
+    taken only within `coarse_max_m`; a low-contrast pair otherwise peaks on a nearly-disjoint
+    overlap and returns a shift that puts the swath outside its own AOI.
+
+    Every number is gated: inject a known shift, re-measure, and require the answer to move by that
+    much. Returns (dx_m, dy_m, info). A shift whose controls fail is reported but not applied, and
+    `_quality` marks the chunk rejected.
     """
-    from skimage.registration import phase_cross_correlation
+    from skimage.registration._masked_phase_cross_correlation import cross_correlate_masked
 
     d = cfg.coarse_dec
     a, b = img[::d, ::d], ref[::d, ::d]
+    cap_px = round(cfg.coarse_max_m / (cfg.ps * d))
 
     def measure(x, y):
         mx, my = np.isfinite(x), np.isfinite(y)
         xs = np.where(mx, (x - x[mx].mean()) / (x[mx].std() + 1e-9), 0)
         ys = np.where(my, (y - y[my].mean()) / (y[my].std() + 1e-9), 0)
-        s, _, _ = phase_cross_correlation(ys, xs, reference_mask=my, moving_mask=mx, overlap_ratio=0.15)
-        return np.asarray(s, dtype=float)
+        xcorr = cross_correlate_masked(xs, ys, mx, my, axes=(0, 1), mode="full", overlap_ratio=0.15)
+        return _bounded_peak(xcorr, ys.shape, cap_px)
 
     base = measure(a, b)
     controls, ok = [], []
@@ -692,14 +689,18 @@ def coarse_shift(img, ref, cfg):
         controls.append({"inject": [dy, dx], "change": [round(got[0], 1), round(got[1], 1)], "passed": passed})
         ok.append(passed)
     ps = cfg.ps * d
+    dx_m, dy_m = float(base[1] * ps), float(-base[0] * ps)
+    accepted = bool(all(ok))
     return (
-        float(base[1] * ps),
-        float(-base[0] * ps),
+        dx_m if accepted else 0.0,
+        dy_m if accepted else 0.0,
         {
             "shift_px": [round(base[0], 1), round(base[1], 1)],
-            "shift_km": [round(base[1] * ps / 1e3, 2), round(-base[0] * ps / 1e3, 2)],
+            "shift_km": [round(dx_m / 1e3, 2), round(dy_m / 1e3, 2)],
+            "search_cap_px": cap_px,
             "controls": controls,
             "trustworthy": all(ok),
+            "accepted": accepted,
         },
     )
 
@@ -760,7 +761,8 @@ def _coreg_pass(gref, gtgt, cfg, max_shift_px, grid_res, bad_tgt=None):
         **kw,
     )
     tp = crl.CoRegPoints_table
-    return tp[(gtgt.nodata != tp.ABS_SHIFT) & tp.X_SHIFT_PX.notna() & (cfg.min_reliability <= tp.RELIABILITY)]
+    kept = tp[(gtgt.nodata != tp.ABS_SHIFT) & tp.X_SHIFT_PX.notna() & (cfg.min_reliability <= tp.RELIABILITY)]
+    return kept, len(tp)  # unfiltered length is the denominator of `match_frac`
 
 
 def tie_points(ref, tgt, transform, cfg, max_shift_px):
@@ -786,16 +788,17 @@ def tie_points(ref, tgt, transform, cfg, max_shift_px):
     mk = lambda arr, m: GeoArray(_standardize(arr, m, nodata), geotransform=gt, projection=proj, nodata=nodata)
     gref, gtgt = mk(r, rm), mk(t, tm)
 
-    tp = _coreg_pass(gref, gtgt, cfg, max_shift_px, cfg.grid_res)
+    tp, n_cand = _coreg_pass(gref, gtgt, cfg, max_shift_px, cfg.grid_res)
     dist = edge_dist_m(tm, abs(transform.a))
     if cfg.edge_dense_m and cfg.grid_res > 1:
         # Split rather than concatenate: the half-spacing grid is a superset of the coarse one
         # (both anchored at the array origin), so taking the coarse pass outside the margin and
         # the dense pass inside it covers every point exactly once.
         margin = dist <= cfg.edge_dense_m
-        dense = _coreg_pass(gref, gtgt, cfg, max_shift_px, cfg.grid_res // 2, bad_tgt=~margin)
+        dense, n_dense = _coreg_pass(gref, gtgt, cfg, max_shift_px, cfg.grid_res // 2, bad_tgt=~margin)
         keep = [tp[~margin[_rowcol(tp, transform, tm.shape)]], dense[margin[_rowcol(dense, transform, tm.shape)]]]
         tp = pd.concat(keep, ignore_index=True)
+        n_cand += n_dense
 
     row, col = _rowcol(tp, transform, tm.shape)
     if cfg.edge_reject_m:
@@ -803,7 +806,7 @@ def tie_points(ref, tgt, transform, cfg, max_shift_px):
         row, col = _rowcol(tp, transform, tm.shape)
     if cfg.shadow_max < 1.0:
         tp = tp[_window_shadow(ref, row, col, cfg.win) <= cfg.shadow_max]
-    return tp
+    return tp, n_cand
 
 
 def _reject_shift_cap(tp, cap_px):
@@ -895,24 +898,34 @@ def displacement_field(tp, cfg):
     The GCP lattice spans the whole strip but tie points exist only where it crosses the AOI. A TPS
     diverges outside its control-point hull, so beyond the support the field blends to the bulk
     median with a Gaussian in distance-to-nearest.
+
+    A low-texture chunk can leave too few, or too degenerately placed, tie points to fit a spline
+    at all; those iterations fall back to the bulk median shift and say so in `info["degenerate"]`.
+    They cannot reach `converged`, which needs `cfg.min_kept` points.
     """
     pts = tp[["X_MAP", "Y_MAP"]].to_numpy(float)
     disp = np.c_[tp.X_SHIFT_PX.to_numpy(float) * cfg.ps, -tp.Y_SHIFT_PX.to_numpy(float) * cfg.ps]
     bulk = np.median(disp, axis=0)
     info = {"n": len(pts), "bulk_m": [round(float(bulk[0]), 1), round(float(bulk[1]), 1)]}
-    if len(tp) < 3:  # too few for a spline; the bulk shift is the trustworthy part anyway
-        return (lambda q: np.repeat(bulk[None], len(q), axis=0)), info
 
     smooth = cfg.smooth_fixed
     if cfg.smooth_cv:
+        t0 = time.time()
         smooth, cv_rms, base_rms = choose_smoothing(pts, disp)
         info |= {
             "smoothing": smooth,
             "cv_rms_m": round(cv_rms, 1),
             "bulk_median_rms_m": round(base_rms, 1),
             "beats_bulk": bool(cv_rms < base_rms),
+            "smooth_s": round(time.time() - t0, 2),  # 125 dense O(n^3) fits; grows fast with `n`
         }
-    rbf = RBFInterpolator(pts, disp, kernel="thin_plate_spline", smoothing=smooth)
+    try:
+        rbf = RBFInterpolator(pts, disp, kernel="thin_plate_spline", smoothing=smooth)
+    except (np.linalg.LinAlgError, ValueError) as e:
+        # The TPS trend term (1, x, y) needs 3 points spanning a plane: scipy raises ValueError
+        # below 3 and LinAlgError when they are collinear. Return bulk shift where spline fails.
+        info["degenerate"] = f"tps_unfittable: {e}".rstrip(". ")
+        return (lambda q: np.repeat(bulk[None], len(q), axis=0)), info
     tree = cKDTree(pts)
     far = _local_plane(pts, disp, tree, cfg.edge_fit_k) if cfg.edge_fit_k else None
     info["off_support"] = f"local_plane_k{cfg.edge_fit_k}" if far else "bulk_median"
@@ -991,23 +1004,24 @@ def gcp_lattice(fgeom, ny, nx, cfg):
     cube's own rows.
     """
     lat_band = cfg.lat_band or POLE_LAT_BAND[cfg.pole]
-    glon, glat, _ = utils.geom2grid(fgeom, (-180, 180, *lat_band))
-    # `lat_band` has to be the crop the cube was built with. Too narrow and this indexes off the
-    # end; too wide and the truncation below silently pairs each row with the wrong latitude, which
-    # shows up as the whole product shifted rather than as an error.
-    if len(glon) < ny:
+    extent = (-180, 180, *lat_band)
+    # `lat_band` must be the crop the cube was built with to align GCPs with original rows
+    _, xyext = utils.parse_geom(fgeom, extent)
+    scan0, n_geom_rows = xyext[2], xyext[3] - xyext[2] + 1
+    if n_geom_rows < ny:
         raise ValueError(
-            f"lat_band {lat_band} spans {len(glon)} geometry rows but the cube has {ny} -- "
+            f"lat_band {lat_band} spans {n_geom_rows} geometry rows but the cube has {ny} -- "
             "pass the crop the cube was built with as GeorefConfig.lat_band"
         )
-    glon, glat = glon[:ny], glat[:ny]
     r0, r1 = _lattice_row_bounds(ny, cfg)
     # The bounding rows must themselves be GCP rows: arange stops short of r1, leaving the last
     # ~1 km beyond every GCP where GDAL's TPS extrapolates freely.
     rows = np.unique(np.r_[np.arange(r0, r1 + 1, cfg.row_step), r1])
     cols = np.unique(np.linspace(0, nx - 1, cfg.ncol).astype(int))
+    # Cube row r is geometry Scan scan0 + r.
+    glon, glat, _ = utils.geom2grid(fgeom, extent, xs=cols, ys=scan0 + rows)
     jj, ii = np.meshgrid(rows, cols, indexing="ij")
-    x, y = to_stereo(cfg.pole).transform(glon[jj, ii], glat[jj, ii])
+    x, y = to_stereo(cfg.pole).transform(glon, glat)
     return jj, ii, x, y
 
 
@@ -1082,28 +1096,16 @@ def data_window(arr, pad=8):
 def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None):
     """One reproject of a camera-space band -- or a whole (band, y, x) cube -- onto the AOI grid.
 
-    Pass the cube, not one band at a time: GDAL solves the ~1300-point thin-plate spline once per
-    call, and that solve is essentially the entire cost (measured 5x on a 5-band cube; identical
-    pixels where both are finite). `window` crops the output to (r0, r1, c0, c1) of the AOI grid,
-    which for a cube is the difference between a few GB and tens of them -- a strip covers ~10% of
-    the AOI. The transformer is exact, so a windowed warp equals the same window of a full one.
-
-    SRC_METHOD=GCP_TPS: a plain GCP list makes GDAL fit one global polynomial, which smooths the
-    correction away; TPS interpolates the GCPs instead. The option must be spelled SRC_METHOD --
-    rasterio 1.4 honoured METHOD as well, 1.5 silently ignores it (corr 0.9918 -> 0.9581).
-
-    tolerance=0 is the exact transformer. rasterio defaults to 0.125, i.e. the TPS is replaced by a
-    polynomial fitted per destination chunk to within an eighth of a pixel -- 5 m of slop at 40
-    m/px against a solve whose p95 is 16.6 m, and worse, the chunking follows the output extent, so
-    the same scene warped at two windows disagrees (measured max 0.24 in reflectance).
+    Pass the cube, not one band at a time: GDAL solves the warp once per call.
+    - `window` crops the output to (r0, r1, c0, c1) of the AOI grid (down from several GB strip).
+    - SRC_METHOD=GCP_TPS: thin-plate-spline interpolation.
+    - tolerance=0 is the exact transformer (rasterio's default 0.125 replaces TPS with a
+    polynomial fitted within an eighth of a pixel which added 5 m of noise at 40 m/px)
     """
     shape, tr = window_of(cfg, window)
     shape = np.shape(band)[:-2] + shape
-    # A cube covering most of the AOI is 12+ GB of destination, which a 23 GB box cannot hold
-    # alongside the source. Splitting the call into band groups would be the obvious fix and is
-    # wrong: GDAL's multi-band warp masks a band with a small valid footprint down toward the
-    # others, so which bands share a call changes the nodata pattern. Spill to disk instead and
-    # keep every band in one call.
+    # Every band must stay in one call to avoid solving the warp repeatedly, but full AOI cube is
+    # multiple GB, so spill to disk if it exceeds MAX_RAM_BYTES.
     out: np.ndarray
     if np.prod(shape) * 4 > MAX_RAM_BYTES:
         tmp = tempfile.NamedTemporaryFile(suffix=".f32", delete=False)  # noqa: SIM115
@@ -1123,7 +1125,7 @@ def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None):
         src_nodata=np.nan,
         dst_nodata=np.nan,
         tolerance=0.0,
-        num_threads=os.cpu_count() or 1,  # the exact TPS is ~1700 gcps per destination pixel
+        num_threads=len(os.sched_getaffinity(0)),  # parallize warp kernel over available cores
         SRC_METHOD="GCP_TPS",
     )
     return out
@@ -1216,6 +1218,86 @@ def _register_subprocess(ftif, fgeom, fspm, cfg, kernels, reference, verbose):
     )
 
 
+def _stop_iterating(k: int, p95: float, prev_p95: float, cfg: GeorefConfig, n_kept: int) -> tuple[bool, str | None]:
+    """Whether iteration `k`'s residual is good enough to stop, and why.
+
+    Two independent exits, both gated by `min_iter` (0 = no floor): `p95_stop_m` is a tight
+    "this solve is already excellent" fast exit; `p95_plateau_frac` is the default day-to-day
+    exit -- stop once p95 is no longer improving by more than that fraction of the previous
+    iteration, regardless of its absolute value.
+
+    Neither exit fires on fewer than `min_kept` tie points: a p95 only describes the points it was
+    measured on, so a handful of them can show an excellent residual on a mis-locked chunk.
+
+    >>> from dataclasses import replace
+    >>> cfg = replace(GeorefConfig(), p95_stop_m=18.0, p95_plateau_frac=0.02, min_iter=0)
+    >>> _stop_iterating(1, 15.0, float("inf"), cfg, 800)  # under the floor -- fast exit
+    (True, 'threshold')
+    >>> _stop_iterating(2, 19.0, 19.1, cfg, 800)  # barely moved, still above the floor
+    (True, 'plateau')
+    >>> _stop_iterating(2, 19.0, 25.0, cfg, 800)  # still improving fast -- keep going
+    (False, None)
+    >>> _stop_iterating(1, 10.0, float("inf"), replace(cfg, min_iter=2), 800)  # min_iter floor
+    (False, None)
+    >>> _stop_iterating(1, 15.0, float("inf"), cfg, 4)  # excellent p95, but over 4 points
+    (False, None)
+    """
+    if k < cfg.min_iter or n_kept < cfg.min_kept:
+        return False, None
+    if p95 < cfg.p95_stop_m:
+        return True, "threshold"
+    if cfg.p95_plateau_frac and (prev_p95 - p95) < cfg.p95_plateau_frac * prev_p95:
+        return True, "plateau"
+    return False, None
+
+
+def _quality(iters, cinfo, cfg):
+    """Whether this solve registered at all, judged on tie points rather than on `corr`.
+
+    `corr` measures the projected band against the hillshade, which albedo dominates wherever the
+    terrain is mare/highland, so it cannot separate a registered chunk from a mis-locked one. The
+    fraction of tie-point candidates kept can.
+
+    >>> from dataclasses import replace
+    >>> cfg = replace(GeorefConfig(), min_match_frac=0.10, min_kept=50)
+    >>> ok = {"accepted": True}
+    >>> _quality([{"n_kept": 1080, "match_frac": 0.68}], ok, cfg)["rejected"]
+    False
+    >>> _quality([{"n_kept": 12, "match_frac": 0.009}], ok, cfg)["reason"]
+    'match_frac 0.009 < 0.1'
+    >>> _quality([{"n_kept": 1080, "match_frac": 0.68}], {"accepted": False}, cfg)["reason"]
+    'coarse shift refused'
+    >>> _quality([], ok, cfg)["reason"]
+    'no iterations'
+    """
+    last = iters[-1] if iters else {}
+    frac, n_kept = last.get("match_frac"), last.get("n_kept", 0)
+    if not iters:
+        reason = "no iterations"
+    elif not cinfo.get("accepted", True):
+        reason = "coarse shift refused"
+    elif frac is not None and frac < cfg.min_match_frac:
+        reason = f"match_frac {frac} < {cfg.min_match_frac}"
+    elif n_kept < cfg.min_kept:
+        reason = f"n_kept {n_kept} < {cfg.min_kept}"
+    else:
+        reason = None
+    return {
+        "match_frac": frac,
+        "n_kept": n_kept,
+        "coarse_accepted": cinfo.get("accepted"),
+        "rejected": reason is not None,
+        "reason": reason,
+    }
+
+
+def _best_iterate(best_p95, best_xy, last_p95, x, y):
+    """The best-p95 lattice seen this solve if it beats the last iterate, else `(x, y)` as-is."""
+    if best_xy is not None and best_p95 < last_p95:
+        return (*best_xy, "best_iterate_fallback")
+    return x, y, None
+
+
 def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False):
     """
     Solve a scene's registration against LOLA. Returns a :class:`Registration`.
@@ -1241,28 +1323,42 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
         ref, hs_info = render_reference(fgeom, fspm, cfg, kernels)
         info["reference"] = hs_info
 
+    t0 = time.time()
     band = read_band(ftif, cfg.band)
     ny, nx = band.shape
     jj, ii, x, y = gcp_lattice(fgeom, ny, nx, cfg)
     _, _, tr, _ = grid_of(cfg)
+    info["setup_s"] = round(time.time() - t0, 2)
 
     # base: supplied geometry alone -- what the coarse search is measured on
+    t0 = time.time()
     img = project(band, _to_gcps(jj, ii, x, y), cfg)
+    info["project_s"] = round(time.time() - t0, 2)
+    t0 = time.time()
     dx, dy, cinfo = coarse_shift(img, ref, cfg)
     info["coarse"] = cinfo
+    info["coarse_s"] = round(time.time() - t0, 2)
     x, y = x + dx, y + dy
 
-    iters, converged, prev_p95 = [], False, np.inf
+    iters, converged, converged_reason, prev_p95 = [], False, None, np.inf
+    best_p95, best_xy = np.inf, None
     for k in range(1, cfg.niter + 1):
         t_iter = time.time()
         img = project(band, _to_gcps(jj, ii, x, y), cfg)
-        tp = tie_points(ref, img, tr, cfg, cfg.max_shift_for(k))
+        project_s = time.time() - t_iter
+        tp, n_cand = tie_points(ref, img, tr, cfg, cfg.max_shift_for(k))
         tp = _reject_shift_cap(tp, cfg.max_shift_for(k))
         n_mad, mad_lim = 0, None
         if cfg.mad_from_iter and k >= cfg.mad_from_iter:
             tp, n_mad, mad_lim = _reject_mad(tp, cfg.mad_k, cfg.ps)
         if not len(tp):
-            iters.append({"iter": k, "n_kept": 0, "note": "no tie points", "iter_s": round(time.time() - t_iter, 2)})
+            iters.append({
+                "iter": k,
+                "n_kept": 0,
+                "n_candidates": n_cand,
+                "note": "no tie points",
+                "iter_s": round(time.time() - t_iter, 2),
+            })
             break
 
         d = np.hypot(tp.Y_SHIFT_PX, tp.X_SHIFT_PX).to_numpy(float) * cfg.ps
@@ -1270,26 +1366,37 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
         fieldfn, finfo = displacement_field(tp, cfg)
         s = fieldfn(np.c_[x.ravel(), y.ravel()]).reshape(*x.shape, 2)
         x, y = x + s[..., 0], y + s[..., 1]
+        # Same `min_kept` floor as `_stop_iterating`: a p95 over a handful of points can be the
+        # smallest of the run without the lattice being any good, and this one is handed back.
+        if len(tp) >= cfg.min_kept and p95 < best_p95:
+            best_p95, best_xy = p95, (x.copy(), y.copy())
         iters.append({
             "iter": k,
             "max_shift_px": cfg.max_shift_for(k),
             "n_kept": len(tp),
+            "n_candidates": n_cand,
+            "match_frac": round(len(tp) / n_cand, 3) if n_cand else None,
             "n_mad_rejected": n_mad,
             "mad_limit_m": mad_lim,
             "shift_m": {"median": round(float(np.median(d)), 1), "p95": round(p95, 1)},
             "applied_med_m": round(float(np.median(np.hypot(s[..., 0], s[..., 1]))), 1),
             "field": finfo,
+            # The matcher's own share is iter_s - project_s - field.smooth_s.
+            "project_s": round(project_s, 2),
             "iter_s": round(time.time() - t_iter, 2),
         })
         if verbose:
             print(iters[-1], flush=True)
         # p95 of iteration k is the residual measured on product k-1; under a pixel means the
         # product this iteration just produced is converged.
-        plateau = (prev_p95 - p95) < cfg.p95_plateau_frac * prev_p95  # False at k=1 (prev is inf)
-        if p95 < cfg.p95_stop_m and k >= cfg.min_iter and (not cfg.p95_plateau_frac or plateau):
-            converged = True
+        converged, converged_reason = _stop_iterating(k, p95, prev_p95, cfg, len(tp))
+        if converged:
             break
         prev_p95 = p95
+    else:
+        # Exhausted `niter` without converging -- use the best iterate seen, not blindly the
+        # last, in case a late MAD cull or reweight made p95 worse right at the end.
+        x, y, converged_reason = _best_iterate(best_p95, best_xy, p95, x, y)
 
     xs, ys, tr, _ = grid_of(cfg)
     return Registration(
@@ -1297,7 +1404,14 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
         crs=stereo_crs(cfg.pole),
         transform=tr,
         shape=(len(ys), len(xs)),
-        stats=info | {"iters": iters, "converged": converged, "band": cfg.band},
+        stats=info
+        | {
+            "iters": iters,
+            "converged": converged,
+            "converged_reason": converged_reason,
+            "quality": _quality(iters, cinfo, cfg),
+            "band": cfg.band,
+        },
     )
 
 

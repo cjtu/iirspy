@@ -19,9 +19,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
-import zipfile
+import traceback
 from dataclasses import replace
 from pathlib import Path
 
@@ -128,7 +129,18 @@ def _cached_chunk(out: Path, c: dict, good_corr: float, decay_m: float, tweaks: 
     return None
 
 
-def _stage_inputs(day: str) -> Path:
+def _cube_bands(band: int) -> list[int]:
+    """Bands `build_l1`'s calibration actually touches: PAN_BANDS (broadband dark/flat/smile) plus
+    a +-6 window around `band` (iirs.py's `interpolate_na(..., max_gap=6)` reaches at most that far
+    to fill a masked `band` pixel from its true neighbours -- matches the full-cube interpolation
+    exactly, just without every other band the output never uses).
+    """
+    from iirspy.empirical import PAN_BANDS
+
+    return sorted(set(PAN_BANDS) | set(range(max(1, band - 6), min(256, band + 6) + 1)))
+
+
+def _stage_inputs(day: str, band: int) -> Path:
     """Extract the zip and assemble the one-root PDS tree `L0` reads. Returns the raw cube's path.
 
     Ancillary is staged from every `ANC_ROOT`, not just the archive: without the nci geometry csv
@@ -137,8 +149,10 @@ def _stage_inputs(day: str) -> Path:
     raw_qub = STAGE / f"data/raw/{day}/{ZIP.stem}.qub"
     if not raw_qub.exists():
         log(f"extracting {ZIP.name} -> {STAGE}")
-        with zipfile.ZipFile(ZIP) as zf:
-            zf.extractall(STAGE)
+        bands = ",".join(str(b) for b in _cube_bands(band))
+        subprocess.run(  # noqa: S603
+            [sys.executable, "-m", "issdc_iirs", str(ZIP), "-o", str(STAGE), "--bands", bands], check=True
+        )
     for sub in (
         f"geometry/calibrated/{day}",
         f"miscellaneous/raw/{day}",
@@ -171,6 +185,11 @@ def build_l1(lat_range: tuple[float, float], band: int, ftif_out: Path) -> tuple
     scan_lo/scan_hi into row indices), and the latitudes the returned file actually covers, which
     for a cache hit may be a wider earlier build.
     """
+    # Ancillary only (spm, oat, xml, csv -- excludes the qub by default): a few MB, so cheap enough
+    # to always re-run even on an L1 cache hit. Without this, a cache hit skips `_stage_inputs`
+    # below and STAGE never gets the spm the zip carries, since it does not live in ARCHIVE.
+    subprocess.run([sys.executable, "-m", "issdc_iirs", str(ZIP), "-o", str(STAGE)], check=True)  # noqa: S603
+
     fmeta = ftif_out.with_suffix(".meta.json")
     if ftif_out.exists() and fmeta.exists():
         meta = json.loads(fmeta.read_text())
@@ -183,13 +202,14 @@ def build_l1(lat_range: tuple[float, float], band: int, ftif_out: Path) -> tuple
     from iirspy import L0
 
     day = SID[:8]
-    raw_qub = _stage_inputs(day)
+    raw_qub = _stage_inputs(day, band)
 
     l1 = L0(SID, STAGE, chunk=True).calibrate(
         empirical=True, interp_bands="linear", interp_spatial=True, bad_pixel_mask=True
     )
-    # Calibration needs the full cube for empirical dark/flat detection, but only `band` is saved:
-    # it is the only one `register` and `project` read.
+    # Empirical dark/flat/smile only ever touch PAN_BANDS + `band`'s own neighbourhood (see
+    # _cube_bands), so the staged cube is already that subset. Only `band` is saved: it is the
+    # only one `register` and `project` read.
     l1.img = l1.img.sel(band=[band])
     _, xyext = utils.parse_geom(l1.csv, latlonextent=(-180, 180, *lat_range))
     ymin, ymax = xyext[2], xyext[3]
@@ -339,7 +359,17 @@ def _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, hillshade_on
         log(f"chunk {i}: hillshade {hs_s:.1f}s, shape {ref.shape}")
 
         t0 = time.time()
-        reg = register(ftif, fgeom, fspm, cfg, reference=ref, verbose=True)
+        try:
+            reg = register(ftif, fgeom, fspm, cfg, reference=ref, verbose=True)
+        except Exception as e:
+            # corr=None keeps `_cached_chunk` from reusing the failure, so a re-run re-solves this
+            # chunk; the merge just has no GCPs from its rows. Full traceback goes to the log only.
+            err = f"{type(e).__name__}: {e}"
+            log(f"chunk {i}: FAILED after {time.time() - t0:.1f}s -- {err}")
+            log(traceback.format_exc())
+            fit = {"chunk": i, "band": c["band"], "row0": c["row0"], "row1": c["row1"], "corr": None, "error": err}
+            (OUT / f"chunk{i}_fit.json").write_text(json.dumps(fit, indent=1))
+            continue
         solve_s = time.time() - t0
 
         band_i = read_band(ftif, cfg.band)
@@ -367,10 +397,19 @@ def _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, hillshade_on
             "solve_s": round(solve_s, 2),
             "corr": corr,
             "converged": reg.stats.get("converged"),
+            "converged_reason": reg.stats.get("converged_reason"),
+            "quality": reg.stats.get("quality"),
             "stats": reg.stats,
         }
         (OUT / f"chunk{i}_fit.json").write_text(json.dumps(fit, indent=1, default=str))
-        log(f"chunk {i}: corr={corr}, converged={reg.stats.get('converged')}, solve={solve_s:.1f}s")
+        q = reg.stats.get("quality", {})
+        verdict = f"REJECTED ({q['reason']})" if q.get("rejected") else f"ok match_frac={q.get('match_frac')}"
+        log(
+            f"chunk {i}: {verdict}, corr={corr}, converged={reg.stats.get('converged')} "
+            f"({reg.stats.get('converged_reason')}), solve={solve_s:.1f}s "
+            f"[setup={reg.stats.get('setup_s')}s project={reg.stats.get('project_s')}s "
+            f"coarse={reg.stats.get('coarse_s')}s, {len(reg.stats.get('iters', []))} iters]"
+        )
 
         gcps_by_rc = {(g.row, g.col): (g.x, g.y) for g in reg.gcps}
         _save_gcps(OUT / f"chunk{i}.gcps", gcps_by_rc)
@@ -379,17 +418,56 @@ def _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, hillshade_on
     return results
 
 
-def _plan_group_chunks(fgeom, scan0: int, ny: int, only: str | None) -> list[dict]:
+# Per-band solve-time model: {hillshade_s, overhead_s, iter_s} @ 4 cores/24GB SBATCH defaults.
+# `overhead_s` is coarse_shift plus GCP-lattice setup, i.e. solve_s minus the sum of that chunk's
+# own iter_s; it dominates for equatorial, whose coarse search over SLDEM costs ~2x LOLA's.
+# north/north_midlat mirror south/south_midlat (same DEM tier structure) pending their own data.
+BAND_TIMING: dict[str, dict[str, float]] = {
+    "south": {"hillshade_s": 18.0, "overhead_s": 77.0, "iter_s": 43.0},
+    "south_midlat": {"hillshade_s": 2.0, "overhead_s": 81.0, "iter_s": 57.0},
+    "equatorial": {"hillshade_s": 3.0, "overhead_s": 156.0, "iter_s": 47.0},
+    "north": {"hillshade_s": 18.0, "overhead_s": 77.0, "iter_s": 43.0},
+    "north_midlat": {"hillshade_s": 2.0, "overhead_s": 81.0, "iter_s": 57.0},
+}
+# Iterations a plateau-converged chunk lands around; a placeholder until measured under the
+# current convergence rule.
+TYPICAL_NITER = 4
+
+
+def _band_estimate_s(band: str, niter: int) -> float:
+    """Solve time for one `band` chunk run to `niter` iterations, from `BAND_TIMING`.
+
+    >>> round(_band_estimate_s("equatorial", 5))
+    394
+    """
+    t = BAND_TIMING[band]
+    return t["hillshade_s"] + t["overhead_s"] + niter * t["iter_s"]
+
+
+def _plan_group_chunks(fgeom, scan0: int, ny: int, only: str | None, niter_max: int) -> list[dict]:
     """This group's chunks, with cube row bounds attached and optionally filtered to `only`.
 
-    `only` is a comma-separated list of chunk indices.
+    `only` is a comma-separated list of chunk indices. `niter_max` is `GeorefConfig.niter`, for the
+    worst-case estimate.
     """
-    chunks = [c for c in ck.plan_chunks(fgeom, WIDTH_RANGE_KM, OVERLAP_FRAC) if c["group"] == GROUP]
+    all_chunks = ck.plan_chunks(fgeom, WIDTH_RANGE_KM, OVERLAP_FRAC)
+    chunks = [c for c in all_chunks if c["group"] == GROUP]
     for c in chunks:
         c["row0"] = max(0, c["scan_lo"] - scan0)
         c["row1"] = min(ny - 1, c["scan_hi"] - scan0)
     if only:
         wanted = {int(x) for x in only.split(",")}
+        # `i` is a global index across the whole strip, not per-group -- a chunk that exists but
+        # belongs to another group would otherwise silently vanish here, leaving "0 chunks planned"
+        # to look like a clean no-op run instead of a mistyped --chunks/--group pair.
+        missing = wanted - {c["i"] for c in chunks}
+        if missing:
+            other_group = {c["i"]: c["group"] for c in all_chunks}
+            detail = ", ".join(
+                f"{i} (group={other_group[i]!r})" if i in other_group else f"{i} (no such chunk)"
+                for i in sorted(missing)
+            )
+            sys.exit(f"--chunks {sorted(missing)} not in group {GROUP!r}: {detail}")
         chunks = [c for c in chunks if c["i"] in wanted]
     (OUT / "chunks.json").write_text(json.dumps(chunks, indent=1))
     log(f"{len(chunks)} chunks planned ({GROUP} group, {WIDTH_RANGE_KM[0]:.0f}-{WIDTH_RANGE_KM[1]:.0f}km):")
@@ -399,6 +477,26 @@ def _plan_group_chunks(fgeom, scan0: int, ny: int, only: str | None) -> list[dic
             f"s {c['s0'] / 1000:.0f}-{c['s1'] / 1000:.0f}km (w={(c['s1'] - c['s0']) / 1000:.0f}km), "
             f"aoi_km={[round(v / 1000, 1) for v in c['aoi']]}"
         )
+    bands_seen = list(dict.fromkeys(c["band"] for c in chunks))
+    log("per-band summary:")
+    typical_s = worst_s = 0.0
+    for band in bands_seen:
+        bc = [c for c in chunks if c["band"] == band]
+        rows = sum(c["row1"] - c["row0"] + 1 for c in bc)
+        band_typical = len(bc) * _band_estimate_s(band, TYPICAL_NITER)
+        band_worst = len(bc) * _band_estimate_s(band, niter_max)
+        typical_s += band_typical
+        worst_s += band_worst
+        log(
+            f"  {band}: {len(bc)} chunk(s), {rows} rows, near={Path(bc[0]['dem_near']).name}, "
+            f"far={Path(bc[0]['dem_far']).name}, ~{band_typical / 60:.0f} min typical / "
+            f"~{band_worst / 60:.0f} min worst-case"
+        )
+    log(
+        f"estimated solve time: ~{typical_s / 60:.0f} min typical ({TYPICAL_NITER} iters/chunk, "
+        f"plateau-converged) / ~{worst_s / 60:.0f} min worst-case (every chunk hits the "
+        f"{niter_max}-iter cap) for {len(chunks)} chunks"
+    )
     return chunks
 
 
@@ -458,9 +556,9 @@ def _parser():
     ap.add_argument(
         "--plateau-frac",
         type=float,
-        default=0.0,
+        default=0.02,
         help="stop when p95 improves by less than this fraction of the previous iteration's p95, "
-        "with GeorefConfig.p95_stop_m demoted to a sanity ceiling (GeorefConfig.p95_plateau_frac; 0 = off)",
+        "independent of GeorefConfig.p95_stop_m (GeorefConfig.p95_plateau_frac; 0 = off)",
     )
     ap.add_argument(
         "--min-iter",
@@ -483,6 +581,35 @@ def _parser():
         help="second, denser tie-point pass within this far of the swath edge (GeorefConfig.edge_dense_m; 0 = off)",
     )
     return ap
+
+
+def _log_provenance() -> None:
+    """Slurm allocation + host details, `seff`-style, so a slow/failed run can be triaged later.
+
+    Env vars are unset outside Slurm (e.g. a dev-box run), so every lookup falls back to "n/a" or
+    the plain hostname/cpu count instead of raising.
+    """
+    import getpass
+    import platform
+
+    def _gb(mb: str) -> str:
+        try:
+            return f"{int(mb) / 1024:.0f}G"
+        except ValueError:
+            return "n/a"
+
+    job_id = os.environ.get("SLURM_JOB_ID")
+    array_job, array_task = os.environ.get("SLURM_ARRAY_JOB_ID"), os.environ.get("SLURM_ARRAY_TASK_ID")
+    log("--- job ---")
+    log(f"Job ID: {job_id or 'n/a'}")
+    if array_job:
+        log(f"Array Job ID: {array_job}_{array_task}")
+    log(f"Cluster: {os.environ.get('SLURM_CLUSTER_NAME', 'n/a')}")
+    log(f"User: {getpass.getuser()}")
+    log(f"Node: {os.environ.get('SLURMD_NODENAME', platform.node())}")
+    log(f"Cores per node: {os.environ.get('SLURM_CPUS_PER_TASK', ncpu())} (ncpu()={ncpu()})")
+    log(f"Memory: {_gb(os.environ.get('SLURM_MEM_PER_NODE', ''))}/node")
+    log(f"Python: {platform.python_version()}")
 
 
 def _resolve_stage(out: Path) -> Path:
@@ -528,6 +655,7 @@ def main(argv: list[str] | None = None) -> None:
 
     _open_run(args.out)
     t_start = time.time()
+    _log_provenance()
     log(f"{SID} group={GROUP} zip={ZIP.name} ncpu={ncpu()} stage={STAGE}")
 
     cfg0 = ck.chunk_cfg(GROUP)
@@ -550,7 +678,7 @@ def main(argv: list[str] | None = None) -> None:
     del band
     log(f"L1 cube ({GROUP} group, lat {lat_range}): {ny} rows x {nx} cols, scan0={scan0}")
 
-    chunks = _plan_group_chunks(fgeom, scan0, ny, args.chunks)
+    chunks = _plan_group_chunks(fgeom, scan0, ny, args.chunks, cfg0.niter)
 
     decay_m = args.decay_m if args.decay_m is not None else cfg0.decay_m
     tweaks = {
