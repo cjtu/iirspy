@@ -34,7 +34,9 @@ WIDTH_RANGE_KM = (100.0, 150.0)
 OVERLAP_FRAC = 0.10
 
 # Copied to `--keep`; everything else in the work dir is rebuildable from the zip.
-KEEP_GLOBS = ("*.gcps", "chunk*_fit.json", "chunks.json", "summary.json", "run.log")
+# - all gcp files generated and run log / json stats
+# - `*_merged_final.tif`: the final warped raster using the merged gcps (only 1 band, 10s of MB)
+KEEP_GLOBS = ("*.gcps", "chunk*_fit.json", "chunks.json", "summary.json", "run.log", "*_merged_final.tif")
 
 # Set by `main` from argv; module-level because `build_l1` and `log` both need them.
 SID = ""

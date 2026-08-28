@@ -113,8 +113,8 @@ class GeorefConfig:
     min_kept: int = 50  # a p95 over fewer points than this is not evidence of convergence
 
     # --- tie points
-    niter: int = 5
-    p95_stop_m: float = 18.0  # Stop if the p85 error is below this, e.g. fit already excellent
+    niter: int = 6  # Max number of iters before run stops with converged=False
+    p95_stop_m: float = 0.0  # Stop if the p95 error is below this; 0 disables
     p95_plateau_frac: float = 0.02  # Stop if fit improved by less than this fraction per iter (0 = off)
     min_iter: int = 0  # Minimum number of iterations (0 = off)
     win: int = 128  # px = 5.1 km matching window
