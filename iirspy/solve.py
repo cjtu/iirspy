@@ -103,13 +103,28 @@ TWEAK_DEFAULTS = {
 }
 
 
+def _dem_key(path: str) -> str:
+    """Cache-comparable identity for a DEM path: the product filename, not the mount root.
+
+    `IIRS_DEM_ROOTS` differs between a cluster job and a local rerun (e.g. cluster `/scratch/...`
+    vs local `/mnt/d/...`), so comparing full paths would call every chunk's cache stale on a
+    different machine even though the same DEM product solved it.
+
+    >>> _dem_key("/scratch/cjtu/lro_lola/LOLA_GDR/POLAR/SOUTH_POLE/LDEM_75S_30M.tif")
+    'LDEM_75S_30M.tif'
+    >>> _dem_key("/mnt/d/ddata/moon/lro_lola/LOLA_GDR/POLAR/SOUTH_POLE/LDEM_75S_30M.tif")
+    'LDEM_75S_30M.tif'
+    """
+    return Path(path).name
+
+
 def _cached_chunk(out: Path, c: dict, good_corr: float, decay_m: float, tweaks: dict):
     """The prior solve of chunk `c['i']` if it is still valid, else None.
 
     Valid means its band, DEM pair, row bounds, aoi, decay_m and tweaks all match `c` and it
-    converged at corr >= `good_corr`. The DEM pair is part of the key because `plan_chunks` picks
-    the far tier per chunk, so two runs can agree on shape and still have used different
-    references. Returns (fit, gcps_by_rc).
+    converged at corr >= `good_corr`. The DEM pair is part of the key (by product name, see
+    `_dem_key`) because `plan_chunks` picks the far tier per chunk, so two runs can agree on shape
+    and still have used different references. Returns (fit, gcps_by_rc).
     """
     ffit, fgcp = out / f"chunk{c['i']}_fit.json", out / f"chunk{c['i']}.gcps"
     if not (ffit.exists() and fgcp.exists()):
@@ -117,8 +132,8 @@ def _cached_chunk(out: Path, c: dict, good_corr: float, decay_m: float, tweaks: 
     fit = json.loads(ffit.read_text())
     same = (
         fit.get("band") == c["band"]
-        and fit.get("dem_near") == c["dem_near"]
-        and fit.get("dem_far") == c["dem_far"]
+        and _dem_key(fit.get("dem_near", "")) == _dem_key(c["dem_near"])
+        and _dem_key(fit.get("dem_far", "")) == _dem_key(c["dem_far"])
         and fit.get("row0") == c["row0"]
         and fit.get("row1") == c["row1"]
         and fit.get("decay_m") == decay_m
@@ -142,7 +157,7 @@ def _cube_bands(band: int) -> list[int]:
     return sorted(set(PAN_BANDS) | set(range(max(1, band - 6), min(256, band + 6) + 1)))
 
 
-def _stage_inputs(day: str, band: int) -> Path:
+def _stage_inputs(day: str, bands: list[int]) -> Path:
     """Extract the zip and assemble the one-root PDS tree `L0` reads. Returns the raw cube's path.
 
     Ancillary is staged from every `ANC_ROOT`, not just the archive: without the nci geometry csv
@@ -151,9 +166,9 @@ def _stage_inputs(day: str, band: int) -> Path:
     raw_qub = STAGE / f"data/raw/{day}/{ZIP.stem}.qub"
     if not raw_qub.exists():
         log(f"extracting {ZIP.name} -> {STAGE}")
-        bands = ",".join(str(b) for b in _cube_bands(band))
+        band_arg = ",".join(str(b) for b in bands)
         subprocess.run(  # noqa: S603
-            [sys.executable, "-m", "issdc_iirs", str(ZIP), "-o", str(STAGE), "--bands", bands], check=True
+            [sys.executable, "-m", "issdc_iirs", str(ZIP), "-o", str(STAGE), "--bands", band_arg], check=True
         )
     for sub in (
         f"geometry/calibrated/{day}",
@@ -179,13 +194,15 @@ def _stage_inputs(day: str, band: int) -> Path:
     return raw_qub
 
 
-def build_l1(lat_range: tuple[float, float], band: int, ftif_out: Path) -> tuple[Path, int, tuple[float, float]]:
+def build_l1(lat_range: tuple[float, float], bands: list[int], ftif_out: Path) -> tuple[Path, int, tuple[float, float]]:
     """Extract the nri zip and calibrate it, cropped to `lat_range`.
 
     The zip's internal layout already matches the archive's PDS tree, so it extracts in place.
     Returns the L1 path, the crop's first `Scan` value (row 0's scan id, for turning a chunk's
     scan_lo/scan_hi into row indices), and the latitudes the returned file actually covers, which
-    for a cache hit may be a wider earlier build.
+    for a cache hit may be a wider earlier build. `bands` is part of the cache key -- a cube staged
+    for one band list is never reused for a different one, e.g. a single-band solve cache can't
+    satisfy a full-spectrum refl run.
     """
     # Ancillary only (spm, oat, xml, csv -- excludes the qub by default): a few MB, so cheap enough
     # to always re-run even on an L1 cache hit. Without this, a cache hit skips `_stage_inputs`
@@ -196,34 +213,40 @@ def build_l1(lat_range: tuple[float, float], band: int, ftif_out: Path) -> tuple
     if ftif_out.exists() and fmeta.exists():
         meta = json.loads(fmeta.read_text())
         cached_range = tuple(meta["lat_range"])
-        if cached_range[0] <= lat_range[0] and lat_range[1] <= cached_range[1]:
+        if cached_range[0] <= lat_range[0] and lat_range[1] <= cached_range[1] and meta.get("bands") == bands:
             log(f"L1 already built: {ftif_out} (covers {cached_range}, requested {lat_range})")
             return ftif_out, meta["scan0"], cached_range
-        log(f"cached L1 {cached_range} does not cover requested {lat_range} -- rebuilding")
+        log(
+            f"cached L1 {cached_range}/bands={meta.get('bands')} does not cover requested "
+            f"{lat_range}/{bands} -- rebuilding"
+        )
     import iirspy.utils as utils
     from iirspy import L0
 
     day = SID[:8]
-    raw_qub = _stage_inputs(day, band)
+    raw_qub = _stage_inputs(day, bands)
 
-    l1 = L0(SID, STAGE, chunk=True).calibrate(
+    l1 = L0(SID, STAGE, chunk={"band": -1, "y": 1024, "x": -1}).calibrate(
         empirical=True, interp_bands="linear", interp_spatial=True, bad_pixel_mask=True
     )
-    # Empirical dark/flat/smile only ever touch PAN_BANDS + `band`'s own neighbourhood (see
-    # _cube_bands), so the staged cube is already that subset. Only `band` is saved: it is the
-    # only one `register` and `project` read.
-    l1.img = l1.img.sel(band=[band])
+    # l1.img already holds exactly `bands` -- that's what _stage_inputs staged.
     _, xyext = utils.parse_geom(l1.csv, latlonextent=(-180, 180, *lat_range))
     ymin, ymax = xyext[2], xyext[3]
     log(f"L1 crop lat={lat_range}: scan {ymin}-{ymax} ({ymax - ymin} rows)")
     l1.img = l1.img.sel(y=slice(ymin, ymax))
     l1.img = l1.img / utils.RAD_NATIVE_SCALE
     l1.save(str(ftif_out))
-    fmeta.write_text(json.dumps({"scan0": int(ymin), "lat_range": list(lat_range)}))
+    fmeta.write_text(json.dumps({"scan0": int(ymin), "lat_range": list(lat_range), "bands": bands}))
     raw_qub.unlink(missing_ok=True)
     raw_qub.with_suffix(".hdr").unlink(missing_ok=True)
     log(f"L1 saved: {ftif_out}")
     return ftif_out, int(ymin), lat_range
+
+
+def _merged_gcps_paths(keep: str | None) -> list[Path]:
+    """Where a previous run's merged GCPs could be, work dir first."""
+    name = f"{SID}_{GROUP}_merged.gcps"
+    return [OUT / name, *([Path(keep) / name] if keep else [])]
 
 
 def keep_products(out: Path, dest: Path) -> list[Path]:
@@ -235,6 +258,39 @@ def keep_products(out: Path, dest: Path) -> list[Path]:
             shutil.copyfile(f, dest / f.name)
             copied.append(f)
     return copied
+
+
+def _scene_scan0(fgeom: Path, lat_range: tuple[float, float]) -> int:
+    """First Scan of the group's L1 crop, from the geometry csv alone -- no cube needed."""
+    import iirspy.utils as utils
+
+    _, xyext = utils.parse_geom(fgeom, latlonextent=(-180, 180, *lat_range))
+    return int(xyext[2])
+
+
+def _make_glt(merged: dict, cfg0, scan0: int, glt_dir: str, overwrite: bool = False) -> Path:
+    """Build the scene's GLT from the merged GCPs."""
+    from rasterio.control import GroundControlPoint
+
+    from iirspy import glt as glt_mod
+
+    gcps = [GroundControlPoint(row=r, col=c, x=x, y=y) for (r, c), (x, y) in merged.items()]
+    xs, ys = [g.x for g in gcps], [g.y for g in gcps]
+    cfg = replace(cfg0, aoi=(min(xs), min(ys), max(xs), max(ys)))
+    return glt_mod.scene_glt(SID, GROUP, gcps, cfg, scan0, glt_dir, overwrite)
+
+
+def _glt_only(args, cfg0, fgeom, lat_range) -> bool:
+    """Already solved: build the GLT from the saved GCPs instead of restaging and re-solving."""
+    fdone = next((f for f in _merged_gcps_paths(args.keep) if f.exists()), None)
+    if fdone is None or args.resolve or args.chunks or args.hillshade_only:
+        return False
+    if fgeom is None:
+        sys.exit(f"missing geometry csv for {SID}")
+    merged = _load_gcps(fdone)
+    f = _make_glt(merged, replace(cfg0, lat_band=lat_range), _scene_scan0(fgeom, lat_range), args.glts)
+    log(f"{fdone} exists ({len(merged)} gcps) -- skipped solve, glt: {f}")
+    return True
 
 
 def _warp_merged(merged: dict, used_chunks: list[dict], cfg0, ftif: Path):
@@ -272,7 +328,9 @@ def _merge_gcps(results) -> tuple[dict, dict]:
     used_chunks = [r["chunk"] for r in results]
     all_cols = sorted({col for r in results for (_row, col) in r["gcps"]})
     all_rows = sorted({row for r in results for (row, _col) in r["gcps"]})
-    max_row = used_chunks[-1]["row1"]
+    # chunk index does not track row direction -- some tracks scan pole-to-equator, others
+    # equator-to-pole, so the bound has to come from the rows themselves, not chunks[-1].
+    max_row = max(c["row1"] for c in used_chunks)
     merged_rows = [row for row in all_rows if row <= max_row]
 
     agree: dict[tuple[int, int], list[float]] = {}
@@ -286,7 +344,7 @@ def _merge_gcps(results) -> tuple[dict, dict]:
             for col in all_cols:
                 merged[(row, col)] = o["gcps"][(row, col)]
             continue
-        owners.sort(key=lambda r: r["chunk"]["i"])
+        owners.sort(key=lambda r: r["chunk"]["row0"])
         c_a, c_b = owners[0], owners[-1]
         row0_ov, row1_ov = c_b["chunk"]["row0"], c_a["chunk"]["row1"]
         t = (row - row0_ov) / max(row1_ov - row0_ov, 1e-6)
@@ -345,6 +403,7 @@ def _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, hillshade_on
             aoi=c["aoi"],
             dem_near=c["dem_near"],
             dem_far=c["dem_far"],
+            p95_stop_m=c["p95_stop_m"],
             decay_m=decay_m,
             gcp_rows=(c["row0"], c["row1"]),
             **tweaks,
@@ -510,6 +569,8 @@ def _parser():
     ap.add_argument("--group", required=True, choices=list(ck.GROUPS))
     ap.add_argument("--out", default=None, help="work dir and restart cache (default runs/<sid>_<group>)")
     ap.add_argument("--keep", default=None, help="copy GCPs, fits, summary and log here when the run completes")
+    ap.add_argument("--glts", default=str(Path.home() / "data" / "iirs" / "glts"), help="where scene GLTs are written")
+    ap.add_argument("--resolve", action="store_true", help="re-solve even if merged GCPs already exist")
     ap.add_argument(
         "--clean",
         action="store_true",
@@ -664,8 +725,12 @@ def main(argv: list[str] | None = None) -> None:
     anc = ck.ancillary(SID)
     fgeom, fspm = anc["geometry/calibrated"], anc["miscellaneous/raw"]
 
+    lat_range0 = ck.l1_lat_range(GROUP)
+    if _glt_only(args, cfg0, fgeom, lat_range0):
+        return
+
     # The crop carries a buffer past the solved bands; the chunk plan does not.
-    ftif, scan0, lat_range = build_l1(ck.l1_lat_range(GROUP), cfg0.band, OUT / f"{SID}_l1_{GROUP}_group.tif")
+    ftif, scan0, lat_range = build_l1(lat_range0, _cube_bands(cfg0.band), OUT / f"{SID}_l1_{GROUP}_group.tif")
     cfg0 = replace(cfg0, lat_band=lat_range)
 
     # The spm rides inside the nri zip, so a scene whose ancillary was never synced to the archive
@@ -718,6 +783,8 @@ def main(argv: list[str] | None = None) -> None:
     log(f"\nmerged gcps: {len(merged)} points -> {fgcps}")
 
     final_cfg, final = _warp_merged(merged, used_chunks, cfg0, ftif)
+    fglt = _make_glt(merged, cfg0, scan0, args.glts, overwrite=True)
+    log(f"glt: {fglt}")
 
     summary = {
         "sid": SID,
@@ -732,6 +799,8 @@ def main(argv: list[str] | None = None) -> None:
         "per_chunk_fit": [r["fit"] for r in results],
         "overlap_agreement": agree_summary,
         "n_merged_gcps": len(merged),
+        "scan0": scan0,
+        "glt": str(fglt),
         "final_aoi_m": final_cfg.aoi,
         "final_shape": list(final.shape),
         "total_s": round(time.time() - t_start, 1),

@@ -48,6 +48,7 @@ INVALID = (*range(1, 7), *range(252, 257))  # Invalid band list
 # IIRS L1 radiance is stored in [1000 mW/cm^2/sr/um]; multiply to get physical [W/m^2/sr/um].
 RAD_NATIVE_SCALE = 0.01  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
 E1_EXPOSURE_MS = 1.0  # exposure duration the e1g2 gain LUT was measured at (see get_gain_offset)
+AU_KM = 1.495978707e8
 
 
 ## Reflectance corr
@@ -1198,19 +1199,29 @@ def get_solar_flux(sdist=1.0, fflux=FSOLAR):
     return xr.DataArray(flux, coords={"band": np.arange(1, 257)}, name="Solar flux [W/m^2/sr/um]")
 
 
-def get_solar_distance(fimg):
-    """Return the solar distance from the IIRS metadata."""
-    # TODO: Do properly - needs spice. doesn't seem to be in the metadata
+def get_solar_distance(fimg, kernels=None):
+    """Return the Sun-Moon distance in AU at the scene's mid-line epoch, from SPICE.
+
+    `kernels=None` resolves the kernel set via `chunks.kernels(day)`. Warns and returns 1.0 AU if
+    the label or kernels can't be found, rather than failing the whole calibration.
+    """
+    import spiceypy as sp
+
+    from iirspy import chunks
+
     fimg = Path(fimg)
-    if "20201226T1745264921" in fimg.stem:
-        return 0.9855
-    elif "20210122T0920157625" in fimg.stem:
-        return 0.9849
-    elif "20210719T1622353775" in fimg.stem:
-        return 1.0174
-    elif "20210622T1850441449" in fimg.stem or "20210622T1454378054" in fimg.stem or "20210622T1256344234" in fimg.stem:
-        return 1.0184
-    return 1.0
+    try:
+        line_times = get_line_times(fimg)
+        t = pd.Timestamp(line_times[len(line_times) // 2], unit="s")
+        ks = kernels if kernels is not None else chunks.kernels(t.strftime("%Y%m%d"))
+        for k in ks:
+            sp.furnsh(str(k))
+        et = sp.str2et(t.strftime("%Y-%m-%dT%H:%M:%S.%f"))
+        v, _ = sp.spkpos("SUN", et, "IAU_MOON", "LT+S", "MOON")
+    except Exception as e:
+        warnings.warn(f"get_solar_distance: could not compute from SPICE for {fimg} ({e}); using 1.0 AU", stacklevel=2)
+        return 1.0
+    return float(np.linalg.norm(v) / AU_KM)
 
 
 def write_envi(da, fout):

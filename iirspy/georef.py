@@ -13,7 +13,7 @@ registered L1/L2 directly from the GCPs.
 Typical use:
 
     reg = register("ch2_iir_<sid>_l1_polar.tif", fgeom, fspm, cfg)
-    arr = warp(cube, reg, cfg)             # (band, y, x) on reg.transform / reg.crs
+    glt.scene_glt(sid, group, reg.gcps, cfg, scan0, glt_dir)   # project products by indexing
 
 The matcher needs `arosics`, which needs `osgeo.gdal`, which needs conda. `register` handles
 that (if arosics not importable it runs the solve in a conda env through :mod:`iirspy.coreg`).
@@ -33,7 +33,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import rasterio
-import xarray as xr
 from pyproj import CRS, Transformer
 from rasterio.control import GroundControlPoint
 from rasterio.warp import Resampling, reproject
@@ -113,7 +112,7 @@ class GeorefConfig:
     min_kept: int = 50  # a p95 over fewer points than this is not evidence of convergence
 
     # --- tie points
-    niter: int = 6  # Max number of iters before run stops with converged=False
+    niter: int = 5  # Max number of iters before run stops with converged=False
     p95_stop_m: float = 0.0  # Stop if the p95 error is below this; 0 disables
     p95_plateau_frac: float = 0.02  # Stop if fit improved by less than this fraction per iter (0 = off)
     min_iter: int = 0  # Minimum number of iterations (0 = off)
@@ -956,20 +955,6 @@ class Registration:
         return bool(self.stats.get("converged"))
 
 
-POLE_LAT_BAND: dict[str, tuple[float, float]] = {
-    "south": (-90.0, -80.0),
-    "north": (80.0, 90.0),
-    "equatorial": (-60.0, 60.0),
-}
-for _pole in POLE_LAT_BAND:
-    _override = os.environ.get(f"IIRSPY_POLE_LAT_BAND_{_pole.upper()}")
-    if _override:
-        # Env var, not a runtime dict assignment, so a subprocess that re-imports this module
-        # (register()'s arosics-conda path) also picks up the override.
-        _lo, _hi = (float(v) for v in _override.split(","))
-        POLE_LAT_BAND[_pole] = (_lo, _hi)
-
-
 def _lattice_row_bounds(ny: int, cfg) -> tuple[int, int]:
     """Inclusive first and last cube row the GCP lattice spans.
 
@@ -999,18 +984,17 @@ def _lattice_row_bounds(ny: int, cfg) -> tuple[int, int]:
 def gcp_lattice(fgeom, ny, nx, cfg):
     """Camera (row, col) -> map (x, y) lattice from the supplied geometry csv, uncorrected.
 
-    The lat band must reproduce exactly the crop `run_l1_polar.run_one` applied when it built the
-    cube (`POLE_LAT_BAND` mirrors its per-pole `extent`), or GCP `row` stops lining up with the
-    cube's own rows.
+    `cfg.lat_band` must be exactly the crop the cube was built with (`build_l1` returns it), or GCP
+    `row` stops lining up with the cube's own rows.
     """
-    lat_band = cfg.lat_band or POLE_LAT_BAND[cfg.pole]
-    extent = (-180, 180, *lat_band)
-    # `lat_band` must be the crop the cube was built with to align GCPs with original rows
+    if cfg.lat_band is None:
+        raise ValueError("pass the crop the cube was built with as GeorefConfig.lat_band")
+    extent = (-180, 180, *cfg.lat_band)
     _, xyext = utils.parse_geom(fgeom, extent)
     scan0, n_geom_rows = xyext[2], xyext[3] - xyext[2] + 1
     if n_geom_rows < ny:
         raise ValueError(
-            f"lat_band {lat_band} spans {n_geom_rows} geometry rows but the cube has {ny} -- "
+            f"lat_band {cfg.lat_band} spans {n_geom_rows} geometry rows but the cube has {ny} -- "
             "pass the crop the cube was built with as GeorefConfig.lat_band"
         )
     r0, r1 = _lattice_row_bounds(ny, cfg)
@@ -1042,45 +1026,6 @@ def window_of(cfg, window=None):
     return (r1 - r0, c1 - c0), tr * rasterio.Affine.translation(c0, r0)
 
 
-def unify_nodata(cube):
-    """Stack a cube with its own hole indicator, both under one shared nodata mask.
-
-    Returns a (2 * nband, y, x) array: the data bands, then a 0/1 plane per band marking where
-    that band had nodata. Warp it in one :func:`project` call and drop every output pixel whose
-    indicator came back above zero -- exactly the set whose resampling footprint touched a hole in
-    *that* band. `unstack_nodata` does that.
-
-    Why not just warp the cube. GDAL's multi-band warp does not mask bands independently: a band
-    with a smaller valid footprint is pulled down toward the others (measured on an L2 cube, band
-    27 beside band 251: 165,783 px kept against 171,428 alone -- 3.3% lost, values bit-identical).
-    Band-at-a-time is correct but pays the ~1700-point TPS solve 256 times.
-
-    So remove the disagreement rather than the sharing. Nodata becomes the pixels where *no* band
-    has data, which every band then shares, and a per-band hole inside that footprint becomes 0 in
-    the data half and 1 in the indicator half. A fill value alone cannot mark those holes:
-    resampling blends it into a continuum, so any cut-off leaves surviving contamination of its own
-    magnitude (measured: -999.185 survived a -1000 cut-off).
-
-    Stacked rather than warped separately because GDAL transforms each destination pixel once per
-    *call*, not once per band -- the per-band cost is only the resampling (measured: 5 bands cost
-    94.6 s one at a time against 19.6 s in one call). So carrying the indicator alongside is
-    nearly free, where a second call would pay the whole transform again.
-    """
-    nan = np.isnan(cube)
-    dead = nan.all(axis=0)
-    out = np.empty((2 * len(cube), *cube.shape[1:]), "float32")
-    out[: len(cube)] = np.where(nan, np.float32(0), cube)
-    out[len(cube) :] = nan
-    out[:, dead] = np.nan
-    return out
-
-
-def unstack_nodata(warped, band):
-    """One band out of a warped :func:`unify_nodata` stack, its touched-a-hole pixels set NaN."""
-    n = len(warped) // 2
-    return np.where(warped[n + band] > 0, np.nan, warped[band])
-
-
 def data_window(arr, pad=8):
     """(r0, r1, c0, c1) bounding the finite pixels of a projected band, padded by `pad`."""
     r, c = np.where(np.isfinite(arr))
@@ -1093,27 +1038,28 @@ def data_window(arr, pad=8):
     )
 
 
-def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None):
+def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None, out=None):
     """One reproject of a camera-space band -- or a whole (band, y, x) cube -- onto the AOI grid.
 
     Pass the cube, not one band at a time: GDAL solves the warp once per call.
     - `window` crops the output to (r0, r1, c0, c1) of the AOI grid (down from several GB strip).
+    - `out` is a `rasterio.band(dataset, indexes)` to warp straight into, for a destination too big
+    to hold -- see :func:`warp`. Default allocates an array and returns it.
     - SRC_METHOD=GCP_TPS: thin-plate-spline interpolation.
     - tolerance=0 is the exact transformer (rasterio's default 0.125 replaces TPS with a
     polynomial fitted within an eighth of a pixel which added 5 m of noise at 40 m/px)
     """
     shape, tr = window_of(cfg, window)
     shape = np.shape(band)[:-2] + shape
-    # Every band must stay in one call to avoid solving the warp repeatedly, but full AOI cube is
-    # multiple GB, so spill to disk if it exceeds MAX_RAM_BYTES.
-    out: np.ndarray
-    if np.prod(shape) * 4 > MAX_RAM_BYTES:
-        tmp = tempfile.NamedTemporaryFile(suffix=".f32", delete=False)  # noqa: SIM115
-        out = np.memmap(tmp.name, dtype="float32", mode="w+", shape=shape)
-        out[:] = np.nan
-        Path(tmp.name).unlink()  # unlinked but held open: the pages die with the array
-    else:
-        out = np.full(shape, np.nan, "float32")
+    if out is None:
+        # One call keeps the TPS solve to one, but a full AOI cube is multiple GB, so spill past
+        # MAX_RAM_BYTES. Left uninitialised: GDAL's INIT_DEST=NO_DATA fills the whole destination.
+        if np.prod(shape) * 4 > MAX_RAM_BYTES:
+            tmp = tempfile.NamedTemporaryFile(suffix=".f32", delete=False)  # noqa: SIM115
+            out = np.memmap(tmp.name, dtype="float32", mode="w+", shape=shape)
+            Path(tmp.name).unlink()  # unlinked but held open: the pages die with the array
+        else:
+            out = np.empty(shape, "float32")
     reproject(
         source=band,
         destination=out,
@@ -1413,38 +1359,3 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
             "band": cfg.band,
         },
     )
-
-
-def warp(cube, reg, cfg, resampling=Resampling.bilinear, window=None):
-    """
-    Apply a :class:`Registration` to a cube or single band. Returns a DataArray on the AOI grid.
-
-    `cube` may be a path to an IIRS product or a (band, y, x) DataArray in camera space. Every
-    band is resampled once, straight from camera space. A strip fills ~10% of the AOI, so pass
-    `window` (see :func:`data_window`) unless the whole 160 km box is wanted -- a 256-band cube on
-    the full grid is tens of GB.
-    """
-    if isinstance(cube, str | Path):
-        da = xr.open_dataarray(cube, engine="rasterio")
-        from iirspy.iirs import _band_numbers
-
-        da = da.assign_coords(band=_band_numbers(da))
-    else:
-        da = cube
-    if "band" not in da.dims:
-        da = da.expand_dims("band")
-
-    xs, ys, _, _ = grid_of(cfg)
-    (ny, nx), tr = window_of(cfg, window)
-    r0, c0 = (window[0], window[2]) if window else (0, 0)
-    ys, xs = ys[r0 : r0 + ny], xs[c0 : c0 + nx]
-    out = project(da.values.astype("float32"), reg.gcps, cfg, resampling, window)
-    res = xr.DataArray(
-        out,
-        dims=("band", "y", "x"),
-        coords={"band": da.band.values, "y": ys, "x": xs},
-        attrs=dict(da.attrs) | {"georef_converged": str(reg.converged)},
-    )
-    if "wl" in da.coords:
-        res = res.assign_coords(wl=("band", da.wl.values))
-    return res.rio.write_crs(reg.crs).rio.write_transform(tr)

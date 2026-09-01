@@ -168,8 +168,8 @@ class IIRSData(ABC):
         regardless of image or machine size. GeoTIFF (.tif): float32 BigTIFF, windowed blocks.
 
         When the cube carries an empirical `snr` coordinate (from calibrate_to_rad with attach_snr),
-        a float32 sidecar `<basename>_snr.img` is written alongside it (ENVI coords don't survive the
-        BIL write), unless snr_sidecar is False.
+        a float32 sidecar `<basename>_snr<ext>` is written alongside it in the same format (ENVI
+        coords don't survive the BIL write), unless snr_sidecar is False.
 
         Parameters
         ----------
@@ -186,30 +186,34 @@ class IIRSData(ABC):
         """
         fout = str(fout)
         if snr_sidecar and "snr" in self.img.coords:
-            self._save_snr_sidecar(fout)
+            self._save_snr_sidecar(fout, sub_rows)
+        return self._write(self.img, fout, sub_rows)
+
+    def _write(self, da, fout, row_block):
+        """Format dispatch for any camera-space product: `.tif` -> GeoTIFF, else ENVI BIL.
+
+        Everything goes out through here -- cube, SNR sidecar, derived planes -- because both
+        writers record the absolute first line, without which a product is not GLT-addressable.
+        """
+        fout = str(fout)
         if fout.lower().endswith(".tif"):
-            return self._save_geotiff(fout, sub_rows)
-        description = f"IIRS {self.img.attrs.get('name', '')}".strip()
-        return utils.write_envi_bil(self.img, fout, sub_rows, description)
+            return self._save_geotiff(fout, row_block, da)
+        return utils.write_envi_bil(da, fout, row_block, f"IIRS {da.attrs.get('name', '')}".strip())
 
-    def _save_snr_sidecar(self, fout):
-        """Write the (y, x) empirical broadband SNR field to a float32 ENVI sidecar next to fout."""
-        import rasterio
+    def _save_snr_sidecar(self, fout, row_block=1000):
+        """Write the (y, x) empirical broadband SNR field beside fout, in fout's own format."""
+        snr = self.img.snr.reset_coords(drop=True).expand_dims(band=[1]).astype("float32")
+        snr.attrs = {"name": "SNR", "units": ""}
+        f = Path(fout)
+        return self._write(snr, f.with_name(f.stem + "_snr" + f.suffix), row_block)
 
-        snr = self.img.snr.values.astype("float32")
-        ny, nx = snr.shape
-        fsnr = Path(fout).with_name(Path(fout).stem + "_snr.img")
-        with rasterio.open(fsnr, "w", driver="ENVI", height=ny, width=nx, count=1, dtype="float32") as dst:
-            dst.write(snr, 1)
-        return str(fsnr)
-
-    def _save_geotiff(self, fout, row_block):
+    def _save_geotiff(self, fout, row_block, da=None):
         """Write a float32 BigTIFF sequentially in windowed blocks (bounded memory)."""
         import rasterio
         from dask.diagnostics import ProgressBar
         from rasterio.windows import Window
 
-        da = self.img
+        da = self.img if da is None else da
         nband, ny, nx = da.shape
         profile = {
             "driver": "GTiff",
@@ -550,6 +554,7 @@ class L1(IIRSData):
             )
             fimg = paths.get("qub", {}).get(instance.basename) or paths.get("xml", {}).get(instance.basename)
             if fimg is not None:
+                instance.qub = fimg
                 # yrange as contiguous absolute line indices matching this cube's y, so the
                 # incidence array lines up exactly (extent min/max int-truncation can be off by 1).
                 y0 = round(float(instance.img.y.min()) - 0.5)
@@ -939,6 +944,17 @@ class L2(IIRSData):
         refl.name = "Reflectance"
         refl.attrs["name"] = "Reflectance"
         refl.attrs["units"] = ""
+
+        inc_deg = np.degrees(np.arccos(np.clip(cos_inc, -1.0, 1.0)))
+        refl.attrs["thermal_corr"] = thermal_corr
+        refl.attrs["photom"] = photom if isinstance(photom, str) else getattr(photom, "__name__", "custom")
+        refl.attrs["min_lit"] = min_lit
+        refl.attrs["sun_az_offset"] = sun_az_offset
+        refl.attrs["topo_used"] = topo is not None
+        refl.attrs["solar_distance_au"] = sdist
+        refl.attrs["inc_min_deg"] = float(inc_deg.min())
+        refl.attrs["inc_max_deg"] = float(inc_deg.max())
+        refl.attrs["inc_mean_deg"] = float(inc_deg.mean())
 
         return refl
 

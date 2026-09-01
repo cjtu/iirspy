@@ -36,6 +36,8 @@ dependencies = [
 
 [project.scripts]
 iirs-solve-scene = "iirspy.solve:main"
+iirs-compute-refl = "iirspy.refl:main"
+iirs-make-glt = "iirspy.glt:main"
 
 [project.urls]
 Homepage = "https://cjtu.github.io/iirspy/"

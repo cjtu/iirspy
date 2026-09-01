@@ -1,9 +1,8 @@
 """Chunk planning for strip registration.
 
-Answers the questions `iirspy.solve` asks before it registers anything: which latitude band a row
-falls in and therefore which LOLA DEM renders its reference (`BANDS`), where to cut the strip into
-chunks (`plan_chunks`), which SPICE kernels cover the observation (`kernels`), and what
-`GeorefConfig` a chunk starts from (`chunk_cfg`).
+Determines which latitude band a row falls into, which LOLA DEM to use as reference, where to cut
+the strip into chunks (`plan_chunks`), which SPICE kernels cover the observation (`kernels`), and
+what `GeorefConfig` a chunk starts from (`chunk_cfg`).
 
 Stateless: no scene is read and nothing is written. Paths come from `IIRS_ARCHIVE`,
 `IIRS_DEM_ROOTS`, `IIRS_SPICE` and `IIRS_ANC_ROOTS`.
@@ -80,11 +79,13 @@ def _equatorward(lat_range: tuple[float, float]) -> float:
 # window still land on real elevation at a seam.
 #
 # Coverage:
-#   LDEM_75{N,S}_30M    +/-75 to +/-90        LDEM_45{N,S}_100M  +/-45 to +/-90
-#   SLDEM2015_512       -60 to 60
+#   LDEM_75{N,S}_30M    +/-76.5 to +/-90   (1.5° buffer for long hillshade shadows)
+#   LDEM_45{N,S}_100M  +/-60 to +/-76.5  (link to equatorial - lower accuracy than 75N/S or SLDEM)
+#   SLDEM2015_512       -60 to 60  (equatorial LOLA-Kaguya merged, more accurate than LDEM equatorial)
 #
 # `near`/`far` name the products; `bands()` resolves them to paths. Keeping the names here lets
 # this module import with no DEM tree present.
+
 BANDS: dict[str, dict] = {
     "south": {
         "lat_range": (-90.0, -76.5),
@@ -92,6 +93,7 @@ BANDS: dict[str, dict] = {
         "group": "south",
         "near": (f"{_POLAR}/SOUTH_POLE", "LDEM_75S_30M"),
         "far": (f"{_POLAR}/SOUTH_POLE", "LDEM_45S_100M"),
+        "p95_stop_m": 16.5,
     },
     "south_midlat": {
         "lat_range": (-76.5, -60.0),
@@ -99,6 +101,7 @@ BANDS: dict[str, dict] = {
         "group": "south",
         "near": (f"{_POLAR}/SOUTH_POLE", "LDEM_45S_100M"),
         "far": (f"{_POLAR}/SOUTH_POLE", "LDEM_45S_100M"),
+        "p95_stop_m": 20.0,
     },
     "equatorial": {
         "lat_range": (-60.0, 60.0),
@@ -107,6 +110,7 @@ BANDS: dict[str, dict] = {
         "near": ("SLDEM", _SLDEM),
         "far": ("SLDEM", _SLDEM),
         "xy_half": (5_458_000.0, 1_819_000.0),  # SLDEM's own bounds; not stereographic
+        "p95_stop_m": 16.5,
     },
     "north_midlat": {
         "lat_range": (60.0, 76.5),
@@ -114,6 +118,7 @@ BANDS: dict[str, dict] = {
         "group": "north",
         "near": (f"{_POLAR}/NORTH_POLE", "LDEM_45N_100M"),
         "far": (f"{_POLAR}/NORTH_POLE", "LDEM_45N_100M"),
+        "p95_stop_m": 16.5,
     },
     "north": {
         "lat_range": (76.5, 90.0),
@@ -121,6 +126,7 @@ BANDS: dict[str, dict] = {
         "group": "north",
         "near": (f"{_POLAR}/NORTH_POLE", "LDEM_75N_30M"),
         "far": (f"{_POLAR}/NORTH_POLE", "LDEM_45N_100M"),
+        "p95_stop_m": 16.5,
     },
 }
 for _name, _e in BANDS.items():
@@ -412,6 +418,7 @@ def plan_chunks(fgeom: Path, width_range_km: tuple[float, float] = (100.0, 150.0
                 "group": b["group"],
                 "dem_near": b["dem_near"],
                 "dem_far": b["dem_far"],
+                "p95_stop_m": b["p95_stop_m"],
                 "s0": float(gs0),
                 "s1": float(gs1),
                 "scan_lo": int(in_chunk.min()),

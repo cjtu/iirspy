@@ -9,7 +9,7 @@ import pytest
 import xarray as xr
 
 from iirspy import L0, L1, L2, utils
-from iirspy.iirs import _band_numbers
+from iirspy.iirs import _apply_envi_start, _band_numbers
 
 BASENAME = "20201202T1527488942"
 FULL = [1, 2, 3]
@@ -80,3 +80,25 @@ def test_from_file_preserves_bands_wls_and_absolute_lines(bands, ext, tmp_path):
     np.testing.assert_allclose(back.img.y.values, inst.img.y.values)
     np.testing.assert_allclose(back.img.x.values, inst.img.x.values)
     assert back.img.y.values[0] < back.img.y.values[-1], "lines must stay in acquisition order"
+
+
+@pytest.mark.filterwarnings("ignore::rasterio.errors.NotGeoreferencedWarning")
+@pytest.mark.parametrize("ext", [".tif", ".img"])
+def test_snr_sidecar_is_written_by_the_same_driver_as_its_cube(ext, tmp_path):
+    """A sidecar written through a different driver than the cube it rides with cannot record where
+    it starts -- and a camera-space product that cannot say its first scan is not addressable by a
+    GLT. Derived products (mineral parameters, OHIBD) go out the same way, so the dispatch is
+    shared rather than reimplemented per product."""
+    inst = make(L1, FULL, tmp_path)
+    ny, nx = inst.img.sizes["y"], inst.img.sizes["x"]
+    snr = np.arange(ny * nx, dtype="float32").reshape(ny, nx)
+    inst.img = inst.img.assign_coords(snr=(("y", "x"), snr))
+
+    inst.save(tmp_path / f"cube{ext}")
+    fsnr = tmp_path / f"cube_snr{ext}"
+    assert fsnr.exists(), "the sidecar must take the cube's own format, not always ENVI"
+
+    back = _apply_envi_start(xr.open_dataarray(fsnr, engine="rasterio").sortby("y").sortby("x"))
+    np.testing.assert_allclose(back.y.values, inst.img.y.values)
+    np.testing.assert_allclose(back.x.values, inst.img.x.values)
+    np.testing.assert_allclose(np.asarray(back.values).reshape(ny, nx), snr)
