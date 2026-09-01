@@ -37,7 +37,7 @@ SPICE = Path(os.environ.get("IIRS_SPICE", str(ARCHIVE / "spice")))
 
 # Our own re-solved products, laid out like the archive's own `<category>/<level>/<day>/` tree so
 # the two read the same way -- but not under IIRS_ARCHIVE, since these are derived, not PDS-shipped.
-RECAL_ROOT = Path(os.environ.get("IIRS_RECAL_ROOT", str(Path.home() / "data" / "iirs")))
+RECAL_ROOT = Path(os.environ.get("IIRS_RECAL_ROOT", str(Path.home() / "data" / "ch2_iirs")))
 
 
 def _dem(sub: str, name: str) -> str:

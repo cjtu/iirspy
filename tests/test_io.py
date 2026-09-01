@@ -9,7 +9,7 @@ import pytest
 import xarray as xr
 
 from iirspy import L0, L1, L2, utils
-from iirspy.iirs import _apply_envi_start, _band_numbers
+from iirspy.iirs import _apply_envi_start, _band_numbers, _row_block
 
 BASENAME = "20201202T1527488942"
 FULL = [1, 2, 3]
@@ -102,3 +102,27 @@ def test_snr_sidecar_is_written_by_the_same_driver_as_its_cube(ext, tmp_path):
     np.testing.assert_allclose(back.y.values, inst.img.y.values)
     np.testing.assert_allclose(back.x.values, inst.img.x.values)
     np.testing.assert_allclose(np.asarray(back.values).reshape(ny, nx), snr)
+
+
+@pytest.mark.filterwarnings("ignore::rasterio.errors.NotGeoreferencedWarning")
+@pytest.mark.parametrize("chunk", [True, False, {"band": -1, "y": 2, "x": -1}], ids=["auto", "off", "explicit"])
+def test_write_block_tracks_chunking_and_pixels_do_not(chunk, tmp_path):
+    """One y-block policy, not two: a write step is the cube's own dask chunk unless overridden.
+
+    Unaligned, every write block straddles two compute blocks and re-reads them. The pixels must
+    not care either way -- the file bytes can differ, since a differently-windowed write packs the
+    GeoTIFF's internal tiles differently.
+    """
+    inst = make(L1, FULL, tmp_path)
+    fout = tmp_path / "cube.tif"
+    inst.save(fout, snr_sidecar=False)
+
+    back = L1.from_file(fout, BASENAME, tmp_path, chunk=chunk)
+    ychunks = back.img.chunks[back.img.dims.index("y")] if back.img.chunks else None
+    assert _row_block(back.img) == (max(ychunks) if ychunks else _row_block(back.img.compute()))
+    assert _row_block(back.img, 7) == 7, "an explicit sub_rows still wins"
+
+    fout2 = tmp_path / "cube2.tif"
+    back.save(fout2, snr_sidecar=False)
+    reread = xr.open_dataarray(fout2, engine="rasterio")
+    np.testing.assert_allclose(reread.values, back.img.values, rtol=1e-6)

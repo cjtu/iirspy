@@ -1281,8 +1281,12 @@ def _write_bil_rows(f, da, i0, i1, sub_rows):
         blk.transpose(1, 0, 2).tofile(f)  # C-order of (row, band, x) == ENVI BIL
 
 
-def write_envi_bil(da, fout, sub_rows=1000, description="IIRS"):
-    """Sequentially stream a (band, y, x) DataArray to an ENVI BIL float32 file (bounded memory)."""
+def write_envi_bil(da, fout, sub_rows, description="IIRS"):
+    """Sequentially stream a (band, y, x) DataArray to an ENVI BIL float32 file (bounded memory).
+
+    `sub_rows` is required: it is resolved once in `IIRSData._write`, so no second default can
+    drift away from the cube's dask chunking.
+    """
     fout = str(fout)
     nband, ny, nx = da.shape
     with open(fout, "wb") as f:
@@ -1564,20 +1568,3 @@ def plot_spectra_with_sigma(da: xr.DataArray, ax=None, label: str = "", stdev_al
     ax.set_xlabel("Wavelength")
     ax.legend(frameon=False)
     return ax
-
-
-if __name__ == "__main__":  # pragma: no cover
-    fqub = (
-        "/home/cjtu/projects/lai/issdc-requester/data/corrected_python/refl/ch2_iir_20210622T1256344234_destriped.img"
-    )
-    fgeom = "/home/cjtu/projects/lai/data/moon/ch2/iirs/geometry/calibrated/20210622/ch2_iir_nci_20210622T1256344234_g_grd_d32.csv"
-    fpoints = "/home/cjtu/projects/lai/data/moon/ch2/iirs/corrected_python/refl/ch2_iir_20210622T1256344234_destriped.img.points"
-
-    # Read un-georeferenced data qub and add projection info
-    da = xr.open_dataarray(fqub, engine="rasterio")
-    gridlon, gridlat, xyext = geom2grid(fgeom, (None, None, -86, -83))
-    gcps, gcps_crs = read_gcps(fpoints)
-
-    # projected = warp2grid(da, xyext, gridlon, gridlat)
-    proj_from_gcps = warp2gcps(fqub, da, gcps, gcps_crs, "./test.tif")
-    pass

@@ -157,6 +157,123 @@ def test_displacement_field_falls_back_to_the_bulk_median_on_collinear_tie_point
         assert np.allclose(fieldfn(q), [np.median(tp.X_SHIFT_PX) * cfg.ps, -0.5 * cfg.ps]), n
 
 
+def test_camera_topo_is_camera_gradients_then_slope_aspect(monkeypatch):
+    """camera_topo must be exactly the split: camera_gradients's (sx, sy) fed through slope_aspect."""
+    from dataclasses import replace
+
+    def fake_render_topo(fgeom, fspm, cfg, kernels=None):
+        tr = from_origin(0.0, 40.0, 40.0, 40.0)
+        gx = np.linspace(-1.0, 1.0, 4 * 4).reshape(4, 4)
+        gy = np.linspace(1.0, -1.0, 4 * 4).reshape(4, 4)
+        lit = np.full((4, 4), 0.8)
+        return gx, gy, lit, tr, {"az_grid": 12.0, "elev": 5.0, "r_sun": 0.27}
+
+    monkeypatch.setattr(georef, "render_topo", fake_render_topo)
+    cfg = replace(georef.GeorefConfig(), aoi=(-1000.0, -1000.0, 1000.0, 1000.0))
+    gcps = [
+        GroundControlPoint(row=float(r), col=float(c), x=20.0 + 40.0 * c, y=20.0 + 40.0 * r)
+        for r in (0, 3)
+        for c in (0, 3)
+    ]
+    shape = (4, 4)
+
+    slope, aspect, lit, info = georef.camera_topo(gcps, shape, "fgeom", "fspm", cfg)
+    sx, sy, lit2, info2 = georef.camera_gradients(gcps, shape, "fgeom", "fspm", cfg)
+    want_slope, want_aspect = georef.slope_aspect(sx, sy)
+
+    np.testing.assert_allclose(slope, want_slope)
+    np.testing.assert_allclose(aspect, want_aspect)
+    np.testing.assert_allclose(lit, lit2)
+    assert info == info2
+
+
+def test_row_bands_falls_back_to_midlat_across_the_polar_seam():
+    """A camera row is 'south' only if both bracketing lattice rows are fully inside -76.5..-90."""
+    from dataclasses import replace
+
+    from iirspy import chunks as ck
+
+    cfg = replace(georef.GeorefConfig(), pole="south")
+    assert ck.BANDS["south"]["lat_range"] == (-90.0, -76.5)
+    # Lattice rows 0, 50, 100, 150: latitudes straddle the seam so row 50 is the last fully-polar
+    # lattice row and row 100 straddles it (one column polar, one not).
+    lattice_lat = {0: -85.0, 50: -80.0, 100: -76.0, 150: -70.0}
+    cols = (0, 10)
+    gcps = []
+    for r, lat in lattice_lat.items():
+        for c in cols:
+            # row 100 straddles the seam: col 0 stays polar, col 10 crosses into midlat territory
+            this_lat = lat if not (r == 100 and c == 10) else -77.0
+            x, y = georef.to_stereo("south").transform(0.0, this_lat)
+            gcps.append(GroundControlPoint(row=float(r), col=float(c), x=x, y=y))
+
+    band = georef._row_bands(gcps, ny=160, cfg=cfg)
+
+    # rows [0, 50): both bracketing rows (0, 50) are fully polar -> south
+    assert set(band[0:50]) == {"south"}
+    # rows [50, 100): row 100 is NOT fully polar (straddles) -> conservative fallback to midlat
+    assert set(band[50:100]) == {"south_midlat"}
+    # rows [100, 150) and beyond: neither bracket is fully polar -> midlat
+    assert set(band[100:150]) == {"south_midlat"}
+
+
+def test_scene_topo_assembles_pieces_with_no_blending_and_monotone_sun(tmp_path, monkeypatch):
+    """Pieces just concatenate (no seam blending), and per-row sun interpolates monotonically."""
+    from dataclasses import replace
+
+    from iirspy import chunks as ck
+
+    ny, nx = 3500, 4  # > _split_run's max_rows -> at least 2 pieces, one band (equatorial, no split)
+    rows = np.unique(np.r_[np.arange(0, ny, 25), ny - 1])
+    cols = (0, nx - 1)
+    gcps = [GroundControlPoint(row=float(r), col=float(c), x=1000.0 * c, y=100.0 * r) for r in rows for c in cols]
+    cfg = replace(georef.GeorefConfig(), pole="equatorial", margin_m=5000.0, ps=2000.0)
+    # bands() resolves real DEM paths on disk for every band; scene_topo only needs the names, and
+    # render_topo (mocked below) never opens dem_near/dem_far, so a placeholder dict skips the DEM tree.
+    monkeypatch.setattr(
+        ck, "bands", lambda: {"equatorial": {**ck.BANDS["equatorial"], "dem_near": "x", "dem_far": "x"}}
+    )
+
+    calls = []
+
+    def fake_render_topo(fgeom, fspm, cfg, kernels=None):
+        xs, ys, tr, _ = georef.grid_of(cfg)
+        val = float(cfg.aoi[1])  # unique per piece: pieces don't overlap in y
+        gx = np.full((len(ys), len(xs)), val, "float32")
+        gy = np.zeros_like(gx)
+        lit = np.ones_like(gx)
+        elev = val / 1e5
+        calls.append(val)
+        return gx, gy, lit, tr, {"az_grid": 10.0, "elev": elev, "r_sun": 0.27}
+
+    monkeypatch.setattr(georef, "render_topo", fake_render_topo)
+    f = georef.scene_topo("sid", "equatorial", gcps, (ny, nx), "fgeom", "fspm", cfg, [], tmp_path)
+
+    assert len(calls) >= 2  # the strip really did split into multiple pieces
+
+    import rasterio
+
+    with rasterio.open(f) as src:
+        names = [src.descriptions[i] for i in range(src.count)]
+        slope = src.read(names.index("slope") + 1)
+        sun_elev = src.read(names.index("sun_elev") + 1)
+
+    # Recompute the expected piece boundaries the same way scene_topo does, and check every row's
+    # slope matches its own piece's constant gradient -- concatenation, no cross-piece blending.
+    from iirspy import chunks as ck
+
+    band_of_row = georef._row_bands(gcps, ny, cfg)
+    pieces = [p for a, z in ck._runs(band_of_row == "equatorial") for p in georef._split_run(a, z)]
+    assert len(pieces) == len(calls)
+    for (a, z), val in zip(pieces, calls, strict=True):
+        want = np.degrees(np.arctan(abs(val)))
+        np.testing.assert_allclose(slope[a:z], want, atol=1e-3)
+
+    # Per-row sun elevation must be monotone between piece centres (np.interp of an increasing
+    # sequence), matching the along-track sun geometry each piece reported.
+    assert np.all(np.diff(sun_elev) >= -1e-6)
+
+
 def test_gcp_lattice_samples_the_geometry_spline_at_the_right_rows(tmp_path):
     """The lattice evaluates the geometry TPS only where GCPs go, so row->Scan must line up.
 

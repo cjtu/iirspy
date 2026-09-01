@@ -143,15 +143,14 @@ def load_topo(topo, like=None):
         slope, aspect, lit = pick("slope"), pick("aspect"), pick("lit")
         if slope is None or aspect is None:
             raise ValueError(f"topo product has bands {names}; need at least slope and aspect")
-        sun = _sun_tags(da.attrs)
+        sun_az, sun_elev = pick("sun_az"), pick("sun_elev")
+        sun = (sun_az, sun_elev) if sun_az is not None and sun_elev is not None else _sun_tags(da.attrs)
     if like is not None:
         if slope.shape != like.shape:
             raise ValueError(f"topo {slope.shape} does not match the image {like.shape}; regenerate it for this crop")
-        # Only `like`'s dimension coords: the topo raster's y/x start at 0 while the cube's carry
-        # its absolute line/sample offset, and per-line coords are not properties of the terrain.
         coords = {d: like[d] for d in like.dims if d in like.coords}
-        slope, aspect, lit = (
-            None if v is None else xr.DataArray(np.asarray(v), coords=coords, dims=like.dims)
-            for v in (slope, aspect, lit)
-        )
+        conv = lambda v: None if v is None else xr.DataArray(np.asarray(v), coords=coords, dims=like.dims)
+        slope, aspect, lit = conv(slope), conv(aspect), conv(lit)
+        if isinstance(sun, tuple) and hasattr(sun[0], "shape"):  # per-row arrays, not an (az, elev) tag pair
+            sun = (conv(sun[0]), conv(sun[1]))
     return slope, aspect, 1.0 if lit is None else lit, sun

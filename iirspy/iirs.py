@@ -65,6 +65,36 @@ def _apply_envi_start(da):
     return da
 
 
+def _chunks(nband, ny, nx, chunk=True):
+    """dask chunk dict for a (band, y, x) cube, or None to leave it unchunked.
+
+    `chunk` is a dict to use as-is, or True to split along y at `utils.CHUNKSIZE`. A cube already
+    under one chunk's worth stays whole -- dask would only add graph overhead.
+    """
+    if not chunk:
+        return None
+    if isinstance(chunk, dict):
+        return chunk
+    if nband * ny * nx * 4 <= utils.CHUNKSIZE:
+        return None
+    return {"band": nband, "y": int(utils.CHUNKSIZE / (nband * nx * 4)), "x": nx}
+
+
+def _row_block(da, sub_rows=None):
+    """Rows per write step. Defaults to the array's own y-chunk, so a block is read exactly once.
+
+    An explicit `sub_rows` wins. Unchunked the cube is already resident, so the block only bounds
+    the float32 copy and `utils.CHUNKSIZE` worth of rows is as good a size as any.
+    """
+    if sub_rows:
+        return sub_rows
+    chunks = getattr(da, "chunks", None)
+    if chunks:
+        return max(chunks[da.dims.index("y")])
+    nband, _, nx = da.shape
+    return max(1, int(utils.CHUNKSIZE / (nband * nx * 4)))
+
+
 FLAT_SMILE_MIN = 0.2  # clip flat*smile away from 0 before dividing (avoids blow-ups)
 
 
@@ -122,10 +152,8 @@ class IIRSData(ABC):
         self.img = self.img.assign_coords(wl=("band", utils.get_wls()[self.img.band.values - 1]))
 
         # Chunk with dask if needed
-        if chunk and self.nband * self.ny * self.nx * 4 > utils.CHUNKSIZE:
-            if not isinstance(chunk, dict):
-                dy = int(utils.CHUNKSIZE / (self.nband * self.nx * 4))
-                chunk = {"band": self.nband, "y": dy, "x": self.nx}
+        chunk = _chunks(self.nband, self.ny, self.nx, chunk)
+        if chunk:
             self.img = self.img.chunk(chunk)
 
     def _extract_metadata(self):
@@ -159,7 +187,7 @@ class IIRSData(ABC):
         """Mask invalid bands (OSF, bad bands)."""
         self.img = self.img.where(~self.img.band.isin((*utils.OSF, *utils.INVALID)))
 
-    def save(self, fout, sub_rows=1000, snr_sidecar=True):
+    def save(self, fout, sub_rows=None, snr_sidecar=True):
         """
         Stream the image cube to disk with bounded memory.
 
@@ -175,8 +203,9 @@ class IIRSData(ABC):
         ----------
         fout : str or Path
             Output path. Extension selects the format (.tif -> GeoTIFF, else ENVI).
-        sub_rows : int
-            Scanlines computed/written per step (bounds peak memory).
+        sub_rows : int, optional
+            Scanlines computed/written per step (bounds peak memory). Default None: the cube's own
+            dask y-chunk, so a write block and a compute block are the same rows.
         snr_sidecar : bool
             Write the broadband `snr` field (if present) to a float32 sidecar next to fout.
 
@@ -189,18 +218,20 @@ class IIRSData(ABC):
             self._save_snr_sidecar(fout, sub_rows)
         return self._write(self.img, fout, sub_rows)
 
-    def _write(self, da, fout, row_block):
+    def _write(self, da, fout, row_block=None):
         """Format dispatch for any camera-space product: `.tif` -> GeoTIFF, else ENVI BIL.
 
         Everything goes out through here -- cube, SNR sidecar, derived planes -- because both
         writers record the absolute first line, without which a product is not GLT-addressable.
+        The one place `row_block` is resolved, so every product's write step matches its own chunks.
         """
         fout = str(fout)
+        row_block = _row_block(da, row_block)
         if fout.lower().endswith(".tif"):
             return self._save_geotiff(fout, row_block, da)
         return utils.write_envi_bil(da, fout, row_block, f"IIRS {da.attrs.get('name', '')}".strip())
 
-    def _save_snr_sidecar(self, fout, row_block=1000):
+    def _save_snr_sidecar(self, fout, row_block=None):
         """Write the (y, x) empirical broadband SNR field beside fout, in fout's own format."""
         snr = self.img.snr.reset_coords(drop=True).expand_dims(band=[1]).astype("float32")
         snr.attrs = {"name": "SNR", "units": ""}
@@ -568,7 +599,7 @@ class L1(IIRSData):
         return instance
 
     @classmethod
-    def from_file(cls, path, basename, directory="."):
+    def from_file(cls, path, basename, directory=".", chunk=True):
         """Load a cropped empirical-L1 GeoTIFF or ENVI cube (native [1000 mW/cm^2/sr/um]) as an L1.
 
         Restores the band numbers, wavelengths and absolute line/sample offset, rescales radiance to
@@ -583,8 +614,14 @@ class L1(IIRSData):
             Image basename (e.g. 20210723T1445053074), used to find spm/geometry in `directory`.
         directory : str
             Directory holding the IIRS bundle (nci ancillary: spm + geometry csv).
+        chunk : bool or dict
+            Chunk image automatically (default: True). Or supply dict of x,y,band chunk sizes (see dask).
         """
         da = _apply_envi_start(xr.open_dataarray(path, engine="rasterio").sortby("y").sortby("x"))
+        nband, ny, nx = da.shape
+        chunk = _chunks(nband, ny, nx, chunk)
+        if chunk:
+            da = da.chunk(chunk)
         bands = np.asarray(_band_numbers(da), dtype=int)
         da = da.assign_coords(band=bands, wl=("band", utils.get_wls()[bands - 1]))
         da = da * utils.RAD_NATIVE_SCALE  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]

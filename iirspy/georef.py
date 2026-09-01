@@ -559,12 +559,10 @@ def camera_xy(gcps, shape):
     return tuple(RectBivariateSpline(rows, cols, a, kx=kx, ky=ky)(ys, xs) for a in xy)
 
 
-def camera_topo(gcps, shape, fgeom, fspm, cfg, kernels=None):
-    """(slope, aspect, lit) as (y, x) camera-space arrays, for the L2 photometric correction.
+def camera_gradients(gcps, shape, fgeom, fspm, cfg, kernels=None):
+    """(sx, sy, lit, info) sampled into (y, x) camera space east/north gradients, not yet slope/aspect.
 
-    Camera space, not the map grid: L2 is computed there, where the per-line solar geometry lives.
-    Each camera pixel is sampled bilinearly at its registered map position, so its slope, aspect
-    and lit fraction come from the DEM neighbourhood that produced the hillshade it matched.
+    Each camera pixel is sampled bilinearly at its map position - consistency with hillshade.
 
     NaN outside `cfg.aoi`: the hillshade covers only that box, so only there are the GCPs measured
     rather than extrapolated. On a strip several times longer than the AOI that is most of the
@@ -578,32 +576,164 @@ def camera_topo(gcps, shape, fgeom, fspm, cfg, kernels=None):
     sx, sy, slit = (map_coordinates(a, rc, order=1, mode="constant", cval=np.nan) for a in (gx, gy, lit))
     out = (x < cfg.aoi[0]) | (x > cfg.aoi[2]) | (y < cfg.aoi[1]) | (y > cfg.aoi[3])
     sx, sy, slit = (np.where(out, np.nan, a) for a in (sx, sy, slit))
+    return sx.astype("float32"), sy.astype("float32"), slit.astype("float32"), info
+
+
+def camera_topo(gcps, shape, fgeom, fspm, cfg, kernels=None):
+    """(slope, aspect, lit) as (y, x) camera-space arrays, for the L2 photometric correction.
+
+    See :func:`camera_gradients` for the sampling; this just converts its gradients to slope/aspect.
+    """
+    sx, sy, lit, info = camera_gradients(gcps, shape, fgeom, fspm, cfg, kernels)
     slope, aspect = slope_aspect(sx, sy)
-    return slope.astype("float32"), aspect.astype("float32"), slit.astype("float32"), info
+    return slope.astype("float32"), aspect.astype("float32"), lit, info
 
 
-def save_topo(fout, slope, aspect, lit, tags=None):
-    """Write the camera-space topo product: a 3-band float32 GeoTIFF, bands named for L2.
+def save_topo(fout, slope, aspect, lit, tags=None, sun_az=None, sun_elev=None):
+    """Write the camera-space topo product: a 3- or 5-band float32 GeoTIFF, bands named for L2.
+
+    `sun_az`/`sun_elev`, if given, are per-row (y,) sun angles broadcast into extra bands 4-5:
+    over a whole strip the tangent-plane sun moves too much for `iirs.py`'s single-scalar-tag
+    convention, so `iirspy.photometry.load_topo` hands these back as (y, x) arrays instead.
 
     No CRS or transform -- this is camera space, and iirspy.photometry.load_topo matches it to the
     L1 cube by shape. Small enough (a few MB) to ship beside every L1.
     """
+    bands = [("slope", slope), ("aspect", aspect), ("lit", lit)]
+    if sun_az is not None:
+        sun_az = np.broadcast_to(np.asarray(sun_az)[:, None], slope.shape)
+        sun_elev = np.broadcast_to(np.asarray(sun_elev)[:, None], slope.shape)
+        bands += [("sun_az", sun_az), ("sun_elev", sun_elev)]
     with rasterio.open(
         fout,
         "w",
         driver="GTiff",
         height=slope.shape[0],
         width=slope.shape[1],
-        count=3,
+        count=len(bands),
         dtype="float32",
         compress="LZW",
         tiled=True,
     ) as dst:
-        for i, (name, a) in enumerate([("slope", slope), ("aspect", aspect), ("lit", lit)], start=1):
+        for i, (name, a) in enumerate(bands, start=1):
             dst.write(np.asarray(a, dtype="float32"), i)
             dst.set_band_description(i, name)
         dst.update_tags(**{k: str(v) for k, v in (tags or {}).items()})
     return fout
+
+
+def _row_bands(gcps, ny, cfg):
+    """Per absolute camera row 0..ny-1, the `chunks.BANDS` name to render its topo with.
+
+    A row takes the polar band only if both lattice rows bracketing it are themselves fully inside
+    the polar `lat_range` -- conservative at the transition, since the midlat DEM's wider
+    `dem_range` already covers the whole group. Equatorial has one band; no split.
+    """
+    from iirspy import chunks as ck
+
+    if cfg.pole == "equatorial":
+        return np.full(ny, "equatorial", dtype=object)
+    polar, midlat = cfg.pole, f"{cfg.pole}_midlat"
+    lo, hi = ck.BANDS[polar]["lat_range"]
+    rows = np.array(sorted({g.row for g in gcps}))
+    is_polar = np.empty(len(rows), dtype=bool)
+    for i, r in enumerate(rows):
+        xs = [g.x for g in gcps if g.row == r]
+        ys = [g.y for g in gcps if g.row == r]
+        _, lat = to_lonlat(cfg.pole).transform(xs, ys)
+        is_polar[i] = bool(np.all((np.asarray(lat) >= lo) & (np.asarray(lat) <= hi)))
+    band = np.full(ny, midlat, dtype=object)
+    idx = np.arange(ny)
+    band[idx < rows[0]] = polar if is_polar[0] else midlat
+    band[idx >= rows[-1]] = polar if is_polar[-1] else midlat
+    for i in range(len(rows) - 1):
+        if is_polar[i] and is_polar[i + 1]:
+            band[(idx >= rows[i]) & (idx < rows[i + 1])] = polar
+    return band
+
+
+def _split_run(r0, r1, max_rows=2000):
+    """[(a, z), ...] roughly-equal pieces covering [r0, r1), each <= max_rows.
+
+    `max_rows` caps the DEM area one topo render crops at 30 m, ~164 km of track at 2000 rows.
+
+    >>> _split_run(0, 4500, max_rows=2000)
+    [(0, 1500), (1500, 3000), (3000, 4500)]
+    >>> _split_run(0, 1200, max_rows=2000)
+    [(0, 1200)]
+    """
+    n = r1 - r0
+    if n <= max_rows:
+        return [(r0, r1)]
+    k = -(-n // max_rows)
+    edges = np.linspace(r0, r1, k + 1).round().astype(int)
+    return list(zip(edges[:-1].tolist(), edges[1:].tolist(), strict=True))
+
+
+def scene_topo(sid, group, gcps, shape, fgeom, fspm, cfg, kernels, topo_dir, overwrite=False) -> Path:
+    """The scene's camera-space topo product (slope/aspect/lit + per-row sun), built if not there.
+
+    Splits the strip into `_split_run`-sized pieces, each its own band (see `_row_bands`), its own
+    DEM crop (AOI = bbox of its own GCPs + `cfg.margin_m`) and one `camera_gradients` call; pieces
+    resample already-fixed positions rather than reconciling independent solves, so gradients just
+    concatenate. `slope_aspect` runs once, over the assembled gradients, since -- unlike them -- it
+    is nonlinear (circular, for aspect) across a seam. Each piece's own (az, elev) is interpolated
+    to every row and written as two extra bands; the tags keep the strip-midpoint scalar for
+    provenance.
+    """
+    from dataclasses import replace
+
+    from iirspy import chunks as ck
+
+    f = Path(topo_dir) / f"{sid}_{group}_topo.tif"
+    if f.exists() and not overwrite:
+        return f
+    f.parent.mkdir(parents=True, exist_ok=True)
+
+    ny, nx = shape
+    resolved = ck.bands()
+    band_of_row = _row_bands(gcps, ny, cfg)
+    pieces: list[tuple[int, int, str]] = []
+    for name in dict.fromkeys(band_of_row.tolist()):
+        for a, z in ck._runs(band_of_row == name):
+            pieces.extend((a2, z2, name) for a2, z2 in _split_run(a, z))
+    pieces.sort(key=lambda p: p[0])
+
+    sx = np.full((ny, nx), np.nan, "float32")
+    sy = np.full((ny, nx), np.nan, "float32")
+    lit = np.full((ny, nx), np.nan, "float32")
+    centers, azs, elevs, used_bands = [], [], [], []
+    for a, z, name in pieces:
+        b = resolved[name]
+        own = [g for g in gcps if a <= g.row < z] or gcps
+        xs, ys = [g.x for g in own], [g.y for g in own]
+        aoi = (
+            min(xs) - cfg.margin_m,
+            min(ys) - cfg.margin_m,
+            max(xs) + cfg.margin_m,
+            max(ys) + cfg.margin_m,
+        )
+        pcfg = replace(cfg, aoi=aoi, dem_near=b["dem_near"], dem_far=b["dem_far"])
+        shifted = [GroundControlPoint(row=g.row - a, col=g.col, x=g.x, y=g.y) for g in gcps]
+        psx, psy, plit, info = camera_gradients(shifted, (z - a, nx), fgeom, fspm, pcfg, kernels)
+        sx[a:z], sy[a:z], lit[a:z] = psx, psy, plit
+        centers.append((a + z) / 2)
+        azs.append(info["az_grid"])
+        elevs.append(info["elev"])
+        used_bands.append(name)
+
+    slope, aspect = slope_aspect(sx, sy)
+    rows = np.arange(ny)
+    sun_az = np.interp(rows, centers, azs) if len(centers) > 1 else np.full(ny, azs[0])
+    sun_elev = np.interp(rows, centers, elevs) if len(centers) > 1 else np.full(ny, elevs[0])
+    mid = ny // 2
+    tags = {
+        "az_grid": float(sun_az[mid]),
+        "elev": float(sun_elev[mid]),
+        "bands_used": ",".join(dict.fromkeys(used_bands)),
+        "n_pieces": len(pieces),
+    }
+    return Path(save_topo(f, slope, aspect, lit, tags=tags, sun_az=sun_az, sun_elev=sun_elev))
 
 
 # ------------------------------------------------------------------------------------------
