@@ -208,6 +208,18 @@ def build_l1(lat_range: tuple[float, float], bands: list[int], ftif_out: Path) -
     # to always re-run even on an L1 cache hit. Without this, a cache hit skips `_stage_inputs`
     # below and STAGE never gets the spm the zip carries, since it does not live in ARCHIVE.
     subprocess.run([sys.executable, "-m", "issdc_iirs", str(ZIP), "-o", str(STAGE)], check=True)  # noqa: S603
+    # The nri zip's own layout only ever yields .../raw, but iirspy.L1 (level=1) always looks
+    # under .../calibrated -- for spm (calibrate()'s FileNotFoundError check) and for the xml
+    # label (from_xarray's solar_inc/solar_az lookup, iirs.py `paths.get("qub"/"xml")` at
+    # level=1). Mirror both so a stage-only run (no full nci archive copy) still satisfies them.
+    day = SID[:8]
+    for root, ext in (("miscellaneous", "spm"), ("data", "xml")):
+        src_dir = STAGE / root / "raw" / day
+        dst_dir = STAGE / root / "calibrated" / day
+        for fsrc in src_dir.glob(f"*{SID}*.{ext}"):
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            if not (dst_dir / fsrc.name).exists():
+                shutil.copyfile(fsrc, dst_dir / fsrc.name)
 
     fmeta = ftif_out.with_suffix(".meta.json")
     if ftif_out.exists() and fmeta.exists():
@@ -223,7 +235,6 @@ def build_l1(lat_range: tuple[float, float], bands: list[int], ftif_out: Path) -
     import iirspy.utils as utils
     from iirspy import L0
 
-    day = SID[:8]
     raw_qub = _stage_inputs(day, bands)
 
     l1 = L0(SID, STAGE, chunk={"band": -1, "y": 1024, "x": -1}).calibrate(
