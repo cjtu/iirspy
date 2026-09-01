@@ -217,8 +217,9 @@ def test_row_bands_falls_back_to_midlat_across_the_polar_seam():
     assert set(band[100:150]) == {"south_midlat"}
 
 
-def test_scene_topo_assembles_pieces_with_no_blending_and_monotone_sun(tmp_path, monkeypatch):
-    """Pieces just concatenate (no seam blending), and per-row sun interpolates monotonically."""
+def test_scene_topo_assembles_pieces_with_no_blending_and_exact_per_row_sun(tmp_path, monkeypatch):
+    """Pieces just concatenate (no seam blending); the sun bands are `sun_geometry_rows`'s own
+    exact per-pixel values passed straight through, not a piece-centroid interpolation."""
     from dataclasses import replace
 
     from iirspy import chunks as ck
@@ -242,11 +243,24 @@ def test_scene_topo_assembles_pieces_with_no_blending_and_monotone_sun(tmp_path,
         gx = np.full((len(ys), len(xs)), val, "float32")
         gy = np.zeros_like(gx)
         lit = np.ones_like(gx)
-        elev = val / 1e5
         calls.append(val)
-        return gx, gy, lit, tr, {"az_grid": 10.0, "elev": elev, "r_sun": 0.27}
+        return gx, gy, lit, tr, {"az_grid": 10.0, "elev": val / 1e5, "r_sun": 0.27}
 
     monkeypatch.setattr(georef, "render_topo", fake_render_topo)
+
+    # Distinct from render_topo's own per-piece (az, elev), and varying across x too (not just y),
+    # so the test fails if scene_topo either falls back to piece info or collapses the per-pixel
+    # (not just per-row) field save_topo is now expected to carry through untouched.
+    want_elev = np.linspace(-1.0, 1.0, ny)[:, None] + np.linspace(0.0, 0.01, nx)[None, :]
+    monkeypatch.setattr(
+        georef,
+        "sun_geometry_rows",
+        lambda gcps, shape, fspm, cfg, scan0, kernels=None: (
+            np.full(shape, 20.0),
+            want_elev,
+        ),
+    )
+
     f = georef.scene_topo("sid", "equatorial", gcps, (ny, nx), "fgeom", "fspm", cfg, [], tmp_path)
 
     assert len(calls) >= 2  # the strip really did split into multiple pieces
@@ -260,8 +274,6 @@ def test_scene_topo_assembles_pieces_with_no_blending_and_monotone_sun(tmp_path,
 
     # Recompute the expected piece boundaries the same way scene_topo does, and check every row's
     # slope matches its own piece's constant gradient -- concatenation, no cross-piece blending.
-    from iirspy import chunks as ck
-
     band_of_row = georef._row_bands(gcps, ny, cfg)
     pieces = [p for a, z in ck._runs(band_of_row == "equatorial") for p in georef._split_run(a, z)]
     assert len(pieces) == len(calls)
@@ -269,9 +281,9 @@ def test_scene_topo_assembles_pieces_with_no_blending_and_monotone_sun(tmp_path,
         want = np.degrees(np.arctan(abs(val)))
         np.testing.assert_allclose(slope[a:z], want, atol=1e-3)
 
-    # Per-row sun elevation must be monotone between piece centres (np.interp of an increasing
-    # sequence), matching the along-track sun geometry each piece reported.
-    assert np.all(np.diff(sun_elev) >= -1e-6)
+    # Every pixel's sun elevation is sun_geometry_rows's own per-pixel value, not an interpolation
+    # of render_topo's piece-level (az, elev) and not collapsed back down to per-row.
+    np.testing.assert_allclose(sun_elev, want_elev, atol=1e-5)
 
 
 def test_gcp_lattice_samples_the_geometry_spline_at_the_right_rows(tmp_path):

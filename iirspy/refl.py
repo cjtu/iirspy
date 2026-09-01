@@ -203,7 +203,9 @@ def main(argv: list[str] | None = None) -> None:
     ftopo = (
         None
         if args.no_topo
-        else georef.scene_topo(sid, group, gcps, l1.img.shape[-2:], fgeom, fspm, cfg, kernels, fgcps.parent)
+        else georef.scene_topo(
+            sid, group, gcps, l1.img.shape[-2:], fgeom, fspm, cfg, kernels, fgcps.parent, scan0=scan0
+        )
     )
     solve.log(f"topo: {ftopo or 'skipped (--no-topo)'}")
 

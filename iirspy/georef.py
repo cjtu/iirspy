@@ -348,11 +348,15 @@ def lambert_shade(dem, pixel_size, sun_az, sun_elev):
 # 3. Reference hillshade
 # ------------------------------------------------------------------------------------------
 def _enu(lon, lat):
-    """East, north, up unit vectors at a body-fixed lon/lat (degrees)."""
+    """East, north, up unit vectors at a body-fixed lon/lat (degrees), scalar or same-shape arrays.
+
+    Stacked on axis 0, so a (3,) result for scalar input and a (3, ...) result for array input --
+    either way `u @ east` (u the (3,) sun vector) dots correctly against every point at once.
+    """
     lo, la = np.radians(lon), np.radians(lat)
-    east = np.array([-np.sin(lo), np.cos(lo), 0.0])
-    north = np.array([-np.sin(la) * np.cos(lo), -np.sin(la) * np.sin(lo), np.cos(la)])
-    up = np.array([np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)])
+    east = np.stack([-np.sin(lo), np.cos(lo), np.zeros_like(lo)])
+    north = np.stack([-np.sin(la) * np.cos(lo), -np.sin(la) * np.sin(lo), np.cos(la)])
+    up = np.stack([np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)])
     return east, north, up
 
 
@@ -397,6 +401,44 @@ def sun_geometry(fgeom, fspm, cfg, kernels=None):
     el = np.degrees(np.arcsin(u @ up))
     r_sun = np.degrees(np.arcsin(695_700_000.0 / (np.linalg.norm(v) * 1000.0)))
     return float(az_grid), float(el), float(r_sun)
+
+
+def sun_geometry_rows(gcps, shape, fspm, cfg, scan0, kernels=None):
+    """(az_grid, elev) at every camera *pixel*. Exact sun angle on the solved geometry.
+
+    Ground position comes from `camera_xy` (the solved GCP lattice).
+
+    `scan0` is the crop's first absolute Scan (`solve.build_l1`'s own return): `fspm` is indexed
+    by absolute Scan, not this crop's own 0-based row numbering.
+    """
+    import spiceypy as sp
+
+    for k in kernels or []:
+        sp.furnsh(str(k))
+
+    ny, nx = shape
+    x, y = camera_xy(gcps, shape)
+    lon, lat = to_lonlat(cfg.pole).transform(x, y)
+    lon = np.where(lon > 180, lon - 360, lon)
+
+    spm = utils.load_iirs_spm(fspm)
+    spm_row = spm.row.to_numpy()
+    spm_ns = spm.datetime.to_numpy().astype("datetime64[ns]").astype("int64")
+    row_ns = np.interp(scan0 + np.arange(ny), spm_row, spm_ns).astype("int64")
+
+    lon0 = stereo_crs(cfg.pole).to_dict().get("lon_0", 0.0)
+    grid_sign = 0.0 if cfg.pole == "equatorial" else (-1.0 if cfg.pole == "north" else 1.0)
+
+    az = np.empty((ny, nx))
+    el = np.empty((ny, nx))
+    for r in range(ny):
+        et = sp.str2et(pd.Timestamp(row_ns[r]).strftime("%Y-%m-%dT%H:%M:%S.%f"))
+        v, _ = sp.spkpos("SUN", et, "IAU_MOON", "LT+S", "MOON")
+        u = np.asarray(v) / np.linalg.norm(v)
+        east, north, up = _enu(lon[r], lat[r])  # each (3, nx): this row's local frame per column
+        az[r] = (np.degrees(np.arctan2(u @ east, u @ north)) + grid_sign * (lon[r] - lon0)) % 360
+        el[r] = np.degrees(np.arcsin(u @ up))
+    return az, el
 
 
 def shadow_reach_m(elev_deg, relief_m=12_180.0, radius=MOON_RADIUS_M):
@@ -461,13 +503,18 @@ def _onto(arr, tr_src, tr_dst, shape_dst):
 
 
 def _tier(path, cfg, az, el, r_sun, reach_m, min_range_m, dec=1):
-    """Lit fraction for one DEM tier, on that DEM's own grid."""
+    """Lit fraction for one DEM tier, on that DEM's own grid.
+
+    Returns `z_raw` (metres above the sphere, no tangent-plane correction) alongside the
+    corrected `z` the horizon sweep needs -- callers wanting a local surface gradient want the
+    former (see `render_topo`).
+    """
     cx, cy = (cfg.aoi[0] + cfg.aoi[2]) / 2, (cfg.aoi[1] + cfg.aoi[3]) / 2
     z_raw, tr, ps = load_lola_elev(path, bounds=_upsun_box(cfg.aoi, az, reach_m, cfg.margin_m), dec=dec)
     z = tangent_z(z_raw, ps, origin=((cy - tr.f) / tr.e, (cx - tr.c) / tr.a))
     lad = penumbra_ladder(el, r_sun)
     lit = lit_fraction(lad[horizon_1az(z, ps, az, lad, min_range_m)], el, r_sun)
-    return lit, tr, ps, z
+    return lit, tr, ps, z, z_raw
 
 
 def _to_gsd(a, ps_src, cfg):
@@ -485,10 +532,10 @@ def render_reference(fgeom, fspm, cfg, kernels=None):
     to it -- always toward too much light. Returns (shade, info).
     """
     az, el, r_sun = sun_geometry(fgeom, fspm, cfg, kernels)
-    lit_n, tr_n, ps_n, z_n = _tier(cfg.dem_near, cfg, az, el, r_sun, cfg.near_m, 0.0)
+    lit_n, tr_n, ps_n, z_n, _ = _tier(cfg.dem_near, cfg, az, el, r_sun, cfg.near_m, 0.0)
     lit = lit_n
     if cfg.dem_far:
-        lit_f, tr_f, _, _ = _tier(cfg.dem_far, cfg, az, el, r_sun, _far_reach(cfg, el), cfg.near_m, dec=cfg.far_dec)
+        lit_f, tr_f, _, _, _ = _tier(cfg.dem_far, cfg, az, el, r_sun, _far_reach(cfg, el), cfg.near_m, dec=cfg.far_dec)
         lit = np.minimum(lit_n, _onto(lit_f, tr_f, tr_n, lit_n.shape))
     fine = lambert_shade(z_n, ps_n, az, el) * lit
 
@@ -525,15 +572,17 @@ def render_topo(fgeom, fspm, cfg, kernels=None):
     function of the surface; the smoothed gradient is the gradient of the smoothed surface, the
     facet IIRS sees across its 76.5 m ground sample.
 
+    Differenced off `z_raw` ("metres above the sphere") abosolute el, not tangenet-plane-relative.
+
     Returns (gx, gy, lit, transform, info) on the near tier's own grid; feed it to
     :func:`camera_topo` to land in camera space.
     """
     az, el, r_sun = sun_geometry(fgeom, fspm, cfg, kernels)
-    lit, tr_n, ps_n, z_n = _tier(cfg.dem_near, cfg, az, el, r_sun, cfg.near_m, 0.0)
+    lit, tr_n, ps_n, _, z_raw = _tier(cfg.dem_near, cfg, az, el, r_sun, cfg.near_m, 0.0)
     if cfg.dem_far:
-        lit_f, tr_f, _, _ = _tier(cfg.dem_far, cfg, az, el, r_sun, _far_reach(cfg, el), cfg.near_m, dec=cfg.far_dec)
+        lit_f, tr_f, _, _, _ = _tier(cfg.dem_far, cfg, az, el, r_sun, _far_reach(cfg, el), cfg.near_m, dec=cfg.far_dec)
         lit = np.minimum(lit, _onto(lit_f, tr_f, tr_n, lit.shape))
-    dzdy_row, dzdx = np.gradient(z_n, ps_n)
+    dzdy_row, dzdx = np.gradient(z_raw, ps_n)
     gx, gy = _to_gsd(dzdx, ps_n, cfg), _to_gsd(-dzdy_row, ps_n, cfg)  # east, north
     return gx, gy, _to_gsd(lit, ps_n, cfg), tr_n, {"az_grid": az, "elev": el, "r_sun": r_sun}
 
@@ -592,17 +641,20 @@ def camera_topo(gcps, shape, fgeom, fspm, cfg, kernels=None):
 def save_topo(fout, slope, aspect, lit, tags=None, sun_az=None, sun_elev=None):
     """Write the camera-space topo product: a 3- or 5-band float32 GeoTIFF, bands named for L2.
 
-    `sun_az`/`sun_elev`, if given, are per-row (y,) sun angles broadcast into extra bands 4-5:
-    over a whole strip the tangent-plane sun moves too much for `iirs.py`'s single-scalar-tag
-    convention, so `iirspy.photometry.load_topo` hands these back as (y, x) arrays instead.
+    `sun_az`/`sun_elev`, if given, land in extra bands 4-5: over a whole strip the tangent-plane
+    sun moves too much for `iirs.py`'s single-scalar-tag convention, so `iirspy.photometry.load_topo`
+    hands these back as (y, x) arrays instead. Either a per-row (y,) array (broadcast across x) or
+    an already-per-pixel (y, x) one (`georef.sun_geometry_rows`'s own output) is accepted.
 
     No CRS or transform -- this is camera space, and iirspy.photometry.load_topo matches it to the
     L1 cube by shape. Small enough (a few MB) to ship beside every L1.
     """
     bands = [("slope", slope), ("aspect", aspect), ("lit", lit)]
     if sun_az is not None:
-        sun_az = np.broadcast_to(np.asarray(sun_az)[:, None], slope.shape)
-        sun_elev = np.broadcast_to(np.asarray(sun_elev)[:, None], slope.shape)
+        sun_az, sun_elev = np.asarray(sun_az), np.asarray(sun_elev)
+        if sun_az.ndim == 1:
+            sun_az = np.broadcast_to(sun_az[:, None], slope.shape)
+            sun_elev = np.broadcast_to(sun_elev[:, None], slope.shape)
         bands += [("sun_az", sun_az), ("sun_elev", sun_elev)]
     with rasterio.open(
         fout,
@@ -670,16 +722,18 @@ def _split_run(r0, r1, max_rows=2000):
     return list(zip(edges[:-1].tolist(), edges[1:].tolist(), strict=True))
 
 
-def scene_topo(sid, group, gcps, shape, fgeom, fspm, cfg, kernels, topo_dir, overwrite=False) -> Path:
-    """The scene's camera-space topo product (slope/aspect/lit + per-row sun), built if not there.
+def scene_topo(sid, group, gcps, shape, fgeom, fspm, cfg, kernels, topo_dir, scan0=0, overwrite=False) -> Path:
+    """The scene's camera-space topo product (slope/aspect/lit + per-pixel sun), built if not there.
 
     Splits the strip into `_split_run`-sized pieces, each its own band (see `_row_bands`), its own
     DEM crop (AOI = bbox of its own GCPs + `cfg.margin_m`) and one `camera_gradients` call; pieces
     resample already-fixed positions rather than reconciling independent solves, so gradients just
     concatenate. `slope_aspect` runs once, over the assembled gradients, since -- unlike them -- it
-    is nonlinear (circular, for aspect) across a seam. Each piece's own (az, elev) is interpolated
-    to every row and written as two extra bands; the tags keep the strip-midpoint scalar for
-    provenance.
+    is nonlinear (circular, for aspect) across a seam. Sun az/elev are `sun_geometry_rows`'s exact
+    per-pixel values (see there for why a pole-crossing strip needs the cross-track term too, not
+    just along-track), not a piece average -- the photometric model is far more sensitive to a
+    wrong angle than the shadow cast is. `scan0` (see `sun_geometry_rows`) defaults to 0, correct
+    only when `shape`'s row 0 is the strip's own absolute Scan 0.
     """
     from dataclasses import replace
 
@@ -702,7 +756,7 @@ def scene_topo(sid, group, gcps, shape, fgeom, fspm, cfg, kernels, topo_dir, ove
     sx = np.full((ny, nx), np.nan, "float32")
     sy = np.full((ny, nx), np.nan, "float32")
     lit = np.full((ny, nx), np.nan, "float32")
-    centers, azs, elevs, used_bands = [], [], [], []
+    used_bands = []
     for a, z, name in pieces:
         b = resolved[name]
         own = [g for g in gcps if a <= g.row < z] or gcps
@@ -715,21 +769,16 @@ def scene_topo(sid, group, gcps, shape, fgeom, fspm, cfg, kernels, topo_dir, ove
         )
         pcfg = replace(cfg, aoi=aoi, dem_near=b["dem_near"], dem_far=b["dem_far"])
         shifted = [GroundControlPoint(row=g.row - a, col=g.col, x=g.x, y=g.y) for g in gcps]
-        psx, psy, plit, info = camera_gradients(shifted, (z - a, nx), fgeom, fspm, pcfg, kernels)
+        psx, psy, plit, _ = camera_gradients(shifted, (z - a, nx), fgeom, fspm, pcfg, kernels)
         sx[a:z], sy[a:z], lit[a:z] = psx, psy, plit
-        centers.append((a + z) / 2)
-        azs.append(info["az_grid"])
-        elevs.append(info["elev"])
         used_bands.append(name)
 
     slope, aspect = slope_aspect(sx, sy)
-    rows = np.arange(ny)
-    sun_az = np.interp(rows, centers, azs) if len(centers) > 1 else np.full(ny, azs[0])
-    sun_elev = np.interp(rows, centers, elevs) if len(centers) > 1 else np.full(ny, elevs[0])
+    sun_az, sun_elev = sun_geometry_rows(gcps, shape, fspm, cfg, scan0, kernels)
     mid = ny // 2
     tags = {
-        "az_grid": float(sun_az[mid]),
-        "elev": float(sun_elev[mid]),
+        "az_grid": float(sun_az[mid, nx // 2]),
+        "elev": float(sun_elev[mid, nx // 2]),
         "bands_used": ",".join(dict.fromkeys(used_bands)),
         "n_pieces": len(pieces),
     }
