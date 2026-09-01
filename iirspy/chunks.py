@@ -35,6 +35,10 @@ _DEM_ROOTS = [
 # Kernel tree holding lsk/, pck/, sclk/, fk/ and spk/.
 SPICE = Path(os.environ.get("IIRS_SPICE", str(ARCHIVE / "spice")))
 
+# Our own re-solved products, laid out like the archive's own `<category>/<level>/<day>/` tree so
+# the two read the same way -- but not under IIRS_ARCHIVE, since these are derived, not PDS-shipped.
+RECAL_ROOT = Path(os.environ.get("IIRS_RECAL_ROOT", str(Path.home() / "data" / "iirs")))
+
 
 def _dem(sub: str, name: str) -> str:
     """Path to a LOLA product by its bare product name, preferring a COG over the GDR JP2.
@@ -255,13 +259,30 @@ def _one(pattern: str) -> Path | None:
     return None
 
 
+def recal_dir(sid: str, group: str) -> Path:
+    """Where `sid`/`group`'s recalibrated geometry lives: `geometry/recalibrated/<day>/<sid>_<group>`.
+
+    One dir holds everything a solve produces for that scene/group -- merged GCPs, chunk fits,
+    run log, and the GLT -- mirroring `geometry/calibrated`'s own `<day>` nesting.
+    """
+    return RECAL_ROOT / "geometry" / "recalibrated" / sid[:8] / f"{sid}_{group}"
+
+
 def ancillary(sid: str) -> dict[str, Path | None]:
-    """The geometry csv and spm for `sid`, each None if not on disk."""
+    """The geometry csv and spm for `sid`, plus this pipeline's own recalibrated GCPs/GLT per
+    group -- each `None` if not on disk yet."""
     day = sid[:8]
-    return {
+    out: dict[str, Path | None] = {
         "geometry/calibrated": _one(f"geometry/calibrated/{day}/ch2_iir_nci_{sid}_g_grd_*.csv"),
         "miscellaneous/raw": _one(f"miscellaneous/raw/{day}/ch2_iir_nri_{sid}_d_img_*.spm"),
     }
+    for group in GROUPS:
+        d = recal_dir(sid, group)
+        gcps = d / f"{sid}_{group}.gcps"
+        glt = d / f"{sid}_{group}_glt.tif"
+        out[f"geometry/recalibrated/gcps_{group}"] = gcps if gcps.is_file() and gcps.stat().st_size > 0 else None
+        out[f"geometry/recalibrated/glt_{group}"] = glt if glt.is_file() else None
+    return out
 
 
 def nri_zip(sid: str) -> Path | None:

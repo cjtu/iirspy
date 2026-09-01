@@ -8,9 +8,10 @@ group's CRS. No re-registration -- if the scene isn't solved yet, this refuses t
         [--gcps PATH] [--thermal-corr ""|verma] [--photom lambert|lommel_seeliger|lunar_lambert]
 
 `--gcps` defaults to the standard `iirs-solve-scene --keep` layout:
-$HOME/data/iirs/gcps/<sid>_<group>/<sid>_<group>_merged.gcps
+geometry/recalibrated/<day>/<sid>_<group>/<sid>_<group>.gcps under `IIRS_RECAL_ROOT`.
 
-Paths come from `IIRS_ARCHIVE`, `IIRS_DEM_ROOTS`, `IIRS_SPICE` and `IIRS_STAGE`, same as `iirspy.solve`.
+Paths come from `IIRS_ARCHIVE`, `IIRS_DEM_ROOTS`, `IIRS_SPICE`, `IIRS_STAGE` and `IIRS_RECAL_ROOT`,
+same as `iirspy.solve`.
 """
 
 from __future__ import annotations
@@ -21,8 +22,6 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
-
-from rasterio.control import GroundControlPoint
 
 from iirspy import chunks as ck
 from iirspy import solve
@@ -45,16 +44,6 @@ def _full_bands() -> list[int]:
     from iirspy import utils
 
     return sorted(set(range(1, 257)) - set(utils.OSF) - set(utils.INVALID))
-
-
-def _gcps_and_aoi(fgcps: Path) -> tuple[list[GroundControlPoint], tuple[float, float, float, float]]:
-    """GroundControlPoints from a merged `.gcps` file, plus the AOI their own x/y span."""
-    merged = solve._load_gcps(fgcps)
-    if not merged:
-        sys.exit(f"{fgcps} has no GCPs")
-    gcps = [GroundControlPoint(row=float(r), col=float(c), x=float(x), y=float(y)) for (r, c), (x, y) in merged.items()]
-    xs, ys = [g.x for g in gcps], [g.y for g in gcps]
-    return gcps, (min(xs), min(ys), max(xs), max(ys))
 
 
 def _solve_quality(fgcps: Path) -> dict:
@@ -89,27 +78,22 @@ def _parser():
     ap.add_argument(
         "--gcps",
         default=None,
-        help="merged GCPs from iirs-solve-scene --keep (default $HOME/data/iirs/gcps/<sid>_<group>/"
-        "<sid>_<group>_merged.gcps)",
+        help="merged GCPs from iirs-solve-scene --keep (default geometry/recalibrated/<day>/"
+        "<sid>_<group>/<sid>_<group>.gcps under IIRS_RECAL_ROOT)",
     )
-    ap.add_argument("--glts", default=str(Path.home() / "data" / "iirs" / "glts"), help="where scene GLTs live")
     ap.add_argument("--thermal-corr", default="", choices=("", "verma"), help="L2 thermal correction")
     ap.add_argument("--photom", default="lambert", help="photometric model name (iirspy.photometry.MODELS)")
     return ap
 
 
 def main(argv: list[str] | None = None) -> None:
-    from iirspy import georef, glt
+    from iirspy import georef
     from iirspy.iirs import L1
 
     args = _parser().parse_args(argv)
     sid, group = args.sid, args.group
 
-    fgcps = (
-        Path(args.gcps)
-        if args.gcps
-        else Path.home() / "data" / "iirs" / "gcps" / f"{sid}_{group}" / f"{sid}_{group}_merged.gcps"
-    )
+    fgcps = Path(args.gcps) if args.gcps else solve.merged_gcps_path(sid, group)
     if not fgcps.is_file() or fgcps.stat().st_size == 0:
         sys.exit(f"{fgcps} missing or empty -- {sid} {group} is not solved yet (run iirs-solve-scene first)")
 
@@ -123,7 +107,7 @@ def main(argv: list[str] | None = None) -> None:
     solve._log_provenance()
     solve.log(f"{sid} group={group} zip={solve.ZIP.name} ncpu={solve.ncpu()} stage={solve.STAGE} gcps={fgcps}")
 
-    gcps, aoi = _gcps_and_aoi(fgcps)
+    gcps, aoi = georef._gcps_and_aoi(fgcps)
     lat_range = ck.l1_lat_range(group)
     cfg = replace(ck.chunk_cfg(group), aoi=aoi, lat_band=lat_range)
     solve.log(f"aoi from {len(gcps)} merged gcps: {[round(v / 1000, 1) for v in aoi]} km")
@@ -151,9 +135,9 @@ def main(argv: list[str] | None = None) -> None:
     l2.save(str(fl2))
     solve.log(f"L2 saved: {fl2}")
     for f in (Path(ftif), fl2):
-        solve.log(f"gcp vrt -> {glt.save_gcp_vrt(f, gcps, georef.stereo_crs(group))}")
+        solve.log(f"gcp vrt -> {georef.save_gcp_vrt(f, gcps, georef.stereo_crs(group))}")
 
-    fglt = glt.scene_glt(sid, group, gcps, cfg, scan0, args.glts)
+    fglt = georef.scene_glt(sid, group, gcps, cfg, scan0, ck.recal_dir(sid, group))
     solve.log(f"glt: {fglt}")
 
     summary = {

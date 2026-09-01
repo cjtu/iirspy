@@ -35,8 +35,8 @@ OVERLAP_FRAC = 0.10
 
 # Copied to `--keep`; everything else in the work dir is rebuildable from the zip.
 # - all gcp files generated and run log / json stats
-# - `*_merged_final.tif`: the final warped raster using the merged gcps (only 1 band, 10s of MB)
-KEEP_GLOBS = ("*.gcps", "chunk*_fit.json", "chunks.json", "summary.json", "run.log", "*_merged_final.tif")
+# - `*_L1_b*.tif`: the final warped raster at the registration band (only 1 band, 10s of MB)
+KEEP_GLOBS = ("*.gcps", "chunk*_fit.json", "chunks.json", "summary.json", "run.log", "*_L1_b*.tif")
 
 # Set by `main` from argv; module-level because `build_l1` and `log` both need them.
 SID = ""
@@ -245,8 +245,22 @@ def build_l1(lat_range: tuple[float, float], bands: list[int], ftif_out: Path) -
 
 def _merged_gcps_paths(keep: str | None) -> list[Path]:
     """Where a previous run's merged GCPs could be, work dir first."""
-    name = f"{SID}_{GROUP}_merged.gcps"
+    name = f"{SID}_{GROUP}.gcps"
     return [OUT / name, *([Path(keep) / name] if keep else [])]
+
+
+def merged_gcps_path(sid: str, group: str) -> Path:
+    """Where `sid`/`group`'s merged GCPs land once solved -- the durable `--keep` layout every
+    cluster script and CLI default assumes, independent of any particular run's `--out`."""
+    return ck.recal_dir(sid, group) / f"{sid}_{group}.gcps"
+
+
+def already_solved(sid: str, group: str) -> bool:
+    """Whether `sid`/`group` has a non-empty merged-GCPs file -- what a submission script checks
+    before deciding a scene needs a solve job at all (job-count control belongs there, not in a
+    job that's already been spawned)."""
+    f = merged_gcps_path(sid, group)
+    return f.is_file() and f.stat().st_size > 0
 
 
 def keep_products(out: Path, dest: Path) -> list[Path]:
@@ -272,12 +286,12 @@ def _make_glt(merged: dict, cfg0, scan0: int, glt_dir: str, overwrite: bool = Fa
     """Build the scene's GLT from the merged GCPs."""
     from rasterio.control import GroundControlPoint
 
-    from iirspy import glt as glt_mod
+    from iirspy import georef
 
     gcps = [GroundControlPoint(row=r, col=c, x=x, y=y) for (r, c), (x, y) in merged.items()]
     xs, ys = [g.x for g in gcps], [g.y for g in gcps]
     cfg = replace(cfg0, aoi=(min(xs), min(ys), max(xs), max(ys)))
-    return glt_mod.scene_glt(SID, GROUP, gcps, cfg, scan0, glt_dir, overwrite)
+    return georef.scene_glt(SID, GROUP, gcps, cfg, scan0, glt_dir, overwrite)
 
 
 def _glt_only(args, cfg0, fgeom, lat_range) -> bool:
@@ -288,8 +302,12 @@ def _glt_only(args, cfg0, fgeom, lat_range) -> bool:
     if fgeom is None:
         sys.exit(f"missing geometry csv for {SID}")
     merged = _load_gcps(fdone)
-    f = _make_glt(merged, replace(cfg0, lat_band=lat_range), _scene_scan0(fgeom, lat_range), args.glts)
+    glt_dir = args.keep or str(ck.recal_dir(SID, GROUP))
+    f = _make_glt(merged, replace(cfg0, lat_band=lat_range), _scene_scan0(fgeom, lat_range), glt_dir)
     log(f"{fdone} exists ({len(merged)} gcps) -- skipped solve, glt: {f}")
+    if args.clean:
+        shutil.rmtree(OUT, ignore_errors=True)
+        print(f"removed work dir {OUT}", flush=True)
     return True
 
 
@@ -313,7 +331,7 @@ def _warp_merged(merged: dict, used_chunks: list[dict], cfg0, ftif: Path):
         ),
     )
     final = project(read_band(ftif, final_cfg.band), gcps, final_cfg)
-    ffinal = OUT / f"{SID}_{GROUP}_merged_final.tif"
+    ffinal = OUT / f"{SID}_{GROUP}_L1_b{final_cfg.band}.tif"
     save_grid(ffinal, final, final_cfg)
     log(f"final merged+warped: shape={final.shape} -> {ffinal}, aoi_km={[round(v / 1000, 1) for v in final_cfg.aoi]}")
     return final_cfg, final
@@ -568,8 +586,12 @@ def _parser():
     ap.add_argument("sid", help="scene id, e.g. 20201202T2319552644")
     ap.add_argument("--group", required=True, choices=list(ck.GROUPS))
     ap.add_argument("--out", default=None, help="work dir and restart cache (default runs/<sid>_<group>)")
-    ap.add_argument("--keep", default=None, help="copy GCPs, fits, summary and log here when the run completes")
-    ap.add_argument("--glts", default=str(Path.home() / "data" / "iirs" / "glts"), help="where scene GLTs are written")
+    ap.add_argument(
+        "--keep",
+        default=None,
+        help="copy GCPs, fits, summary, log and the GLT here when the run completes "
+        "(default geometry/recalibrated/<day>/<sid>_<group> under IIRS_RECAL_ROOT)",
+    )
     ap.add_argument("--resolve", action="store_true", help="re-solve even if merged GCPs already exist")
     ap.add_argument(
         "--clean",
@@ -778,12 +800,12 @@ def main(argv: list[str] | None = None) -> None:
     used_chunks = [r["chunk"] for r in results]
     merged, agree_summary = _merge_gcps(results)
 
-    fgcps = OUT / f"{SID}_{GROUP}_merged.gcps"
+    fgcps = OUT / f"{SID}_{GROUP}.gcps"
     _save_gcps(fgcps, merged)
     log(f"\nmerged gcps: {len(merged)} points -> {fgcps}")
 
     final_cfg, final = _warp_merged(merged, used_chunks, cfg0, ftif)
-    fglt = _make_glt(merged, cfg0, scan0, args.glts, overwrite=True)
+    fglt = _make_glt(merged, cfg0, scan0, args.keep or str(ck.recal_dir(SID, GROUP)), overwrite=True)
     log(f"glt: {fglt}")
 
     summary = {

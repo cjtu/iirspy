@@ -10,7 +10,7 @@ import rasterio
 from rasterio.control import GroundControlPoint
 from rasterio.warp import Resampling
 
-from iirspy import georef, glt
+from iirspy import georef
 
 CFG = georef.GeorefConfig(aoi=(0.0, 0.0, 4000.0, 4000.0), ps=40.0)
 NY, NX = 60, 20
@@ -43,15 +43,15 @@ def _cube():
 def test_indexing_through_the_glt_is_a_nearest_warp(tmp_path):
     gcps = _gcps()
     cube = _cube()
-    g = glt.make_glt(gcps, CFG, (NY, NX))
+    g = georef.make_glt(gcps, CFG, (NY, NX))
     want = georef.project(cube, gcps, CFG, resampling=Resampling.nearest)
-    np.testing.assert_array_equal(glt.apply_glt(cube, g), want)
+    np.testing.assert_array_equal(georef.apply_glt(cube, g), want)
 
 
 def test_glt_marks_only_the_camera_footprint(tmp_path):
     """Nodata means "no camera pixel here", never "that pixel had no data" -- so one GLT serves L1,
     L2 and anything built later, each bringing its own NaN pattern."""
-    g = glt.make_glt(_gcps(), CFG, (NY, NX))
+    g = georef.make_glt(_gcps(), CFG, (NY, NX))
     valid = g[0] >= 0
     assert valid.any() and not valid.all()
     np.testing.assert_array_equal(valid, g[1] >= 0)  # both bands agree on the footprint
@@ -60,7 +60,7 @@ def test_glt_marks_only_the_camera_footprint(tmp_path):
     assert g[0][valid].min() >= 0
 
     # ... and a cube whose own holes fall inside that footprint still reports them
-    out = glt.apply_glt(_cube(), g)
+    out = georef.apply_glt(_cube(), g)
     assert np.isnan(out[1]).sum() > np.isnan(out[0]).sum()
 
 
@@ -68,8 +68,8 @@ def test_glt_round_trips_through_a_cog_with_the_tags_that_make_it_usable(tmp_pat
     """Everything needed to apply the table has to travel inside it: which scene and group, what
     frame band 2 is in, and the camera extent the indices are valid over."""
     gcps = _gcps()
-    g = glt.make_glt(gcps, CFG, (NY, NX))
-    f = glt.save_glt(
+    g = georef.make_glt(gcps, CFG, (NY, NX))
+    f = georef.save_glt(
         tmp_path / "glt.tif",
         g,
         CFG,
@@ -91,7 +91,7 @@ def test_glt_round_trips_through_a_cog_with_the_tags_that_make_it_usable(tmp_pat
             assert src.crs == ref.crs
         assert src.transform == georef.window_of(CFG)[1]
 
-    back, tags = glt.read_glt(f)
+    back, tags = georef.read_glt(f)
     np.testing.assert_array_equal(back, g)
     assert tags["sid"] == "20210103T1829495344"
     assert tags["group"] == "south"
@@ -102,17 +102,17 @@ def test_glt_round_trips_through_a_cog_with_the_tags_that_make_it_usable(tmp_pat
 
 
 def test_apply_glt_windows_without_changing_the_answer(tmp_path):
-    g = glt.make_glt(_gcps(), CFG, (NY, NX))
+    g = georef.make_glt(_gcps(), CFG, (NY, NX))
     cube = _cube()
-    full = glt.apply_glt(cube, g)
+    full = georef.apply_glt(cube, g)
     win = (10, 60, 5, 40)
-    np.testing.assert_array_equal(glt.apply_glt(cube, g, window=win), full[:, 10:60, 5:40])
+    np.testing.assert_array_equal(georef.apply_glt(cube, g, window=win), full[:, 10:60, 5:40])
 
 
 def test_apply_glt_rejects_a_cube_the_glt_was_not_built_for():
-    g = glt.make_glt(_gcps(), CFG, (NY, NX))
+    g = georef.make_glt(_gcps(), CFG, (NY, NX))
     with pytest.raises(ValueError, match="camera"):
-        glt.apply_glt(_cube()[:, : NY - 3], g)
+        georef.apply_glt(_cube()[:, : NY - 3], g)
 
 
 def test_glt_rows_are_absolute_scans_not_crop_rows():
@@ -121,8 +121,8 @@ def test_glt_rows_are_absolute_scans_not_crop_rows():
     absolute Scan means the caller states what their own cube starts at, and nothing else."""
     gcps = _gcps()
     cube = _cube()
-    plain = glt.make_glt(gcps, CFG, (NY, NX))
-    shifted = glt.make_glt(gcps, CFG, (NY, NX), scan0=11050)
+    plain = georef.make_glt(gcps, CFG, (NY, NX))
+    shifted = georef.make_glt(gcps, CFG, (NY, NX), scan0=11050)
 
     on = plain[0] >= 0
     np.testing.assert_array_equal(shifted[0], plain[0])  # columns never move
@@ -130,14 +130,14 @@ def test_glt_rows_are_absolute_scans_not_crop_rows():
 
     # ... and the same cube read back through either table, told where it starts, is the same data
     np.testing.assert_array_equal(
-        glt.apply_glt(cube, shifted, cube_scan0=11050), glt.apply_glt(cube, plain, cube_scan0=0)
+        georef.apply_glt(cube, shifted, cube_scan0=11050), georef.apply_glt(cube, plain, cube_scan0=0)
     )
 
 
 def test_apply_glt_rejects_the_wrong_scan_origin():
-    g = glt.make_glt(_gcps(), CFG, (NY, NX), scan0=11050)
+    g = georef.make_glt(_gcps(), CFG, (NY, NX), scan0=11050)
     with pytest.raises(ValueError, match="cube_scan0"):
-        glt.apply_glt(_cube(), g, cube_scan0=0)
+        georef.apply_glt(_cube(), g, cube_scan0=0)
 
 
 def test_scene_glt_reuses_a_table_but_a_fresh_solve_replaces_it(tmp_path):
@@ -146,9 +146,9 @@ def test_scene_glt_reuses_a_table_but_a_fresh_solve_replaces_it(tmp_path):
     from dataclasses import replace
 
     cfg = replace(CFG, lat_band=(-90.0, -59.0))
-    a = glt.scene_glt("sid", "south", _gcps(), cfg, 0, tmp_path)
+    a = georef.scene_glt("sid", "south", _gcps(), cfg, 0, tmp_path)
     first = a.read_bytes()
 
     moved = [GroundControlPoint(row=g.row, col=g.col, x=g.x + 400.0, y=g.y) for g in _gcps()]
-    assert glt.scene_glt("sid", "south", moved, cfg, 0, tmp_path).read_bytes() == first
-    assert glt.scene_glt("sid", "south", moved, cfg, 0, tmp_path, overwrite=True).read_bytes() != first
+    assert georef.scene_glt("sid", "south", moved, cfg, 0, tmp_path).read_bytes() == first
+    assert georef.scene_glt("sid", "south", moved, cfg, 0, tmp_path, overwrite=True).read_bytes() != first
