@@ -122,9 +122,12 @@ def _cached_chunk(out: Path, c: dict, good_corr: float, decay_m: float, tweaks: 
     """The prior solve of chunk `c['i']` if it is still valid, else None.
 
     Valid means its band, DEM pair, row bounds, aoi, decay_m and tweaks all match `c` and it
-    converged at corr >= `good_corr`. The DEM pair is part of the key (by product name, see
-    `_dem_key`) because `plan_chunks` picks the far tier per chunk, so two runs can agree on shape
-    and still have used different references. Returns (fit, gcps_by_rc).
+    wasn't rejected, at corr >= `good_corr`. Convergence isn't required -- a non-converged chunk
+    that still passed quality (5-iter cap, no plateau) re-solves to the same result every time, so
+    treating it as cache-invalid just burns wall-clock re-deriving an answer that won't change.
+    The DEM pair is part of the key (by product name, see `_dem_key`) because `plan_chunks` picks
+    the far tier per chunk, so two runs can agree on shape and still have used different
+    references. Returns (fit, gcps_by_rc).
     """
     ffit, fgcp = out / f"chunk{c['i']}_fit.json", out / f"chunk{c['i']}.gcps"
     if not (ffit.exists() and fgcp.exists()):
@@ -140,7 +143,7 @@ def _cached_chunk(out: Path, c: dict, good_corr: float, decay_m: float, tweaks: 
         and all(fit.get(k, TWEAK_DEFAULTS[k]) == v for k, v in tweaks.items())
         and all(abs(a - b) < 1.0 for a, b in zip(fit.get("aoi", []), c["aoi"], strict=True))
     )
-    good = fit.get("corr") is not None and fit["corr"] >= good_corr and fit.get("converged")
+    good = fit.get("corr") is not None and fit["corr"] >= good_corr and not fit.get("quality", {}).get("rejected")
     if same and good:
         return fit, _load_gcps(fgcp)
     return None
@@ -357,6 +360,23 @@ def _warp_merged(merged: dict, used_chunks: list[dict], cfg0, ftif: Path):
     return final_cfg, final
 
 
+def _blend_point(pa, pb, w_a: float):
+    """One merged point from two owners' GCPs, falling back to whichever side has it.
+
+    A tie point can be MAD-rejected in one chunk's solve but not the other -- don't assume both
+    grids are dense at every (row, col). Returns (point, disagreement_m or None).
+    """
+    if pa is None and pb is None:
+        return None, None
+    if pa is None:
+        return pb, None
+    if pb is None:
+        return pa, None
+    xa, ya = pa
+    xb, yb = pb
+    return (w_a * xa + (1 - w_a) * xb, w_a * ya + (1 - w_a) * yb), float(np.hypot(xa - xb, ya - yb))
+
+
 def _merge_gcps(results) -> tuple[dict, dict]:
     """Blend the per-chunk GCP fields into one, cosine cross-fading each row overlap.
 
@@ -390,22 +410,14 @@ def _merge_gcps(results) -> tuple[dict, dict]:
         t = (row - row0_ov) / max(row1_ov - row0_ov, 1e-6)
         w_a = _cross_fade(t)
         key = (c_a["chunk"]["i"], c_b["chunk"]["i"])
-        # A tie point can be MAD-rejected in one chunk's solve but not the other -- fall back to
-        # whichever side has it instead of assuming both grids are dense at every (row, col).
         for col in all_cols:
             pa, pb = c_a["gcps"].get((row, col)), c_b["gcps"].get((row, col))
-            if pa is None and pb is None:
+            pt, dist = _blend_point(pa, pb, w_a)
+            if pt is None:
                 continue
-            if pa is None:
-                merged[(row, col)] = pb
-                continue
-            if pb is None:
-                merged[(row, col)] = pa
-                continue
-            xa, ya = pa
-            xb, yb = pb
-            agree.setdefault(key, []).append(float(np.hypot(xa - xb, ya - yb)))
-            merged[(row, col)] = (w_a * xa + (1 - w_a) * xb, w_a * ya + (1 - w_a) * yb)
+            merged[(row, col)] = pt
+            if dist is not None:
+                agree.setdefault(key, []).append(dist)
 
     log("\noverlap agreement (independent chunk solves, before blending):")
     agree_summary = {}

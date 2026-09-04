@@ -98,6 +98,14 @@ def _row_block(da, sub_rows=None):
 FLAT_SMILE_MIN = 0.2  # clip flat*smile away from 0 before dividing (avoids blow-ups)
 
 
+def _in_wl_ranges(wl, ranges):
+    """True where `wl` falls in any (lo, hi) of `ranges` (inclusive); all False if `ranges` is falsy."""
+    hit = xr.zeros_like(wl, dtype=bool)
+    for lo, hi in ranges or ():
+        hit = hit | ((wl >= lo) & (wl <= hi))
+    return hit
+
+
 class IIRSData(ABC):
     """Abstract base class for IIRS data products."""
 
@@ -381,6 +389,7 @@ class L0(IIRSData):
         empirical_kws=None,
         bad_pixel_mask=True,
         calib_dir=utils.DCALIB,
+        exclude_wl=None,
     ):
         """
         Perform IIRS L0 digital number to L1 radiance calibration.
@@ -440,6 +449,10 @@ class L0(IIRSData):
             Mask known bad detector elements (x, band). True (default) uses the packaged mask
             (utils.load_bad_pixel_mask); False skips masking; or pass a custom boolean mask
             (True where bad) to null instead.
+        exclude_wl : list of (lo, hi) or None
+            Extra wavelength [nm] ranges to null, on top of OSF/invalid bands -- e.g. bands that
+            stay noisy no matter the flat/smile derivation. Cut alongside OSF/invalid, so a band
+            in range is excluded from interp_bands' neighbour fill too, not patched over it.
 
         Returns
         -------
@@ -465,8 +478,8 @@ class L0(IIRSData):
             # Apply per-element gain and offset to convert DN -> Radiance
             rad = 10 * (self.img * gain + offset)  # [mW/cm^2/sr/μm] -> [W/m^2/sr/um]
 
-        # Drop OSF and invalid bands. interp if specified
-        rad = rad.where(~rad.band.isin((*utils.OSF, *utils.INVALID)))
+        # Drop OSF and invalid bands, plus any caller-supplied wavelength ranges. interp if specified
+        rad = rad.where(~(rad.band.isin((*utils.OSF, *utils.INVALID)) | _in_wl_ranges(rad.wl, exclude_wl)))
 
         # Drop known bad detector elements (x, bands)
         if bad_pixel_mask is True:  # Load default bad pixel mask
