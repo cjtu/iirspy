@@ -156,8 +156,6 @@ def _parser():
 
 
 def main(argv: list[str] | None = None) -> None:
-    from iirspy import georef
-    from iirspy.iirs import L1
 
     args = _parser().parse_args(argv)
     sid, group = args.sid, args.group
@@ -177,6 +175,19 @@ def main(argv: list[str] | None = None) -> None:
     t_start = time.time()
     solve._log_provenance()
     solve.log(f"{sid} group={group} zip={solve.ZIP.name} ncpu={solve.ncpu()} stage={solve.STAGE} gcps={fgcps}")
+
+    try:
+        _run(args, sid, group, fgcps, t_start)
+    except Exception as e:
+        if solve.is_disk_full(e):
+            solve.log(f"FATAL: disk full/quota exceeded -- run `diskusage_report` to check usage. ({e})")
+            sys.exit(f"{sid} {group}: disk full/quota exceeded -- run `diskusage_report` to check usage")
+        raise
+
+
+def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
+    from iirspy import georef
+    from iirspy.iirs import L1
 
     gcps, aoi = georef._gcps_and_aoi(fgcps)
     lat_range = ck.l1_lat_range(group)

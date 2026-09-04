@@ -46,6 +46,38 @@ def _try_load_next_level_metadata(basename, target_level, directory, xyextent):
     return result
 
 
+def _write_json_atomic(path, obj):
+    """Write `obj` as json via a temp file + rename, so a kill mid-write can't leave a torn file."""
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(obj))
+    tmp.replace(path)
+
+
+def _resume_row(fout, fprog, key):
+    """First row `_save_geotiff` still has to write, from a previous run's progress sidecar.
+
+    0 unless `fout` and its sidecar both exist, the sidecar agrees with `key` (same cube shape and
+    block size -- a different one is a different product, not a resume), and `fout` still opens for
+    update. A file killed mid-flush may not reopen at all, so that case restarts from 0 too.
+    """
+    import rasterio
+
+    if not (Path(fout).exists() and Path(fprog).exists()):
+        return 0
+    try:
+        prog = json.loads(Path(fprog).read_text())
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if {k: prog.get(k) for k in key} != key or not prog.get("rows_done"):
+        return 0
+    try:
+        with rasterio.open(fout, "r+"):
+            pass
+    except Exception:
+        return 0
+    return int(prog["rows_done"])
+
+
 def _band_numbers(img):
     """Original IIRS band numbers, from the GeoTIFF band_numbers tag or ENVI band names, else 1..N."""
     for attr in ("band_numbers", "band_names"):
@@ -104,6 +136,11 @@ def _in_wl_ranges(wl, ranges):
     for lo, hi in ranges or ():
         hit = hit | ((wl >= lo) & (wl <= hi))
     return hit
+
+
+def _narrow_bands(rad, output_bands):
+    """`rad` restricted to `output_bands`, or `rad` unchanged if `output_bands` is None."""
+    return rad if output_bands is None else rad.sel(band=output_bands)
 
 
 class IIRSData(ABC):
@@ -247,7 +284,13 @@ class IIRSData(ABC):
         return self._write(snr, f.with_name(f.stem + "_snr" + f.suffix), row_block)
 
     def _save_geotiff(self, fout, row_block, da=None):
-        """Write a float32 BigTIFF sequentially in windowed blocks (bounded memory)."""
+        """Write a float32 BigTIFF sequentially in windowed blocks (bounded memory).
+
+        Restartable: each finished block records `rows_done` in a `<fout>.progress` sidecar, and a
+        rerun of the same shape reopens the file and picks up there. A cluster task killed at its
+        wall clock therefore loses one block, not the whole cube -- which for a long strip is the
+        difference between a resumable requeue and starting the scene from zero.
+        """
         import rasterio
         from dask.diagnostics import ProgressBar
         from rasterio.windows import Window
@@ -273,16 +316,22 @@ class IIRSData(ABC):
         tags = {k: str(v) for k, v in da.attrs.items() if isinstance(v, str | int | float | bool)}
         # Which IIRS bands these planes are: 1..256 on a full cube, arbitrary on a subset
         tags["band_numbers"] = ",".join(str(int(b)) for b in da.band.values)
-        with rasterio.open(fout, "w", **profile) as dst, ProgressBar():
+        fprog = Path(str(fout) + ".progress")
+        key = {"shape": [nband, ny, nx], "row_block": int(row_block)}
+        y_start = _resume_row(fout, fprog, key)
+        mode = "r+" if y_start else "w"
+        with rasterio.open(fout, mode, **({} if y_start else profile)) as dst, ProgressBar():
             if tags:
                 dst.update_tags(**tags)
-            for y0 in range(0, ny, row_block):
+            for y0 in range(y_start, ny, row_block):
                 y1 = min(y0 + row_block, ny)
                 block = da.isel(y=slice(y0, y1)).values.astype("float32", copy=False)
                 dst.write(block, window=Window(0, y0, nx, y1 - y0))
+                _write_json_atomic(fprog, {**key, "rows_done": y1})
             if wls:
                 for i, wl in enumerate(wls):
                     dst.set_band_description(i + 1, wl)
+        fprog.unlink(missing_ok=True)
         return fout
 
     @abstractmethod
@@ -390,6 +439,7 @@ class L0(IIRSData):
         bad_pixel_mask=True,
         calib_dir=utils.DCALIB,
         exclude_wl=None,
+        output_bands=None,
     ):
         """
         Perform IIRS L0 digital number to L1 radiance calibration.
@@ -453,6 +503,14 @@ class L0(IIRSData):
             Extra wavelength [nm] ranges to null, on top of OSF/invalid bands -- e.g. bands that
             stay noisy no matter the flat/smile derivation. Cut alongside OSF/invalid, so a band
             in range is excluded from interp_bands' neighbour fill too, not patched over it.
+        output_bands : list of int or None
+            Restrict masking/interpolation/output (steps 3-5) to this band subset after the
+            empirical dark/flat/smile derivation has already used the full cube -- e.g. a caller
+            that only wants one band back can still supply that band's `interp_bands` neighbours
+            (+-6) here instead of paying to mask/interpolate every staged band. None (default):
+            every band `self.img` holds. Only safe to narrow past what `interp_bands`' max_gap=6
+            could reach for the bands you actually want out; empirical_frames itself always sees
+            the unnarrowed `self.img`, so this has no effect on the empirical frames' quality.
 
         Returns
         -------
@@ -477,6 +535,10 @@ class L0(IIRSData):
         else:
             # Apply per-element gain and offset to convert DN -> Radiance
             rad = 10 * (self.img * gain + offset)  # [mW/cm^2/sr/μm] -> [W/m^2/sr/um]
+
+        # Narrow to the requested output bands before the mask/interpolate stage below -- the
+        # empirical frames above already saw every band `self.img` holds, so this can't affect them.
+        rad = _narrow_bands(rad, output_bands)
 
         # Drop OSF and invalid bands, plus any caller-supplied wavelength ranges. interp if specified
         rad = rad.where(~(rad.band.isin((*utils.OSF, *utils.INVALID)) | _in_wl_ranges(rad.wl, exclude_wl)))

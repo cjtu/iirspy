@@ -16,6 +16,7 @@ Paths come from `IIRS_ARCHIVE`, `IIRS_DEM_ROOTS`, `IIRS_SPICE` and `IIRS_STAGE`.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -33,6 +34,10 @@ from iirspy import chunks as ck
 WIDTH_RANGE_KM = (100.0, 150.0)
 OVERLAP_FRAC = 0.10
 
+# Exit code for "stopped early on purpose, work is checkpointed, run me again" -- distinct from 0
+# (finished) and from any real failure, so a submission script can requeue on it alone.
+EXIT_RESUME = 75
+
 # Copied to `--keep`; everything else in the work dir is rebuildable from the zip.
 # - all gcp files generated and run log / json stats
 # - `*_L1_b*.tif`: the final warped raster at the registration band (only 1 band, 10s of MB)
@@ -48,6 +53,13 @@ LOG = Path()
 # millions of small pieces, so this wants the fastest local filesystem available: node-local disk
 # on a cluster, native ext4 rather than a drvfs mount on WSL. Shared across scenes.
 STAGE = Path()
+# When this run must be finished by (`time.monotonic()`), or None for no limit. See `_time_left`.
+DEADLINE: float | None = None
+
+
+def _time_left() -> float:
+    """Seconds until `DEADLINE`, or inf when the run is unbounded."""
+    return np.inf if DEADLINE is None else DEADLINE - time.monotonic()
 
 
 def ncpu() -> int:
@@ -64,6 +76,47 @@ def log(msg):
     print(msg, flush=True)
     with LOG.open("a") as f:
         f.write(str(msg) + "\n")
+
+
+def is_disk_full(exc: BaseException) -> bool:
+    """Disk quota exceeded surfaces as OSError(errno) from shutil.copy*, or as a message-only
+    error from GDAL/rasterio writes -- check both so either path gets the same clear diagnosis."""
+    if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        return True
+    msg = str(exc).lower()
+    return "disk quota exceeded" in msg or "no space left on device" in msg
+
+
+class phase:
+    """Time one phase and log wall, CPU and the mean cores it actually kept busy.
+
+    `cores` is the number that answers "would more `--cpus-per-task` help here": a stage pinned near
+    1.0 is serial (GIL-bound Python, or waiting on disk) and more cores buy it nothing, while one
+    that tracks `ncpu()` is already scaling. CPU time sums this process *and* its waited-for
+    children, so a subprocess stage (zip extraction) is measured on the same footing as an in-process
+    one, not reported as idle.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def _cpu_s(self) -> float:
+        import resource
+
+        return sum(
+            r.ru_utime + r.ru_stime
+            for r in (resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN))
+        )
+
+    def __enter__(self):
+        self.t0, self.c0 = time.monotonic(), self._cpu_s()
+        return self
+
+    def __exit__(self, *exc):
+        self.wall, self.cpu = time.monotonic() - self.t0, self._cpu_s() - self.c0
+        self.cores = self.cpu / max(self.wall, 1e-9)
+        log(f"{self.name}: {self.wall:.0f}s wall, {self.cpu:.0f}s cpu, {self.cores:.1f} cores of {ncpu()}")
+        return False
 
 
 def _cross_fade(t: float) -> float:
@@ -149,15 +202,23 @@ def _cached_chunk(out: Path, c: dict, good_corr: float, decay_m: float, tweaks: 
     return None
 
 
+def _band_window(band: int) -> list[int]:
+    """+-6 bands around `band` -- as far as `interpolate_na(..., max_gap=6)` ever reaches to fill a
+    masked `band` pixel from its true neighbours, so it's also as much of the band axis as
+    `calibrate_to_rad`'s masking/interpolation stage needs to touch to get `band` right.
+    """
+    return sorted(range(max(1, band - 6), min(256, band + 6) + 1))
+
+
 def _cube_bands(band: int) -> list[int]:
     """Bands `build_l1`'s calibration actually touches: PAN_BANDS (broadband dark/flat/smile) plus
-    a +-6 window around `band` (iirs.py's `interpolate_na(..., max_gap=6)` reaches at most that far
-    to fill a masked `band` pixel from its true neighbours -- matches the full-cube interpolation
-    exactly, just without every other band the output never uses).
+    `_band_window(band)` (see there). Wider than what the masking/interpolation stage runs on
+    (`_band_window` alone, via `output_bands`) -- PAN_BANDS beyond the window only feed the
+    empirical dark/flat/smile derivation, which sees the full staged cube regardless.
     """
     from iirspy.empirical import PAN_BANDS
 
-    return sorted(set(PAN_BANDS) | set(range(max(1, band - 6), min(256, band + 6) + 1)))
+    return sorted(set(PAN_BANDS) | set(_band_window(band)))
 
 
 def _stage_inputs(day: str, bands: list[int]) -> Path:
@@ -168,11 +229,12 @@ def _stage_inputs(day: str, bands: list[int]) -> Path:
     """
     raw_qub = STAGE / f"data/raw/{day}/{ZIP.stem}.qub"
     if not raw_qub.exists():
-        log(f"extracting {ZIP.name} -> {STAGE}")
+        log(f"extracting {ZIP.name} ({len(bands)} bands) -> {STAGE}")
         band_arg = ",".join(str(b) for b in bands)
-        subprocess.run(  # noqa: S603
-            [sys.executable, "-m", "issdc_iirs", str(ZIP), "-o", str(STAGE), "--bands", band_arg], check=True
-        )
+        with phase("extraction"):
+            subprocess.run(  # noqa: S603
+                [sys.executable, "-m", "issdc_iirs", str(ZIP), "-o", str(STAGE), "--bands", band_arg], check=True
+            )
     for sub in (
         f"geometry/calibrated/{day}",
         f"miscellaneous/raw/{day}",
@@ -201,7 +263,12 @@ CALIBRATE_KWS = {"empirical": True, "interp_bands": "linear", "interp_spatial": 
 
 
 def build_l1(
-    lat_range: tuple[float, float], bands: list[int], ftif_out: Path, calibrate_kwargs: dict | None = None
+    lat_range: tuple[float, float],
+    bands: list[int],
+    ftif_out: Path,
+    calibrate_kwargs: dict | None = None,
+    out_bands: list[int] | None = None,
+    chunk_y: int = 1024,
 ) -> tuple[Path, int, tuple[float, float]]:
     """Extract the nri zip and calibrate it, cropped to `lat_range`.
 
@@ -212,8 +279,14 @@ def build_l1(
     for one band list is never reused for a different one, e.g. a single-band solve cache can't
     satisfy a full-spectrum refl run.
 
+    `out_bands` narrows what actually gets *written*, after `bands` has done its job of giving the
+    dark/flat/smile search enough of the spectrum to work with -- a chunk solve only ever reads one
+    band back out (`read_band(ftif, cfg.band)`), so writing all of `bands` to disk for that case is
+    pure I/O nobody uses. None (default, what `iirspy.refl` wants) writes every calibrated band.
+
     calibrate_kwargs overrides CALIBRATE_KWS (e.g. interp_bands=None, exclude_wl=[...]) for a
-    one-off reprocessing run without touching the production default.
+    one-off reprocessing run without touching the production default. `chunk_y` is the dask y-chunk
+    the cube is read and written in, and so also the write/resume block size.
     """
     # Ancillary only (spm, oat, xml, csv -- excludes the qub by default): a few MB, so cheap enough
     # to always re-run even on an L1 cache hit. Without this, a cache hit skips `_stage_inputs`
@@ -232,11 +305,12 @@ def build_l1(
             if not (dst_dir / fsrc.name).exists():
                 shutil.copyfile(fsrc, dst_dir / fsrc.name)
 
+    saved_bands = out_bands if out_bands is not None else bands
     fmeta = ftif_out.with_suffix(".meta.json")
     if ftif_out.exists() and fmeta.exists():
         meta = json.loads(fmeta.read_text())
         cached_range = tuple(meta["lat_range"])
-        if cached_range[0] <= lat_range[0] and lat_range[1] <= cached_range[1] and meta.get("bands") == bands:
+        if cached_range[0] <= lat_range[0] and lat_range[1] <= cached_range[1] and meta.get("bands") == saved_bands:
             log(f"L1 already built: {ftif_out} (covers {cached_range}, requested {lat_range})")
             return ftif_out, meta["scan0"], cached_range
         log(
@@ -246,20 +320,26 @@ def build_l1(
     import iirspy.utils as utils
     from iirspy import L0
 
-    raw_qub = _stage_inputs(day, bands)
+    with phase("staging"):
+        raw_qub = _stage_inputs(day, bands)
 
-    l1 = L0(SID, STAGE, chunk={"band": -1, "y": 1024, "x": -1}).calibrate(**{
-        **CALIBRATE_KWS,
-        **(calibrate_kwargs or {}),
-    })
+    # `chunk_y` sets both the dask y-chunk and, through `_row_block`, the write/resume block.
+    with phase("L0 read + calibrate (graph build; the compute lands in the write)"):
+        l1 = L0(SID, STAGE, chunk={"band": -1, "y": chunk_y, "x": -1}).calibrate(**{
+            **CALIBRATE_KWS,
+            **(calibrate_kwargs or {}),
+        })
     # l1.img already holds exactly `bands` -- that's what _stage_inputs staged.
     _, xyext = utils.parse_geom(l1.csv, latlonextent=(-180, 180, *lat_range))
     ymin, ymax = xyext[2], xyext[3]
     log(f"L1 crop lat={lat_range}: scan {ymin}-{ymax} ({ymax - ymin} rows)")
     l1.img = l1.img.sel(y=slice(ymin, ymax))
     l1.img = l1.img / utils.RAD_NATIVE_SCALE
-    l1.save(str(ftif_out))
-    fmeta.write_text(json.dumps({"scan0": int(ymin), "lat_range": list(lat_range), "bands": bands}))
+    if out_bands is not None:
+        l1.img = l1.img.sel(band=out_bands)
+    with phase(f"L1 write ({l1.img.shape[0]} band x {l1.img.shape[1]} rows, chunk_y={chunk_y})"):
+        l1.save(str(ftif_out))
+    fmeta.write_text(json.dumps({"scan0": int(ymin), "lat_range": list(lat_range), "bands": saved_bands}))
     raw_qub.unlink(missing_ok=True)
     raw_qub.with_suffix(".hdr").unlink(missing_ok=True)
     log(f"L1 saved: {ftif_out}")
@@ -437,6 +517,12 @@ def _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, hillshade_on
     """Solve each chunk against its own hillshade, reusing any prior good solve of the same shape.
 
     Returns one {"chunk", "gcps", "fit"} per solved chunk, empty when `hillshade_only`.
+
+    Exits `EXIT_RESUME` if the next chunk would not fit in the time left (see `--max-seconds`).
+    Stopping *before* a chunk rather than being killed inside one keeps every finished chunk's
+    cache intact for the requeue; exiting here rather than returning short also means a partial set
+    can never reach `_merge_gcps` and write a truncated `<sid>_<group>.gcps`, which `already_solved`
+    would then read as a finished scene.
     """
     from iirspy.georef import project, read_band, register, render_reference, save_grid
 
@@ -461,6 +547,14 @@ def _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, hillshade_on
             results.append({"chunk": c, "gcps": gcps_by_rc, "fit": fit})
             continue
 
+        need_s = _band_estimate_s(c["band"], cfg0.niter)
+        if _time_left() < need_s:
+            log(
+                f"chunk {i} [{c['band']}]: {_time_left() / 60:.0f} min left < ~{need_s / 60:.0f} min needed. "
+                f"{len(results)}/{len(chunks)} chunks solved and cached; exiting {EXIT_RESUME} to resume."
+            )
+            sys.exit(EXIT_RESUME)
+
         cfg = replace(
             cfg0,
             aoi=c["aoi"],
@@ -482,19 +576,19 @@ def _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, hillshade_on
         save_grid(OUT / f"chunk{i}_hs.tif", ref, cfg)
         log(f"chunk {i}: hillshade {hs_s:.1f}s, shape {ref.shape}")
 
-        t0 = time.time()
-        try:
-            reg = register(ftif, fgeom, fspm, cfg, reference=ref, verbose=True)
-        except Exception as e:
-            # corr=None keeps `_cached_chunk` from reusing the failure, so a re-run re-solves this
-            # chunk; the merge just has no GCPs from its rows. Full traceback goes to the log only.
-            err = f"{type(e).__name__}: {e}"
-            log(f"chunk {i}: FAILED after {time.time() - t0:.1f}s -- {err}")
-            log(traceback.format_exc())
-            fit = {"chunk": i, "band": c["band"], "row0": c["row0"], "row1": c["row1"], "corr": None, "error": err}
-            (OUT / f"chunk{i}_fit.json").write_text(json.dumps(fit, indent=1))
-            continue
-        solve_s = time.time() - t0
+        with phase(f"chunk {i} register") as ph:
+            try:
+                reg = register(ftif, fgeom, fspm, cfg, reference=ref, verbose=True)
+            except Exception as e:
+                # corr=None keeps `_cached_chunk` from reusing the failure, so a re-run re-solves
+                # this chunk; the merge just has no GCPs from its rows. Traceback to the log only.
+                err = f"{type(e).__name__}: {e}"
+                log(f"chunk {i}: FAILED -- {err}")
+                log(traceback.format_exc())
+                fit = {"chunk": i, "band": c["band"], "row0": c["row0"], "row1": c["row1"], "corr": None, "error": err}
+                (OUT / f"chunk{i}_fit.json").write_text(json.dumps(fit, indent=1))
+                continue
+        solve_s = ph.wall
 
         band_i = read_band(ftif, cfg.band)
         after = project(band_i, reg.gcps, cfg)
@@ -519,6 +613,9 @@ def _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, hillshade_on
             "elev": round(hs_info["elev"], 3),
             "lit_frac": round(hs_info["lit_frac"], 4),
             "solve_s": round(solve_s, 2),
+            # Mean cores `register` kept busy, against `ncpu`: what a --cpus-per-task sweep reads.
+            "solve_cores": round(ph.cores, 2),
+            "ncpu": ncpu(),
             "corr": corr,
             "converged": reg.stats.get("converged"),
             "converged_reason": reg.stats.get("converged_reason"),
@@ -639,6 +736,14 @@ def _parser():
     )
     ap.add_argument("--resolve", action="store_true", help="re-solve even if merged GCPs already exist")
     ap.add_argument(
+        "--max-seconds",
+        type=float,
+        default=float(os.environ.get("IIRS_MAX_SECONDS", 0)) or None,
+        help=f"stop before starting any step that would not finish inside this budget and exit "
+        f"{EXIT_RESUME}, leaving the work dir resumable, instead of being killed at the wall clock "
+        f"(env IIRS_MAX_SECONDS; default unbounded). Set it a few minutes under the SBATCH --time.",
+    )
+    ap.add_argument(
         "--clean",
         action="store_true",
         help="delete the work dir after --keep; drops the L1, hillshades and per-chunk rasters",
@@ -654,6 +759,13 @@ def _parser():
         action="store_true",
         help="render and write each chunk's reference hillshade, then stop -- for eyeballing a DEM "
         "rewire before paying for the solve",
+    )
+    ap.add_argument(
+        "--chunk-y",
+        type=int,
+        default=int(os.environ.get("IIRS_CHUNK_Y", 1024)),
+        help="dask y-chunk for the L1 read/calibrate/write, and so the write/resume block size "
+        "(env IIRS_CHUNK_Y; default 1024 rows)",
     )
     ap.add_argument(
         "--gcp-row-margin",
@@ -775,8 +887,9 @@ def main(argv: list[str] | None = None) -> None:
 
     args = _parser().parse_args(argv)
 
-    global SID, GROUP
+    global SID, GROUP, DEADLINE
     SID, GROUP = args.sid, args.group
+    DEADLINE = time.monotonic() + args.max_seconds if args.max_seconds else None
 
     # Bind dask's threadpool to the allocation before anything touches a chunked array (see `ncpu`).
     import dask
@@ -797,7 +910,17 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     # The crop carries a buffer past the solved bands; the chunk plan does not.
-    ftif, scan0, lat_range = build_l1(lat_range0, _cube_bands(cfg0.band), OUT / f"{SID}_l1_{GROUP}_group.tif")
+    # A chunk solve only ever reads `cfg0.band` back out, so calibration only masks/interpolates
+    # its own +-6 window (`output_bands`), not every PAN_BANDS the empirical search also staged;
+    # `out_bands` then narrows what's actually written to just that one band.
+    ftif, scan0, lat_range = build_l1(
+        lat_range0,
+        _cube_bands(cfg0.band),
+        OUT / f"{SID}_l1_{GROUP}_group.tif",
+        calibrate_kwargs={"output_bands": _band_window(cfg0.band)},
+        out_bands=[cfg0.band],
+        chunk_y=args.chunk_y,
+    )
     cfg0 = replace(cfg0, lat_band=lat_range)
 
     # The spm rides inside the nri zip, so a scene whose ancillary was never synced to the archive
