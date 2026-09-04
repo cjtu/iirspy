@@ -194,7 +194,12 @@ def _stage_inputs(day: str, bands: list[int]) -> Path:
     return raw_qub
 
 
-def build_l1(lat_range: tuple[float, float], bands: list[int], ftif_out: Path) -> tuple[Path, int, tuple[float, float]]:
+CALIBRATE_KWS = {"empirical": True, "interp_bands": "linear", "interp_spatial": True, "bad_pixel_mask": True}
+
+
+def build_l1(
+    lat_range: tuple[float, float], bands: list[int], ftif_out: Path, calibrate_kwargs: dict | None = None
+) -> tuple[Path, int, tuple[float, float]]:
     """Extract the nri zip and calibrate it, cropped to `lat_range`.
 
     The zip's internal layout already matches the archive's PDS tree, so it extracts in place.
@@ -203,6 +208,9 @@ def build_l1(lat_range: tuple[float, float], bands: list[int], ftif_out: Path) -
     for a cache hit may be a wider earlier build. `bands` is part of the cache key -- a cube staged
     for one band list is never reused for a different one, e.g. a single-band solve cache can't
     satisfy a full-spectrum refl run.
+
+    calibrate_kwargs overrides CALIBRATE_KWS (e.g. interp_bands=None, exclude_wl=[...]) for a
+    one-off reprocessing run without touching the production default.
     """
     # Ancillary only (spm, oat, xml, csv -- excludes the qub by default): a few MB, so cheap enough
     # to always re-run even on an L1 cache hit. Without this, a cache hit skips `_stage_inputs`
@@ -237,9 +245,10 @@ def build_l1(lat_range: tuple[float, float], bands: list[int], ftif_out: Path) -
 
     raw_qub = _stage_inputs(day, bands)
 
-    l1 = L0(SID, STAGE, chunk={"band": -1, "y": 1024, "x": -1}).calibrate(
-        empirical=True, interp_bands="linear", interp_spatial=True, bad_pixel_mask=True
-    )
+    l1 = L0(SID, STAGE, chunk={"band": -1, "y": 1024, "x": -1}).calibrate(**{
+        **CALIBRATE_KWS,
+        **(calibrate_kwargs or {}),
+    })
     # l1.img already holds exactly `bands` -- that's what _stage_inputs staged.
     _, xyext = utils.parse_geom(l1.csv, latlonextent=(-180, 180, *lat_range))
     ymin, ymax = xyext[2], xyext[3]
@@ -371,7 +380,9 @@ def _merge_gcps(results) -> tuple[dict, dict]:
         if len(owners) == 1:
             o = owners[0]
             for col in all_cols:
-                merged[(row, col)] = o["gcps"][(row, col)]
+                pt = o["gcps"].get((row, col))
+                if pt is not None:
+                    merged[(row, col)] = pt
             continue
         owners.sort(key=lambda r: r["chunk"]["row0"])
         c_a, c_b = owners[0], owners[-1]
@@ -379,9 +390,17 @@ def _merge_gcps(results) -> tuple[dict, dict]:
         t = (row - row0_ov) / max(row1_ov - row0_ov, 1e-6)
         w_a = _cross_fade(t)
         key = (c_a["chunk"]["i"], c_b["chunk"]["i"])
+        # A tie point can be MAD-rejected in one chunk's solve but not the other -- fall back to
+        # whichever side has it instead of assuming both grids are dense at every (row, col).
         for col in all_cols:
-            xa, ya = c_a["gcps"][(row, col)]
-            xb, yb = c_b["gcps"][(row, col)]
+            pa, pb = c_a["gcps"].get((row, col)), c_b["gcps"].get((row, col))
+            if pa is None and pb is None:
+                continue
+            if pa is None or pb is None:
+                merged[(row, col)] = pa if pb is None else pb
+                continue
+            xa, ya = pa
+            xb, yb = pb
             agree.setdefault(key, []).append(float(np.hypot(xa - xb, ya - yb)))
             merged[(row, col)] = (w_a * xa + (1 - w_a) * xb, w_a * ya + (1 - w_a) * yb)
 
