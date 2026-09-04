@@ -396,8 +396,11 @@ def _merge_gcps(results) -> tuple[dict, dict]:
             pa, pb = c_a["gcps"].get((row, col)), c_b["gcps"].get((row, col))
             if pa is None and pb is None:
                 continue
-            if pa is None or pb is None:
-                merged[(row, col)] = pa if pb is None else pb
+            if pa is None:
+                merged[(row, col)] = pb
+                continue
+            if pb is None:
+                merged[(row, col)] = pa
                 continue
             xa, ya = pa
             xb, yb = pb
