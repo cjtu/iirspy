@@ -513,130 +513,172 @@ def _merge_gcps(results) -> tuple[dict, dict]:
     return merged, agree_summary
 
 
-def _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, hillshade_only):
-    """Solve each chunk against its own hillshade, reusing any prior good solve of the same shape.
+def _accepted(r):
+    """Whether a `_solve_one` result solved cleanly (not None, not quality-rejected)."""
+    return r is not None and not r["fit"].get("quality", {}).get("rejected")
 
-    Returns one {"chunk", "gcps", "fit"} per solved chunk, empty when `hillshade_only`.
 
-    Exits `EXIT_RESUME` if the next chunk would not fit in the time left (see `--max-seconds`).
-    Stopping *before* a chunk rather than being killed inside one keeps every finished chunk's
-    cache intact for the requeue; exiting here rather than returning short also means a partial set
-    can never reach `_merge_gcps` and write a truncated `<sid>_<group>.gcps`, which `already_solved`
-    would then read as a finished scene.
+def _shift_of(r):
+    """A solved chunk's total coarse shift in metres, or (0, 0) if `r` is None."""
+    return tuple(r["fit"]["stats"]["coarse"].get("total_shift_m", (0.0, 0.0))) if r else (0.0, 0.0)
+
+
+def _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
+    """Solve chunk `c` seeded from `seed` (a prior coarse shift in metres), or reuse its cache.
+
+    Returns {"chunk", "gcps", "fit"}, or None on total failure. Exits `EXIT_RESUME` if this chunk
+    would not fit in the time left (see `--max-seconds`) -- stopping *before* a chunk rather than
+    being killed inside one keeps every finished chunk's cache intact for the requeue.
     """
     from iirspy.georef import project, read_band, register, render_reference, save_grid
 
-    results = []
-    for c in chunks:
-        i = c["i"]
-        if hillshade_only:
-            cfg = replace(cfg0, aoi=c["aoi"], dem_near=c["dem_near"], dem_far=c["dem_far"])
-            t0 = time.time()
-            ref, hs_info = render_reference(fgeom, fspm, cfg, ck.kernels(SID[:8]))
-            save_grid(OUT / f"chunk{i}_hs.tif", ref, cfg)
-            log(
-                f"chunk {i} [{c['band']}] hillshade {time.time() - t0:.1f}s shape={ref.shape} "
-                f"near={Path(c['dem_near']).name} far={Path(c['dem_far']).name} "
-                f"az={hs_info['az_grid']:.1f} elev={hs_info['elev']:.2f} lit={hs_info['lit_frac']:.3f}"
-            )
-            continue
-        cached = _cached_chunk(OUT, c, ck.GOOD_CORR, decay_m, tweaks)
-        if cached is not None:
-            fit, gcps_by_rc = cached
-            log(f"chunk {i} [{c['band']}]: reusing cached solve, corr={fit['corr']}")
-            results.append({"chunk": c, "gcps": gcps_by_rc, "fit": fit})
-            continue
+    i = c["i"]
+    cached = _cached_chunk(OUT, c, ck.GOOD_CORR, decay_m, tweaks)
+    if cached is not None:
+        fit, gcps_by_rc = cached
+        log(f"chunk {i} [{c['band']}]: reusing cached solve, corr={fit['corr']}")
+        return {"chunk": c, "gcps": gcps_by_rc, "fit": fit}
 
-        need_s = _band_estimate_s(c["band"], cfg0.niter)
-        if _time_left() < need_s:
-            log(
-                f"chunk {i} [{c['band']}]: {_time_left() / 60:.0f} min left < ~{need_s / 60:.0f} min needed. "
-                f"{len(results)}/{len(chunks)} chunks solved and cached; exiting {EXIT_RESUME} to resume."
-            )
-            sys.exit(EXIT_RESUME)
-
-        cfg = replace(
-            cfg0,
-            aoi=c["aoi"],
-            dem_near=c["dem_near"],
-            dem_far=c["dem_far"],
-            p95_stop_m=c["p95_stop_m"],
-            decay_m=decay_m,
-            gcp_rows=(c["row0"], c["row1"]),
-            **tweaks,
-        )
+    need_s = _band_estimate_s(c["band"], cfg0.niter)
+    if _time_left() < need_s:
         log(
-            f"\n--- chunk {i} [{c['band']}] solve: aoi={c['aoi']} far={Path(c['dem_far']).name} "
-            f"decay_m={decay_m} {tweaks} ---"
+            f"chunk {i} [{c['band']}]: {_time_left() / 60:.0f} min left < ~{need_s / 60:.0f} min needed. "
+            f"chunks solved and cached; exiting {EXIT_RESUME} to resume."
         )
+        sys.exit(EXIT_RESUME)
 
+    cfg = replace(
+        cfg0,
+        aoi=c["aoi"],
+        dem_near=c["dem_near"],
+        dem_far=c["dem_far"],
+        p95_stop_m=c["p95_stop_m"],
+        decay_m=decay_m,
+        gcp_rows=(c["row0"], c["row1"]),
+        seed_m=seed,
+        **tweaks,
+    )
+    log(
+        f"\n--- chunk {i} [{c['band']}] solve: aoi={c['aoi']} far={Path(c['dem_far']).name} "
+        f"decay_m={decay_m} seed_m={seed} {tweaks} ---"
+    )
+
+    t0 = time.time()
+    ref, hs_info = render_reference(fgeom, fspm, cfg, ck.kernels(SID[:8]))
+    hs_s = time.time() - t0
+    save_grid(OUT / f"chunk{i}_hs.tif", ref, cfg)
+    log(f"chunk {i}: hillshade {hs_s:.1f}s, shape {ref.shape}")
+
+    with phase(f"chunk {i} register") as ph:
+        try:
+            reg = register(ftif, fgeom, fspm, cfg, reference=ref, verbose=True)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            log(f"chunk {i}: FAILED -- {err}")
+            log(traceback.format_exc())
+            fit = {"chunk": i, "band": c["band"], "row0": c["row0"], "row1": c["row1"], "corr": None, "error": err}
+            (OUT / f"chunk{i}_fit.json").write_text(json.dumps(fit, indent=1))
+            return None
+    solve_s = ph.wall
+
+    band_i = read_band(ftif, cfg.band)
+    after = project(band_i, reg.gcps, cfg)
+    m = np.isfinite(after) & np.isfinite(ref) & (after > 0) & (ref > 0)
+    corr = float(np.corrcoef(after[m], ref[m])[0, 1]) if m.sum() > 1000 else None
+    save_grid(OUT / f"chunk{i}_final.tif", after, cfg)
+
+    fit = {
+        "chunk": i,
+        "band": c["band"],
+        "dem_near": c["dem_near"],
+        "dem_far": c["dem_far"],
+        "aoi": c["aoi"],
+        "row0": c["row0"],
+        "row1": c["row1"],
+        "decay_m": decay_m,
+        **tweaks,
+        "hillshade_s": round(hs_s, 2),
+        "az_grid": round(hs_info["az_grid"], 2),
+        "elev": round(hs_info["elev"], 3),
+        "lit_frac": round(hs_info["lit_frac"], 4),
+        "solve_s": round(solve_s, 2),
+        "solve_cores": round(ph.cores, 2),
+        "ncpu": ncpu(),
+        "corr": corr,
+        "converged": reg.stats.get("converged"),
+        "converged_reason": reg.stats.get("converged_reason"),
+        "quality": reg.stats.get("quality"),
+        "stats": reg.stats,
+    }
+    (OUT / f"chunk{i}_fit.json").write_text(json.dumps(fit, indent=1, default=str))
+    q = reg.stats.get("quality", {})
+    verdict = f"REJECTED ({q['reason']})" if q.get("rejected") else f"ok match_frac={q.get('match_frac')}"
+    log(
+        f"chunk {i}: {verdict}, corr={corr}, converged={reg.stats.get('converged')} "
+        f"({reg.stats.get('converged_reason')}), solve={solve_s:.1f}s "
+        f"[setup={reg.stats.get('setup_s')}s project={reg.stats.get('project_s')}s "
+        f"coarse={reg.stats.get('coarse_s')}s, {len(reg.stats.get('iters', []))} iters]"
+    )
+
+    gcps_by_rc = {(g.row, g.col): (g.x, g.y) for g in reg.gcps}
+    _save_gcps(OUT / f"chunk{i}.gcps", gcps_by_rc)
+    return {"chunk": c, "gcps": gcps_by_rc, "fit": fit}
+
+
+def _solve_chunks_hillshade(chunks, cfg0, fgeom, fspm):
+    """Render and save each chunk's reference hillshade only, no registration."""
+    from iirspy.georef import render_reference, save_grid
+
+    for c in chunks:
+        cfg = replace(cfg0, aoi=c["aoi"], dem_near=c["dem_near"], dem_far=c["dem_far"])
         t0 = time.time()
         ref, hs_info = render_reference(fgeom, fspm, cfg, ck.kernels(SID[:8]))
-        hs_s = time.time() - t0
-        save_grid(OUT / f"chunk{i}_hs.tif", ref, cfg)
-        log(f"chunk {i}: hillshade {hs_s:.1f}s, shape {ref.shape}")
-
-        with phase(f"chunk {i} register") as ph:
-            try:
-                reg = register(ftif, fgeom, fspm, cfg, reference=ref, verbose=True)
-            except Exception as e:
-                # corr=None keeps `_cached_chunk` from reusing the failure, so a re-run re-solves
-                # this chunk; the merge just has no GCPs from its rows. Traceback to the log only.
-                err = f"{type(e).__name__}: {e}"
-                log(f"chunk {i}: FAILED -- {err}")
-                log(traceback.format_exc())
-                fit = {"chunk": i, "band": c["band"], "row0": c["row0"], "row1": c["row1"], "corr": None, "error": err}
-                (OUT / f"chunk{i}_fit.json").write_text(json.dumps(fit, indent=1))
-                continue
-        solve_s = ph.wall
-
-        band_i = read_band(ftif, cfg.band)
-        after = project(band_i, reg.gcps, cfg)
-        m = np.isfinite(after) & np.isfinite(ref) & (after > 0) & (ref > 0)
-        corr = float(np.corrcoef(after[m], ref[m])[0, 1]) if m.sum() > 1000 else None
-        save_grid(OUT / f"chunk{i}_final.tif", after, cfg)
-
-        fit = {
-            "chunk": i,
-            "band": c["band"],
-            "dem_near": c["dem_near"],
-            "dem_far": c["dem_far"],
-            "aoi": c["aoi"],
-            "row0": c["row0"],
-            "row1": c["row1"],
-            "decay_m": decay_m,
-            **tweaks,
-            "hillshade_s": round(hs_s, 2),
-            # The sun geometry the reference was rendered under: the first thing wanted when a
-            # chunk's shadows look wrong.
-            "az_grid": round(hs_info["az_grid"], 2),
-            "elev": round(hs_info["elev"], 3),
-            "lit_frac": round(hs_info["lit_frac"], 4),
-            "solve_s": round(solve_s, 2),
-            # Mean cores `register` kept busy, against `ncpu`: what a --cpus-per-task sweep reads.
-            "solve_cores": round(ph.cores, 2),
-            "ncpu": ncpu(),
-            "corr": corr,
-            "converged": reg.stats.get("converged"),
-            "converged_reason": reg.stats.get("converged_reason"),
-            "quality": reg.stats.get("quality"),
-            "stats": reg.stats,
-        }
-        (OUT / f"chunk{i}_fit.json").write_text(json.dumps(fit, indent=1, default=str))
-        q = reg.stats.get("quality", {})
-        verdict = f"REJECTED ({q['reason']})" if q.get("rejected") else f"ok match_frac={q.get('match_frac')}"
+        save_grid(OUT / f"chunk{c['i']}_hs.tif", ref, cfg)
         log(
-            f"chunk {i}: {verdict}, corr={corr}, converged={reg.stats.get('converged')} "
-            f"({reg.stats.get('converged_reason')}), solve={solve_s:.1f}s "
-            f"[setup={reg.stats.get('setup_s')}s project={reg.stats.get('project_s')}s "
-            f"coarse={reg.stats.get('coarse_s')}s, {len(reg.stats.get('iters', []))} iters]"
+            f"chunk {c['i']} [{c['band']}] hillshade {time.time() - t0:.1f}s shape={ref.shape} "
+            f"near={Path(c['dem_near']).name} far={Path(c['dem_far']).name} "
+            f"az={hs_info['az_grid']:.1f} elev={hs_info['elev']:.2f} lit={hs_info['lit_frac']:.3f}"
         )
 
-        gcps_by_rc = {(g.row, g.col): (g.x, g.y) for g in reg.gcps}
-        _save_gcps(OUT / f"chunk{i}.gcps", gcps_by_rc)
-        results.append({"chunk": c, "gcps": gcps_by_rc, "fit": fit})
 
+def _retry_leading_rejects(chunks, results, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
+    """Walk backward from each accepted chunk, retrying its rejected left neighbour seeded from
+    it; stop at the first retry that doesn't flip to accepted."""
+    for idx in range(len(chunks) - 2, -1, -1):
+        if _accepted(results[idx]) or not _accepted(results[idx + 1]):
+            continue
+        seed = _shift_of(results[idx + 1])
+        log(f"chunk {chunks[idx]['i']}: retrying seeded from chunk {chunks[idx + 1]['i']}'s shift {seed}")
+        retried = _solve_one(chunks[idx], seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks)
+        if not _accepted(retried):
+            break
+        results[idx] = retried
     return results
+
+
+def _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, hillshade_only):
+    """Solve each chunk against its own hillshade, reusing any prior good solve of the same shape.
+
+    Each chunk is seeded with the coarse shift of the last chunk solved (forward pass). Any chunk
+    still rejected once its neighbour towards the end of the strip has solved is retried seeded
+    from that neighbour's shift, walking back towards the start until a retry doesn't improve
+    things (`_retry_leading_rejects`).
+
+    Returns one {"chunk", "gcps", "fit"} per solved chunk, empty when `hillshade_only`.
+    """
+    if hillshade_only:
+        _solve_chunks_hillshade(chunks, cfg0, fgeom, fspm)
+        return []
+
+    results = [None] * len(chunks)
+    seed = (0.0, 0.0)
+    for idx, c in enumerate(chunks):
+        results[idx] = _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks)
+        if _accepted(results[idx]):
+            seed = _shift_of(results[idx])
+
+    results = _retry_leading_rejects(chunks, results, cfg0, ftif, fgeom, fspm, decay_m, tweaks)
+    return [r for r in results if r is not None]
 
 
 # Per-band solve-time model: {hillshade_s, overhead_s, iter_s} @ the 4-core SBATCH default.

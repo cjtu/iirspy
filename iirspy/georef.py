@@ -107,6 +107,7 @@ class GeorefConfig:
     inject_tol_px: int = 3
     # How far the initial shift can look (capped at ~2x the largest geometry error, ~9 km)
     coarse_max_m: float = 20_000.0
+    seed_m: tuple = (0.0, 0.0)  # Initial guess of the shift (m)
 
     # --- quality gates
     # Fraction of tie-point candidates that must survive reliability check for chunk to be registered
@@ -1459,10 +1460,12 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
 
     # base: supplied geometry alone -- what the coarse search is measured on
     t0 = time.time()
+    x, y = x + cfg.seed_m[0], y + cfg.seed_m[1]
     img = project(band, _to_gcps(jj, ii, x, y), cfg)
     info["project_s"] = round(time.time() - t0, 2)
     t0 = time.time()
     dx, dy, cinfo = coarse_shift(img, ref, cfg)
+    cinfo["total_shift_m"] = [cfg.seed_m[0] + dx, cfg.seed_m[1] + dy]
     info["coarse"] = cinfo
     info["coarse_s"] = round(time.time() - t0, 2)
     x, y = x + dx, y + dy
