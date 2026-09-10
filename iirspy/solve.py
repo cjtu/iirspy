@@ -639,14 +639,18 @@ def _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, hillshade_on
     return results
 
 
-# Per-band solve-time model: {hillshade_s, overhead_s, iter_s} @ 4 cores/24GB SBATCH defaults.
+# Per-band solve-time model: {hillshade_s, overhead_s, iter_s} @ the 4-core SBATCH default.
 # `overhead_s` is coarse_shift plus GCP-lattice setup, i.e. solve_s minus the sum of that chunk's
-# own iter_s; it dominates for equatorial, whose coarse search over SLDEM costs ~2x LOLA's.
+# own iter_s. `--max-seconds` reads this to decide whether a chunk fits in the time left, so it
+# wants to run a little long rather than short.
 # north/north_midlat mirror south/south_midlat (same DEM tier structure) pending their own data.
+# `equatorial` re-measured 2026-09-04 (iirs-cluster/jobs/profiling): the old {3, 156, 47} predated
+# the gcp_lattice fix (428s -> 1.9s) and the bounded coarse search, and overshot 394s against a
+# measured 146s. south/south_midlat were fit the same way and are probably stale too -- unmeasured.
 BAND_TIMING: dict[str, dict[str, float]] = {
     "south": {"hillshade_s": 18.0, "overhead_s": 77.0, "iter_s": 43.0},
     "south_midlat": {"hillshade_s": 2.0, "overhead_s": 81.0, "iter_s": 57.0},
-    "equatorial": {"hillshade_s": 3.0, "overhead_s": 156.0, "iter_s": 47.0},
+    "equatorial": {"hillshade_s": 3.0, "overhead_s": 10.0, "iter_s": 30.0},
     "north": {"hillshade_s": 18.0, "overhead_s": 77.0, "iter_s": 43.0},
     "north_midlat": {"hillshade_s": 2.0, "overhead_s": 81.0, "iter_s": 57.0},
 }
@@ -659,7 +663,7 @@ def _band_estimate_s(band: str, niter: int) -> float:
     """Solve time for one `band` chunk run to `niter` iterations, from `BAND_TIMING`.
 
     >>> round(_band_estimate_s("equatorial", 5))
-    394
+    163
     """
     t = BAND_TIMING[band]
     return t["hillshade_s"] + t["overhead_s"] + niter * t["iter_s"]
