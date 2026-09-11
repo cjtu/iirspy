@@ -286,6 +286,44 @@ def test_scene_topo_assembles_pieces_with_no_blending_and_exact_per_row_sun(tmp_
     np.testing.assert_allclose(sun_elev, want_elev, atol=1e-5)
 
 
+def test_coarse_shift_falls_through_to_a_lower_ranked_base_peak_when_rank0_fails_controls(monkeypatch):
+    """A probe's rank-0 correlation peak can be a decoy (e.g. a shadow edge); coarse_shift must
+    fall through to a lower-ranked base peak whose controls actually agree."""
+    from dataclasses import replace
+
+    import skimage.registration._masked_phase_cross_correlation as mpc
+
+    from iirspy.georef import GeorefConfig, coarse_shift
+
+    def peaks_at(*entries):
+        x = np.zeros((9, 9))
+        for i, j, h in entries:
+            x[i, j] = h
+        return x
+
+    base_xcorr = peaks_at((6, 6, 5.0), (4, 4, 1.0))  # rank0 decoy at row/col (-2,-2), rank1 at (0,0)
+    ctrl_xcorr = peaks_at((2, 2, 5.0), (5, 5, 1.0))  # rank0 decoy at (2,2), rank1 real match at (-1,-1)
+    calls = iter([base_xcorr, ctrl_xcorr])
+    monkeypatch.setattr(mpc, "cross_correlate_masked", lambda *a, **k: next(calls))
+
+    cfg = replace(
+        GeorefConfig(),
+        coarse_dec=1,
+        ps=1.0,
+        coarse_max_m=2.0,
+        coarse_topk=2,
+        coarse_peak_sep_px=1,
+        inject_px=((1, 1),),
+        inject_tol_px=1,
+    )
+    dx_m, dy_m, info = coarse_shift(np.zeros((5, 5)), np.zeros((5, 5)), cfg)
+
+    assert info["base_rank"] == 1  # rank0 (-2,-2) fails the control; rank1 (0,0) is used instead
+    assert info["accepted"] is True
+    assert info["shift_px"] == [0.0, 0.0]
+    assert (dx_m, dy_m) == (0.0, 0.0)
+
+
 def test_gcp_lattice_samples_the_geometry_spline_at_the_right_rows(tmp_path):
     """The lattice evaluates the geometry TPS only where GCPs go, so row->Scan must line up.
 

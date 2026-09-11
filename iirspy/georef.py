@@ -108,6 +108,8 @@ class GeorefConfig:
     # How far the initial shift can look (capped at ~2x the largest geometry error, ~9 km)
     coarse_max_m: float = 20_000.0
     seed_m: tuple = (0.0, 0.0)  # Initial guess of the shift (m)
+    coarse_topk: int = 5  # ranked correlation peaks to search per probe; 1 = old single-peak search
+    coarse_peak_sep_px: int = 3  # min separation (decimated px) between distinct ranked peaks
 
     # --- quality gates
     # Fraction of tie-point candidates that must survive reliability check for chunk to be registered
@@ -818,11 +820,37 @@ def grad_mag(a, m, sigma):
     return np.hypot(gy, gx), binary_erosion(m, iterations=int(np.ceil(3 * sigma)) + 1)
 
 
-def _bounded_peak(xcorr, shape, cap_px):
-    """Peak of a full-mode masked cross-correlation, searched only within `cap_px` of no shift.
+def _topk_peaks(xcorr, shape, cap_px, k, min_sep_px):
+    """Up to `k` local maxima of a bounded masked cross-correlation, strongest first.
 
     `cross_correlate_masked(moving, reference, ..., mode="full")` holds shift `s` at index
     `reference.shape - 1 - s`, so the admissible shifts are one contiguous window of `xcorr`.
+    Non-max suppression (blank a `min_sep_px`-radius square around each accepted peak before
+    picking the next) keeps rank 1+ from just being a neighbouring bin of the same broad peak.
+
+    >>> x = np.zeros((9, 9)); x[4, 4] = 1.0; x[0, 0] = 5.0  # zero shift, and a taller peak at +4
+    >>> _topk_peaks(x, (5, 5), 4, k=2, min_sep_px=1)
+    [(4.0, 4.0, 5.0), (0.0, 0.0, 1.0)]
+    >>> _topk_peaks(x, (5, 5), 2, k=1, min_sep_px=1)  # taller peak is out of the cap_px=2 window
+    [(0.0, 0.0, 1.0)]
+    """
+    ny, nx = shape
+    r0, c0 = max(ny - 1 - cap_px, 0), max(nx - 1 - cap_px, 0)
+    win = xcorr[r0 : min(ny + cap_px, xcorr.shape[0]), c0 : min(nx + cap_px, xcorr.shape[1])].copy()
+    peaks = []
+    for _ in range(k):
+        i, j = np.unravel_index(np.argmax(win), win.shape)
+        if not np.isfinite(win[i, j]):
+            break
+        peaks.append((float(ny - 1 - (i + r0)), float(nx - 1 - (j + c0)), float(win[i, j])))
+        rlo, rhi = max(0, i - min_sep_px), min(win.shape[0], i + min_sep_px + 1)
+        clo, chi = max(0, j - min_sep_px), min(win.shape[1], j + min_sep_px + 1)
+        win[rlo:rhi, clo:chi] = -np.inf
+    return peaks
+
+
+def _bounded_peak(xcorr, shape, cap_px):
+    """Peak of a full-mode masked cross-correlation, searched only within `cap_px` of no shift.
 
     >>> x = np.zeros((9, 9)); x[4, 4] = 1.0; x[0, 0] = 5.0  # zero shift, and a taller peak at +4
     >>> [float(v) for v in _bounded_peak(x, (5, 5), 4)]
@@ -830,11 +858,8 @@ def _bounded_peak(xcorr, shape, cap_px):
     >>> [float(v) for v in _bounded_peak(x, (5, 5), 2)]
     [0.0, 0.0]
     """
-    ny, nx = shape
-    r0, c0 = max(ny - 1 - cap_px, 0), max(nx - 1 - cap_px, 0)
-    win = xcorr[r0 : min(ny + cap_px, xcorr.shape[0]), c0 : min(nx + cap_px, xcorr.shape[1])]
-    i, j = np.unravel_index(np.argmax(win), win.shape)
-    return np.array([ny - 1 - (i + r0), nx - 1 - (j + c0)], dtype=float)
+    row, col, _ = _topk_peaks(xcorr, shape, cap_px, k=1, min_sep_px=0)[0]
+    return np.array([row, col], dtype=float)
 
 
 def coarse_shift(img, ref, cfg):
@@ -845,9 +870,8 @@ def coarse_shift(img, ref, cfg):
     taken only within `coarse_max_m`; a low-contrast pair otherwise peaks on a nearly-disjoint
     overlap and returns a shift that puts the swath outside its own AOI.
 
-    Every number is gated: inject a known shift, re-measure, and require the answer to move by that
-    much. Returns (dx_m, dy_m, info). A shift whose controls fail is reported but not applied, and
-    `_quality` marks the chunk rejected.
+    Every number is gated: inject a known shift, re-measure, and require the answer to move by
+    that much. Searches up to `coarse_topk` correlation peaks if necessary. 
     """
     from skimage.registration._masked_phase_cross_correlation import cross_correlate_masked
 
@@ -860,28 +884,53 @@ def coarse_shift(img, ref, cfg):
         xs = np.where(mx, (x - x[mx].mean()) / (x[mx].std() + 1e-9), 0)
         ys = np.where(my, (y - y[my].mean()) / (y[my].std() + 1e-9), 0)
         xcorr = cross_correlate_masked(xs, ys, mx, my, axes=(0, 1), mode="full", overlap_ratio=0.15)
-        return _bounded_peak(xcorr, ys.shape, cap_px)
+        return _topk_peaks(xcorr, ys.shape, cap_px, cfg.coarse_topk, cfg.coarse_peak_sep_px)
 
-    base = measure(a, b)
-    controls, ok = [], []
-    for dy, dx in cfg.inject_px:
-        got = measure(np.roll(np.roll(a, dy, 0), dx, 1), b) - base
-        passed = bool(abs(got[0] + dy) < cfg.inject_tol_px and abs(got[1] + dx) < cfg.inject_tol_px)
-        controls.append({"inject": [dy, dx], "change": [round(got[0], 1), round(got[1], 1)], "passed": passed})
-        ok.append(passed)
+    base_peaks = measure(a, b)
+    ctrl_peaks = [measure(np.roll(np.roll(a, dy, 0), dx, 1), b) for dy, dx in cfg.inject_px]
     ps = cfg.ps * d
-    dx_m, dy_m = float(base[1] * ps), float(-base[0] * ps)
-    accepted = bool(all(ok))
+
+    def try_base(brow, bcol):
+        """Each control's own strongest peak consistent with this candidate base peak."""
+        controls = []
+        for (dy, dx), peaks in zip(cfg.inject_px, ctrl_peaks, strict=True):
+            hit = None
+            for peak in peaks:
+                got = (peak[0] - brow, peak[1] - bcol)
+                if abs(got[0] + dy) < cfg.inject_tol_px and abs(got[1] + dx) < cfg.inject_tol_px:
+                    hit = got
+                    break
+            controls.append({
+                "inject": [dy, dx],
+                "change": [round(hit[0], 1), round(hit[1], 1)] if hit is not None else None,
+                "passed": hit is not None,
+            })
+        return controls
+
+    # First base rank whose controls all pass wins; falls back to rank 0's own diagnostic if none do.
+    bi0_row, bi0_col, _ = base_peaks[0]
+    brow, bcol, controls = bi0_row, bi0_col, try_base(bi0_row, bi0_col)
+    bi = 0
+    if not all(c["passed"] for c in controls):
+        for cand_bi, (crow, ccol, _) in enumerate(base_peaks[1:], start=1):
+            cand_controls = try_base(crow, ccol)
+            if all(c["passed"] for c in cand_controls):
+                brow, bcol, controls, bi = crow, ccol, cand_controls, cand_bi
+                break
+
+    dx_m, dy_m = float(bcol * ps), float(-brow * ps)
+    ok = all(c["passed"] for c in controls)
     return (
-        dx_m if accepted else 0.0,
-        dy_m if accepted else 0.0,
+        dx_m if ok else 0.0,
+        dy_m if ok else 0.0,
         {
-            "shift_px": [round(base[0], 1), round(base[1], 1)],
+            "shift_px": [round(brow, 1), round(bcol, 1)],
             "shift_km": [round(dx_m / 1e3, 2), round(dy_m / 1e3, 2)],
             "search_cap_px": cap_px,
+            "base_rank": bi,
             "controls": controls,
-            "trustworthy": all(ok),
-            "accepted": accepted,
+            "trustworthy": ok,
+            "accepted": ok,
         },
     )
 
@@ -914,7 +963,7 @@ def _window_shadow(ref, row, col, win):
     return area / np.maximum((r1 - r0) * (c1 - c0), 1)
 
 
-def _coreg_pass(gref, gtgt, cfg, max_shift_px, grid_res, bad_tgt=None):
+def _coreg_pass(gref, gtgt, cfg, max_shift_px, grid_res, transform, ref, bad_tgt=None):
     """One COREG_LOCAL pass, optionally with the target's interior masked off so only the grid
     points near the swath edge are scored (`bad_tgt` True = skip)."""
     from arosics import COREG_LOCAL
@@ -943,7 +992,11 @@ def _coreg_pass(gref, gtgt, cfg, max_shift_px, grid_res, bad_tgt=None):
     )
     tp = crl.CoRegPoints_table
     kept = tp[(gtgt.nodata != tp.ABS_SHIFT) & tp.X_SHIFT_PX.notna() & (cfg.min_reliability <= tp.RELIABILITY)]
-    return kept, len(tp)  # unfiltered length is the denominator of `match_frac`
+    # n_cand_lit: match_frac's denominator restricted to candidates with any lit pixel in their
+    # win-square window -- a fully-unlit window can never produce a kept point regardless of fit.
+    row_all, col_all = _rowcol(tp, transform, ref.shape)
+    n_cand_lit = int((_window_shadow(ref, row_all, col_all, cfg.win) < 1.0).sum())
+    return kept, len(tp), n_cand_lit
 
 
 def tie_points(ref, tgt, transform, cfg, max_shift_px):
@@ -969,17 +1022,20 @@ def tie_points(ref, tgt, transform, cfg, max_shift_px):
     mk = lambda arr, m: GeoArray(_standardize(arr, m, nodata), geotransform=gt, projection=proj, nodata=nodata)
     gref, gtgt = mk(r, rm), mk(t, tm)
 
-    tp, n_cand = _coreg_pass(gref, gtgt, cfg, max_shift_px, cfg.grid_res)
+    tp, n_cand, n_cand_lit = _coreg_pass(gref, gtgt, cfg, max_shift_px, cfg.grid_res, transform, ref)
     dist = edge_dist_m(tm, abs(transform.a))
     if cfg.edge_dense_m and cfg.grid_res > 1:
         # Split rather than concatenate: the half-spacing grid is a superset of the coarse one
         # (both anchored at the array origin), so taking the coarse pass outside the margin and
         # the dense pass inside it covers every point exactly once.
         margin = dist <= cfg.edge_dense_m
-        dense, n_dense = _coreg_pass(gref, gtgt, cfg, max_shift_px, cfg.grid_res // 2, bad_tgt=~margin)
+        dense, n_dense, n_dense_lit = _coreg_pass(
+            gref, gtgt, cfg, max_shift_px, cfg.grid_res // 2, transform, ref, bad_tgt=~margin
+        )
         keep = [tp[~margin[_rowcol(tp, transform, tm.shape)]], dense[margin[_rowcol(dense, transform, tm.shape)]]]
         tp = pd.concat(keep, ignore_index=True)
         n_cand += n_dense
+        n_cand_lit += n_dense_lit
 
     row, col = _rowcol(tp, transform, tm.shape)
     if cfg.edge_reject_m:
@@ -987,7 +1043,7 @@ def tie_points(ref, tgt, transform, cfg, max_shift_px):
         row, col = _rowcol(tp, transform, tm.shape)
     if cfg.shadow_max < 1.0:
         tp = tp[_window_shadow(ref, row, col, cfg.win) <= cfg.shadow_max]
-    return tp, n_cand
+    return tp, n_cand, n_cand_lit
 
 
 def _reject_shift_cap(tp, cap_px):
@@ -1397,25 +1453,39 @@ def _quality(iters, cinfo, cfg):
     'coarse shift refused'
     >>> _quality([], ok, cfg)["reason"]
     'no iterations'
+
+    `match_frac_lit` accepts a chunk whose lit-only match rate clears the threshold even if the
+    raw one doesn't:
+    >>> _quality([{"n_kept": 60, "match_frac": 0.057, "match_frac_lit": 0.55}], ok, cfg)["rejected"]
+    False
+    >>> _quality([{"n_kept": 60, "match_frac": 0.057, "match_frac_lit": 0.55}], ok, cfg)["illumination_limited"]
+    True
     """
     last = iters[-1] if iters else {}
     frac, n_kept = last.get("match_frac"), last.get("n_kept", 0)
+    frac_lit = last.get("match_frac_lit")
+    illum_limited = False
     if not iters:
         reason = "no iterations"
     elif not cinfo.get("accepted", True):
         reason = "coarse shift refused"
     elif frac is not None and frac < cfg.min_match_frac:
-        reason = f"match_frac {frac} < {cfg.min_match_frac}"
+        if frac_lit is not None and frac_lit >= cfg.min_match_frac and n_kept >= cfg.min_kept:
+            reason, illum_limited = None, True
+        else:
+            reason = f"match_frac {frac} < {cfg.min_match_frac}"
     elif n_kept < cfg.min_kept:
         reason = f"n_kept {n_kept} < {cfg.min_kept}"
     else:
         reason = None
     return {
         "match_frac": frac,
+        "match_frac_lit": frac_lit,
         "n_kept": n_kept,
         "coarse_accepted": cinfo.get("accepted"),
         "rejected": reason is not None,
         "reason": reason,
+        "illumination_limited": illum_limited,
     }
 
 
@@ -1476,7 +1546,7 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
         t_iter = time.time()
         img = project(band, _to_gcps(jj, ii, x, y), cfg)
         project_s = time.time() - t_iter
-        tp, n_cand = tie_points(ref, img, tr, cfg, cfg.max_shift_for(k))
+        tp, n_cand, n_cand_lit = tie_points(ref, img, tr, cfg, cfg.max_shift_for(k))
         tp = _reject_shift_cap(tp, cfg.max_shift_for(k))
         n_mad, mad_lim = 0, None
         if cfg.mad_from_iter and k >= cfg.mad_from_iter:
@@ -1486,6 +1556,7 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
                 "iter": k,
                 "n_kept": 0,
                 "n_candidates": n_cand,
+                "n_candidates_lit": n_cand_lit,
                 "note": "no tie points",
                 "iter_s": round(time.time() - t_iter, 2),
             })
@@ -1505,7 +1576,9 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
             "max_shift_px": cfg.max_shift_for(k),
             "n_kept": len(tp),
             "n_candidates": n_cand,
+            "n_candidates_lit": n_cand_lit,
             "match_frac": round(len(tp) / n_cand, 3) if n_cand else None,
+            "match_frac_lit": round(len(tp) / n_cand_lit, 3) if n_cand_lit else None,
             "n_mad_rejected": n_mad,
             "mad_limit_m": mad_lim,
             "shift_m": {"median": round(float(np.median(d)), 1), "p95": round(p95, 1)},
