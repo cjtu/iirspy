@@ -48,6 +48,7 @@ INVALID = (*range(1, 7), *range(252, 257))  # Invalid band list
 # IIRS L1 radiance is stored in [1000 mW/cm^2/sr/um]; multiply to get physical [W/m^2/sr/um].
 RAD_NATIVE_SCALE = 0.01  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
 E1_EXPOSURE_MS = 1.0  # exposure duration the e1g2 gain LUT was measured at (see get_gain_offset)
+AU_KM = 1.495978707e8
 
 
 ## Reflectance corr
@@ -834,12 +835,12 @@ def parse_geom(
     Examples
     --------
     >>> # Filter by lat/lon, snapping to nearest GCP grid
-    >>> gcps, xyext = parse_geom(fgeom, latlonextent=(-10, 10, 20, 40))
+    >>> gcps, xyext = parse_geom(fgeom, latlonextent=(-10, 10, 20, 40))  # doctest: +SKIP
 
     >>> # Filter by pixel coordinates, snapping to nearest GCP grid
     >>> # If xyextent is (101, 200, 499, 601) and GCPs are every 50,
     >>> # returns GCPs with x from 100 to 200 and y from 450 to 650
-    >>> gcps, xyext = parse_geom(fgeom, xyextent=(101, 200, 499, 601), as_gcps=True)
+    >>> gcps, xyext = parse_geom(fgeom, xyextent=(101, 200, 499, 601), as_gcps=True)  # doctest: +SKIP
     """
     # Check that only one extent type is provided
     latlon_given = any(e is not None for e in latlonextent)
@@ -1006,7 +1007,8 @@ def load_iirs_spm(fspm):
     df = pd.read_csv(fspm, sep="\\s+", header=None, usecols=range(0, 19), names=colnames)
     df["year"] = df["year"].astype(str).str.slice(3, None)
     df["datetime"] = pd.to_datetime(df.iloc[:, 2:9])
-    df["timestamp"] = df["datetime"].astype("int64") / 1e9  # Equiv to .timestamp(), but faster
+    # Conversion to epoch time (like .timestamp() but faster)
+    df["timestamp"] = df["datetime"].astype("datetime64[ns]").astype("int64") / 1e9
     # df['timestamp'] = df['datetime'].apply(lambda x: x.timestamp())  # Slow
     return df
 
@@ -1017,16 +1019,13 @@ def get_line_times(fimg):
     tstart = pd.to_datetime(img.metaget("start_date_time")).timestamp()
     _, lines, _ = get_iirs_shape_meta(fimg)
     dt = float(img.metaget("isda:line_exposure_duration")) / 1000  # [ms]->[s]
-    orbit_dir = img.metaget("isda:orbit_limb_direction").lower()  # Ascending or Descending
 
     # Note: clock not precise - sometimes nlines != (tstop - tstart) / dt
     # For this reason, don't do np.arange(tstart, tstop+dt, dt) nor linspace(tstart, tstop, nlines)
     # tstop = pd.to_datetime(img.metaget('stop_date_time')).timestamp()
 
-    # Data collection time is bottom up for ascending orbit, top down for descending
+    # Note: Data collection time follows spacecraft collect direction
     line_times = tstart + dt * np.arange(lines)
-    if orbit_dir == "Ascending":
-        line_times = line_times[::-1]
     return line_times
 
 
@@ -1200,19 +1199,29 @@ def get_solar_flux(sdist=1.0, fflux=FSOLAR):
     return xr.DataArray(flux, coords={"band": np.arange(1, 257)}, name="Solar flux [W/m^2/sr/um]")
 
 
-def get_solar_distance(fimg):
-    """Return the solar distance from the IIRS metadata."""
-    # TODO: Do properly - needs spice. doesn't seem to be in the metadata
+def get_solar_distance(fimg, kernels=None):
+    """Return the Sun-Moon distance in AU at the scene's mid-line epoch, from SPICE.
+
+    `kernels=None` resolves the kernel set via `chunks.kernels(day)`. Warns and returns 1.0 AU if
+    the label or kernels can't be found, rather than failing the whole calibration.
+    """
+    import spiceypy as sp
+
+    from iirspy import chunks
+
     fimg = Path(fimg)
-    if "20201226T1745264921" in fimg.stem:
-        return 0.9855
-    elif "20210122T0920157625" in fimg.stem:
-        return 0.9849
-    elif "20210719T1622353775" in fimg.stem:
-        return 1.0174
-    elif "20210622T1850441449" in fimg.stem or "20210622T1454378054" in fimg.stem or "20210622T1256344234" in fimg.stem:
-        return 1.0184
-    return 1.0
+    try:
+        line_times = get_line_times(fimg)
+        t = pd.Timestamp(line_times[len(line_times) // 2], unit="s")
+        ks = kernels if kernels is not None else chunks.kernels(t.strftime("%Y%m%d"))
+        for k in ks:
+            sp.furnsh(str(k))
+        et = sp.str2et(t.strftime("%Y-%m-%dT%H:%M:%S.%f"))
+        v, _ = sp.spkpos("SUN", et, "IAU_MOON", "LT+S", "MOON")
+    except Exception as e:
+        warnings.warn(f"get_solar_distance: could not compute from SPICE for {fimg} ({e}); using 1.0 AU", stacklevel=2)
+        return 1.0
+    return float(np.linalg.norm(v) / AU_KM)
 
 
 def write_envi(da, fout):
@@ -1272,8 +1281,12 @@ def _write_bil_rows(f, da, i0, i1, sub_rows):
         blk.transpose(1, 0, 2).tofile(f)  # C-order of (row, band, x) == ENVI BIL
 
 
-def write_envi_bil(da, fout, sub_rows=1000, description="IIRS"):
-    """Sequentially stream a (band, y, x) DataArray to an ENVI BIL float32 file (bounded memory)."""
+def write_envi_bil(da, fout, sub_rows, description="IIRS"):
+    """Sequentially stream a (band, y, x) DataArray to an ENVI BIL float32 file (bounded memory).
+
+    `sub_rows` is required: it is resolved once in `IIRSData._write`, so no second default can
+    drift away from the cube's dask chunking.
+    """
     fout = str(fout)
     nband, ny, nx = da.shape
     with open(fout, "wb") as f:
@@ -1555,20 +1568,3 @@ def plot_spectra_with_sigma(da: xr.DataArray, ax=None, label: str = "", stdev_al
     ax.set_xlabel("Wavelength")
     ax.legend(frameon=False)
     return ax
-
-
-if __name__ == "__main__":  # pragma: no cover
-    fqub = (
-        "/home/cjtu/projects/lai/issdc-requester/data/corrected_python/refl/ch2_iir_20210622T1256344234_destriped.img"
-    )
-    fgeom = "/home/cjtu/projects/lai/data/moon/ch2/iirs/geometry/calibrated/20210622/ch2_iir_nci_20210622T1256344234_g_grd_d32.csv"
-    fpoints = "/home/cjtu/projects/lai/data/moon/ch2/iirs/corrected_python/refl/ch2_iir_20210622T1256344234_destriped.img.points"
-
-    # Read un-georeferenced data qub and add projection info
-    da = xr.open_dataarray(fqub, engine="rasterio")
-    gridlon, gridlat, xyext = geom2grid(fgeom, (None, None, -86, -83))
-    gcps, gcps_crs = read_gcps(fpoints)
-
-    # projected = warp2grid(da, xyext, gridlon, gridlat)
-    proj_from_gcps = warp2gcps(fqub, da, gcps, gcps_crs, "./test.tif")
-    pass

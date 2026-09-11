@@ -1,17 +1,15 @@
 [project]
 name = "iirspy"
-version = "0.0.4"
+version = "0.0.6"
 description = "Handling and correcting Chandrayaan-2 IIRS data in Python."
 authors = [{ name = "Christian J. Tai Udovicic", email = "cj.taiudovicic@gmail.com" }]
 readme = "README.md"
 keywords = ['python']
-requires-python = ">=3.10,<3.15"
+requires-python = ">=3.12,<3.15"
 classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -20,27 +18,31 @@ classifiers = [
 dependencies = [
     "bottleneck>=1.5.0",
     "dask>=2025.2.0",
-    "ipykernel>=6.29.5",
+    "issdc",
     "matplotlib>=3.9.4",
     "numpy>=2.0.2",
     "opencv-python>=4.11.0.86",
     "pandas>=2.2.3",
     "pdr>=1.3.0",
+    "pyproj>=3.7.1",
+    "rasterio>=1.3.0",
     "rioxarray>=0.15.0",
+    "scikit-image>=0.25.2",
     "scipy>=1.13.1",
+    "spiceypy>=8.2.0",
     "xarray>=2024.7.0",
     "xarray-regrid>=0.4.0",
 ]
+
+[project.scripts]
+iirs-solve-scene = "iirspy.solve:main"
+iirs-compute-refl = "iirspy.refl:main"
+iirs-make-glt = "iirspy.georef:main"
 
 [project.urls]
 Homepage = "https://cjtu.github.io/iirspy/"
 Repository = "https://github.com/cjtu/iirspy"
 Documentation = "https://cjtu.github.io/iirspy/"
-
-[project.optional-dependencies]
-download = [
-    "issdc",
-]
 
 [dependency-groups]
 dev = [
@@ -73,14 +75,14 @@ warn_unused_ignores = true
 show_error_codes = true
 
 [[tool.mypy.overrides]]
-module = ["pandas.*", "pdr.*", "rasterio.*", "scipy.*", "cv2.*"]
+module = ["pandas.*", "pdr.*", "rasterio.*", "scipy.*", "cv2.*", "spiceypy.*", "skimage.*", "arosics.*", "geoarray.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py312"
 line-length = 120
 fix = true
 exclude = ["notebooks", "*.ipynb"]

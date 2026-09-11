@@ -21,12 +21,20 @@ FIXTURE_BANDS = [10, 18, 26, 42, 110, 111, 112]
 PAN = [b for b in FIXTURE_BANDS if b in emp.PAN_BANDS]  # [10, 18, 26, 42]
 
 
-def synth_cube(nband=7, ny=600, nx=250, bands=None, dark_rows=200, seed=0):
-    """Synthetic (band, y, x) DN cube: `dark_rows` dark rows then a lit, gently textured scene."""
+def synth_cube(nband=7, ny=600, nx=250, bands=None, dark_rows=200, seed=0, texture=0.0, pedestal=0.0):
+    """Synthetic (band, y, x) DN cube: `dark_rows` dark rows then a lit, gently textured scene.
+
+    `texture` adds cross-track albedo contrast to the lit rows only - the scene's own sine is
+    smooth enough that a CROSS_WIN high-pass removes it, so a shadow/terrain test needs real
+    high-frequency structure to bite. `pedestal` lifts every row, standing in for a scene whose
+    onboard dark subtraction never ran (20201203T1859574285 sits ~290 DN up).
+    """
     rng = np.random.default_rng(seed)
     bands = FIXTURE_BANDS[:nband] if bands is None else bands
-    data = np.full((len(bands), ny, nx), 15.0, dtype="float32")  # dark level
+    data = np.full((len(bands), ny, nx), 15.0 + pedestal, dtype="float32")  # dark level
     scene = 300 + 20 * np.sin(np.linspace(0, 6, nx))[None, :] + rng.normal(0, 3, (ny - dark_rows, nx))
+    if texture:
+        scene = scene + rng.normal(0, texture, (ny - dark_rows, nx))
     data[:, dark_rows:, :] += scene[None].astype("float32")
     data += rng.normal(0, 1.0, data.shape).astype("float32")
     return xr.DataArray(
@@ -80,10 +88,38 @@ def test_dark_floor_and_detect_dark_rows_find_the_dark_block():
     assert row_bright.shape == (cube.sizes["y"],)
 
 
-def test_detect_dark_rows_returns_nothing_when_scene_is_uniformly_lit():
-    cube = synth_cube(dark_rows=0)
-    mask, _, _ = emp.detect_dark_rows(emp.panchromatic(cube))
-    assert not mask.any()
+def test_uniformly_lit_scene_yields_no_dark_subtraction():
+    """The level bootstrap always returns its dimmest rows; is_shadow is what rejects them."""
+    P = emp.panchromatic(synth_cube(dark_rows=0, texture=12.0))
+    mask, _, _ = emp.detect_dark_rows(P)
+    assert mask.any(), "the bootstrap is a level cut, so a lit scene still offers candidates"
+    assert not emp.is_shadow(P, emp.longest_run(mask)), "dim lit rows keep their terrain contrast"
+    *_, notes = emp.empirical_frames(synth_cube(dark_rows=0, texture=12.0))
+    assert notes["has_shadow"] is False
+
+
+def test_shadow_is_found_through_an_unsubtracted_dark_pedestal():
+    """The failure 20201203T1859574285 shows: shadow at ~290 DN, which any level cut calls lit.
+
+    Structure, not level, has to make the call - and the derived dark must carry the pedestal so
+    the radiance still comes out zero-anchored.
+    """
+    cube = synth_cube(texture=12.0, pedestal=290.0)
+    dark, _, _, snr, notes = emp.empirical_frames(cube)
+    assert notes["has_shadow"] is True
+    assert snr is not None
+    a, b = notes["dark_rows"]
+    assert a < 50 and b > 150, f"expected the leading 200 shadow rows, got {notes['dark_rows']}"
+    assert notes["dark_level"] > emp.DARK_PEDESTAL_DN  # flagged as an unsubtracted dark
+    assert float(dark.median()) == pytest.approx(305.0, abs=3.0)  # 15 DN dark + the 290 pedestal
+    # ... and the same scene without the pedestal must land on the same rows
+    plain = emp.empirical_frames(synth_cube(texture=12.0))[-1]
+    assert plain["dark_rows"] == notes["dark_rows"]
+
+
+def test_pedestal_scene_warns_that_the_onboard_dark_is_missing():
+    with pytest.warns(UserWarning, match="onboard dark subtraction looks absent"):
+        emp.empirical_frames(synth_cube(texture=12.0, pedestal=290.0))
 
 
 def test_lit_rows_uses_per_pixel_snr_not_row_median_scatter():
@@ -113,16 +149,17 @@ def test_broadband_snr_is_high_in_lit_rows_and_low_in_dark():
     assert float(snr.isel(y=slice(200, None)).median()) > 50
 
 
-def test_row_roughness_and_flattest_window(real_cube):
+def test_row_roughness_and_flattest_rows(real_cube):
     P = emp.panchromatic(real_cube)
     rs = emp.row_roughness(P)
     lit = emp.lit_rows(P, None)  # fixture is a fully lit crop: no dark block to measure noise in
     assert rs.shape == lit.shape == (real_cube.sizes["y"],)
-    a, b = emp.flattest_window(rs, lit)
-    assert b - a == emp.MIN_ROWS
-    best = float(np.nanmean(rs[a:b]))  # no other window of that length is flatter
-    others = [float(np.nanmean(rs[i : i + emp.MIN_ROWS])) for i in range(0, len(rs) - emp.MIN_ROWS, 25)]
-    assert best <= min(others) + 1e-9
+    rows = emp.flattest_rows(rs, lit)
+    assert rows.size == emp.MIN_ROWS
+    assert (np.diff(rows) > 0).all(), "rows come back sorted"
+    # every row taken is at least as flat as every row left behind
+    rest = np.setdiff1d(np.flatnonzero(np.isfinite(rs) & lit), rows)
+    assert rs[rows].max() <= rs[rest].min() + 1e-9
 
 
 def test_signal_free_rows_do_not_poison_the_roughness_profile():
@@ -134,13 +171,46 @@ def test_signal_free_rows_do_not_poison_the_roughness_profile():
     lit = emp.lit_rows(P, (0, 200))
     assert np.isinf(rs[300:340]).all(), "signal-free rows must be maximally rough"
     assert np.isfinite(rs[400:]).all(), "the rest of the roughness profile must survive"
-    win = emp.flattest_window(rs, lit)
-    assert win is not None and not (win[0] < 340 and win[1] > 300), "must not straddle the dead rows"
+    rows = emp.flattest_rows(rs, lit)
+    assert rows is not None and not ((rows >= 300) & (rows < 340)).any(), "must not take dead rows"
 
 
-def test_flattest_window_without_enough_rows_returns_none():
-    assert emp.flattest_window(np.zeros(500), np.zeros(500, dtype=bool)) is None
-    assert emp.flattest_window(np.zeros(50), np.ones(50, dtype=bool)) is None
+def test_flattest_rows_without_enough_rows_returns_none():
+    assert emp.flattest_rows(np.zeros(500), np.zeros(500, dtype=bool)) is None
+    assert emp.flattest_rows(np.zeros(50), np.ones(50, dtype=bool)) is None
+
+
+def test_flattest_rows_survives_fragmented_lit_rows():
+    """Qualifying rows need not be adjacent."""
+    rs = np.linspace(1.0, 2.0, 1000)
+    lit = np.zeros(1000, dtype=bool)
+    lit[::2] = True  # 500 lit rows, no two adjacent
+    rows = emp.flattest_rows(rs, lit)
+    assert rows is not None and rows.size == emp.MIN_ROWS
+    assert lit[rows].all()
+
+
+def test_dn_bins_never_starves_a_bin_below_min_rows():
+    row_bright = np.linspace(0, 100, 1000)
+    lit = np.zeros(1000, dtype=bool)
+    lit[:500] = True  # 500 lit rows -> 2 bins of 250, not 4 of 125
+    assert len(emp.dn_bins(row_bright, lit)) == 2
+    lit[:] = True
+    assert len(emp.dn_bins(row_bright, lit)) == emp.N_DN_BINS
+    assert emp.dn_bins(row_bright, np.zeros(1000, dtype=bool)) == []
+
+
+def test_refine_dark_block_ignores_a_dim_patch_elsewhere_in_the_scene():
+    """A dim patch longer than the true shadow must not be adopted as the dark block: lit pixels
+    in the dark frame over-subtract the residual dark and inflate the noise scale."""
+    cube = synth_cube(ny=1400, dark_rows=400)
+    cube[:, 800:1050, :] = 40.0  # a dim patch, longer than the true shadow but 25 DN above it
+    P = emp.panchromatic(cube)
+    mask, _, _ = emp.detect_dark_rows(P)
+    block = emp.longest_run(mask)
+    assert block == (0, 400)
+    d0, d1 = emp.refine_dark_block(P, block)
+    assert d1 <= 400, f"refined block {(d0, d1)} must stay on the true shadow, not jump to the patch"
 
 
 def test_spatial_outlier_mask_flags_injected_spikes(real_cube):

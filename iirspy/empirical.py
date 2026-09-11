@@ -11,7 +11,7 @@ step use the LUT only for the per-band absolute scale (see iirs.L0.calibrate_to_
                         *residual* dark - drift + hot/warm-pixel residuals + stray light. Its
                         real job is per-element hot-pixel refinement. 0 when no shadow is found.
   flat(band, x)       : sensor high-frequency response, R / lowpass_x(R), median-composited over
-                        the flattest region of each brightness quantile bin. A hardware property,
+                        the flattest rows of each brightness quantile bin. A hardware property,
                         so it is transferable; falls back to a packaged reference flat when the
                         scene has no qualifying flat region.
   smile(band, x)      : band-relative smooth cross-track field. Only spectrally-varying smooth
@@ -47,7 +47,8 @@ N_CLEAN_BANDS = 8  # how many least-bad bands clean_bands() picks for spatial-ou
 DARK_PCT = 0.5  # darkest percentile of rows used to estimate the shadow floor + noise
 DARK_K = 8.0  # row shadow threshold = floor + DARK_K * sigma
 DARK_SIGMA_FLOOR = 0.15  # min row-median scatter [DN], keeps the bootstrap threshold off zero
-DARK_MAX_FRAC = 0.3  # darkest rows count as shadow only if floor < this * scene median
+DARK_SMOOTH_FRAC = 0.25  # shadow rows carry under this share of the scene's typical cross-track structure
+DARK_PEDESTAL_DN = 25.0  # a dark frame above this did not have its onboard subtraction applied
 NOISE_FLOOR = 0.5  # min noise [DN] to avoid divide-by-zero in the SNR
 SHADOW_SNR = 2.0  # broadband SNR below this is shadow (per-pixel dark noise, as LIT_SNR)
 
@@ -120,14 +121,52 @@ def _xr_yx(mask_yx, like):
     return xr.DataArray(mask_yx, coords={"y": like.y, "x": like.x}, dims=("y", "x"))
 
 
-def longest_run(mask):
-    """Return (start, stop) of the longest contiguous True run in a 1-D bool array."""
+def runs(mask):
+    """Contiguous True runs of a 1-D bool array, as [(start, stop), ...]."""
     idx = np.flatnonzero(mask)
     if idx.size == 0:
-        return (0, 0)
-    splits = np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1)
-    best = max(splits, key=len)
-    return int(best[0]), int(best[-1]) + 1
+        return []
+    return [(int(r[0]), int(r[-1]) + 1) for r in np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1)]
+
+
+def longest_run(mask):
+    """Return (start, stop) of the longest contiguous True run in a 1-D bool array."""
+    return max(runs(mask), key=lambda r: r[1] - r[0], default=(0, 0))
+
+
+def live_cols(P):
+    """Columns carrying real response: those above DEAD_COL_FRAC of the median column profile."""
+    prof = np.nanmedian(P.values, axis=0)
+    return prof > DEAD_COL_FRAC * np.nanmedian(prof)
+
+
+def cross_track_hf(P, win=CROSS_WIN):
+    """Per-row scatter [DN] left by a cross-track high-pass: terrain contrast, independent of level.
+
+    The one shadow signature that survives a missing dark subtraction. A shadowed row holds no
+    albedo structure, so neighbouring samples differ only by detector noise whatever DN the row
+    sits at, while a merely dim row keeps its terrain contrast. Measured on 20201203T1859574285
+    (e2g2, dark pedestal): shadow rows 1.7 DN against a scene median of 16.3, i.e. 0.6% of level
+    against lit terrain's 3.0%.
+    """
+    from scipy.ndimage import uniform_filter1d
+
+    v = P.values[:, live_cols(P)]
+    hp = v - uniform_filter1d(v, win, axis=1, mode="nearest")
+    return np.nanmedian(np.abs(hp - np.nanmedian(hp, axis=1, keepdims=True)), axis=1) * MAD_TO_SIGMA
+
+
+def is_shadow(P, block, hf=None):
+    """True when `block` holds no cross-track scene structure - shadow, not merely dim terrain.
+
+    Level cannot decide this. A scene whose onboard dark subtraction never happened puts its
+    shadow at hundreds of DN (20201203T1859574285: 291-347, against 0-10 across every e1g2 scene
+    here), which any absolute or scene-relative level cut reads as "too bright to be shadow" and
+    throws the dark frame away. Structure decides it at any pedestal.
+    """
+    hf = cross_track_hf(P) if hf is None else hf
+    a, b = block
+    return bool(np.nanmedian(hf[a:b]) < DARK_SMOOTH_FRAC * np.nanmedian(hf[np.isfinite(hf)]))
 
 
 def dark_floor(row_bright):
@@ -143,14 +182,12 @@ def detect_dark_rows(P):
     Return (dark_mask_y, threshold, row_bright): a first pass at the shadow rows, from raw DN.
 
     Cuts DARK_K robust standard deviations above the dark floor, wherever in the scene the darkest
-    rows sit (no assumption of a leading shadow). Returns an empty mask when the floor is not well
-    below the scene as a whole (floor >= DARK_MAX_FRAC * scene median), i.e. the scene holds no
-    shadow and the dark step is skipped. refine_dark_block sharpens the edge on the SNR scale.
+    rows sit (no assumption of a leading shadow). This is a bootstrap on level alone and says
+    nothing about whether the scene holds a shadow at all - `is_shadow` rules on that, after
+    refine_dark_block sharpens the edge on the SNR scale.
     """
     row_bright = np.nanmedian(P.values, axis=1)
     floor, sigma = dark_floor(row_bright)
-    if floor >= DARK_MAX_FRAC * np.nanmedian(row_bright):
-        return np.zeros_like(row_bright, dtype=bool), floor, row_bright
     thresh = floor + DARK_K * sigma
     return row_bright < thresh, thresh, row_bright
 
@@ -170,13 +207,17 @@ def broadband_snr(P, d0, d1):
 
 
 def refine_dark_block(P, block):
-    """Longest run of rows with median broadband SNR below SHADOW_SNR, measured against `block`.
+    """Grow `block` to the full run of rows with median broadband SNR below SHADOW_SNR.
 
     `block` supplies the noise scale, so the shadow edge lands on the same footing as LIT_SNR.
-    Falls back to `block` when the refined run is too short for a stable median.
+    Only runs touching `block` are eligible - a dim patch elsewhere in the scene can also read
+    below SHADOW_SNR, and taking it would put lit pixels in the dark frame. Falls back to `block`
+    when nothing touching it is long enough for a stable median.
     """
     shadow = np.nanmedian(broadband_snr(P, *block).values, axis=1) < SHADOW_SNR
-    d0, d1 = longest_run(shadow)
+    a, b = block
+    touching = [r for r in runs(shadow) if r[0] < b and r[1] > a]
+    d0, d1 = max(touching, key=lambda r: r[1] - r[0], default=block)
     return (d0, d1) if d1 - d0 >= MIN_ROWS else block
 
 
@@ -203,7 +244,7 @@ def row_roughness(P):
 
     vals = P.values
     global_prof = np.nanmedian(vals, axis=0)
-    good = global_prof > DEAD_COL_FRAC * np.nanmedian(global_prof)
+    good = live_cols(P)
     N = vals[:, good] / global_prof[good]
     hp = N - uniform_filter1d(N, CROSS_WIN, axis=1, mode="nearest")
     plo, phi = np.nanpercentile(hp, ROUGH_PCTL, axis=1)
@@ -218,27 +259,18 @@ def row_roughness(P):
     return rs
 
 
-def flattest_window(rs, mask, nrows=MIN_ROWS):
-    """(start, stop) of the lowest-mean-roughness run of `nrows` rows lying wholly inside `mask`.
+def flattest_rows(rs, mask, nrows=MIN_ROWS):
+    """Indices of the `nrows` lowest-roughness rows inside `mask`; None if that many don't exist.
 
-    Fixed length rather than an adaptive tolerance: measured across eight scenes, letting a run
-    grow past nrows adds rows to the flat's median but not accuracy, and a single length needs no
-    threshold to tune. None when no such window exists.
+    Rows need not be contiguous: the flat is a per-column median over y, so row order carries no
+    information, and scattered rows sample the sensor over more independent terrain. Fixed count
+    rather than an adaptive roughness tolerance - taking more rows adds to the median but not the
+    accuracy, and one count needs no tuning.
     """
-    ok = np.isfinite(rs) & mask
-    csum = np.concatenate([[0.0], np.cumsum(np.where(ok, rs, 0.0))])
-    ccnt = np.concatenate([[0], np.cumsum(ok.astype(int))])
-    full = (ccnt[nrows:] - ccnt[:-nrows]) == nrows
-    mean = np.where(full, (csum[nrows:] - csum[:-nrows]) / nrows, np.inf)
-    if not full.any():
+    cand = np.flatnonzero(np.isfinite(rs) & mask)
+    if cand.size < nrows:
         return None
-    a = int(np.argmin(mean))
-    return a, a + nrows
-
-
-def flattest_run_in_bin(rs, lit, row_bright, lo, hi):
-    """The flattest window whose rows fall in brightness bin [lo, hi); None if none qualify."""
-    return flattest_window(rs, lit & (row_bright >= lo) & (row_bright < hi))
+    return np.sort(cand[np.argpartition(rs[cand], nrows - 1)[:nrows]])
 
 
 def spatial_outlier_mask(fsub):
@@ -256,9 +288,9 @@ def spatial_outlier_mask(fsub):
     return np.abs(z) > OUTLIER_Z
 
 
-def derive_sensor_flat(img, dark, a, b):
-    """Sensor flat (band, x) = R / lowpass_x(R) from rows [a, b): high-frequency response only."""
-    fsub = (img.isel(y=slice(a, b)).astype("float32") - dark).compute()
+def derive_sensor_flat(img, dark, rows):
+    """Sensor flat (band, x) = R / lowpass_x(R) from `rows`: high-frequency response only."""
+    fsub = (img.isel(y=rows).astype("float32") - dark).compute()
     mask = spatial_outlier_mask(fsub)
     R = fsub.where(~_xr_yx(mask, fsub)).median("y")
     return (R / lowpass_x(R)).astype("float32")
@@ -282,7 +314,9 @@ def dn_bins(row_bright, lit, nbins=N_DN_BINS):
     Quantiles rather than fixed DN cuts, so the flat is sampled across whatever brightness range
     the scene actually spans - polar scenes are far darker than equatorial ones.
     """
-    if not lit.any():
+    # Equal-count bins, so cap nbins at what leaves every bin MIN_ROWS rows to draw a flat from.
+    nbins = min(nbins, int(lit.sum()) // MIN_ROWS)
+    if nbins < 1:
         return []
     edges = np.nanpercentile(row_bright[lit], np.linspace(0, 100, nbins + 1))
     return [(float(lo), float(hi)) for lo, hi in zip(edges[:-1], [*edges[1:-1], np.inf], strict=True)]
@@ -293,17 +327,20 @@ def build_flat(img, dark, rs, lit, row_bright, ref_flat=None):
     Median-composite sensor flat (band, x) over the flattest region of each brightness bin.
 
     Falls back to the packaged reference flat (with a UserWarning) when no in-scene region
-    qualifies. Never raises. Returns (flat, emp_notes) recording the runs used, whether the
+    qualifies. Never raises. Returns (flat, emp_notes) recording the rows used, whether the
     fallback fired, and the per-scene-vs-reference RMS deviation (the flat stability metric).
+
+    emp_notes["flat_runs"][bin] is [first, last + 1] of the rows sampled in that bin; the rows
+    are scattered within that span, not a solid block.
     """
     bad = on_bands(utils.load_bad_pixel_mask(), img)
     ref_flat = None if ref_flat is None else on_bands(ref_flat, img)
     flats, runs_used = [], {}
     for lo, hi in dn_bins(row_bright, lit):
-        run = flattest_run_in_bin(rs, lit, row_bright, lo, hi)
-        runs_used[f"{lo:.0f}-{hi:.0f}"] = list(run) if run is not None else None
-        if run is not None:
-            flats.append(derive_sensor_flat(img, dark, *run))
+        rows = flattest_rows(rs, lit & (row_bright >= lo) & (row_bright < hi))
+        runs_used[f"{lo:.0f}-{hi:.0f}"] = None if rows is None else [int(rows[0]), int(rows[-1]) + 1]
+        if rows is not None:
+            flats.append(derive_sensor_flat(img, dark, rows))
     emp_notes = {"flat_runs": runs_used, "flat_fallback": False, "flat_ref_rms": None}
 
     if flats:
@@ -386,10 +423,28 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
         d0, d1 = longest_run(dark_mask)
         if d1 - d0 >= MIN_ROWS:
             d0, d1 = refine_dark_block(P, (d0, d1))
+        if d1 - d0 >= MIN_ROWS and is_shadow(P, (d0, d1)):
             dark = img.isel(y=slice(d0, d1)).median("y").compute().astype("float32")
             snr = broadband_snr(P, d0, d1)
             dark_block = (d0, d1)
-            emp_notes.update(has_shadow=True, dark_rows=[d0, d1], dark_threshold=float(thresh), dark_source="auto")
+            level = float(np.nanmedian(row_bright[d0:d1]))
+            emp_notes.update(
+                has_shadow=True,
+                dark_rows=[d0, d1],
+                dark_threshold=float(thresh),
+                dark_source="auto",
+                dark_level=round(level, 3),
+            )
+            if level > DARK_PEDESTAL_DN:
+                # The shadow anchors the zero point either way, so the product is still calibrated
+                # - but a pedestal this large drifts with the detector, and the single frame
+                # derived here only holds near the rows it came from.
+                warnings.warn(
+                    f"shadow rows sit at {level:.0f} DN, not ~0: the onboard dark subtraction looks "
+                    f"absent for this scene, so the empirical dark carries the full pedestal",
+                    UserWarning,
+                    stacklevel=2,
+                )
         else:
             warnings.warn("no shadow rows found; skipping empirical dark subtraction", UserWarning, stacklevel=2)
             dark = xr.zeros_like(P.isel(y=0), dtype="float32").drop_vars("y")
@@ -401,7 +456,7 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
     if flat_yrange is not None:
         a, b = int(flat_yrange[0]), int(flat_yrange[1])
         bad = on_bands(utils.load_bad_pixel_mask(), img)
-        flat = derive_sensor_flat(img, dark, a, b).where(~bad).astype("float32")
+        flat = derive_sensor_flat(img, dark, np.arange(a, b)).where(~bad).astype("float32")
         emp_notes.update(
             flat_runs={"user": [a, b]},
             flat_fallback=False,
