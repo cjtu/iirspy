@@ -61,6 +61,15 @@ def _dem(sub: str, name: str) -> str:
 
 _POLAR = "LOLA_GDR/POLAR"
 _SLDEM = "SLDEM2015_512_60S_60N_000_360"
+_WAC_MOSAIC = "LRO_WAC_Mosaic_Global_303ppd_v3"
+
+
+@lru_cache
+def wac_mosaic() -> str | None:
+    try:
+        return _dem("", _WAC_MOSAIC)
+    except FileNotFoundError:
+        return None
 
 
 def _pole_radius_m(crs_pole: str, lat: float) -> float:
@@ -216,6 +225,7 @@ def chunk_cfg(group: str) -> GeorefConfig:
         pole=group,
         dem_near=primary["dem_near"],
         dem_far=primary["dem_far"],
+        wac_mosaic=wac_mosaic(),
         row_step=ROW_STEP,
     )
 

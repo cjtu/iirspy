@@ -29,10 +29,24 @@ from pathlib import Path
 
 import numpy as np
 
+from iirspy import __version__
 from iirspy import chunks as ck
 
 WIDTH_RANGE_KM = (100.0, 150.0)
 OVERLAP_FRAC = 0.10
+
+# How far a chunk's own coarse shift may sit from the strip consensus before it is re-solved seeded
+# from it. Measured over 9 strips the true correction moves <=1.4 km chunk-to-chunk while a spurious
+# correlation peak jumps 6-28 km, and 2 km stays under the 2.0 km iteration-1 capture radius, so
+# refinement absorbs the residual a reseeded chunk is left with.
+CONSENSUS_TOL_M = 2000.0
+# Grades a merged product from the worst overlap-boundary p95 (see `_solve_grade`).
+GRADE_ACCEPTABLE_M = 500.0
+# Reseeding assumes one constant x/y correction per strip. In polar stereographic grid north rotates
+# with longitude, so a body-frame-constant pointing error is *not* a constant grid vector along a
+# strip spanning longitude; only the equidistant-cylindrical equatorial group clearly satisfies it.
+# Polar groups therefore log the consensus but keep their solves unless this is opted into.
+CONSENSUS_ALL_GROUPS = os.environ.get("IIRS_CONSENSUS_SEED") == "1"
 
 # Exit code for "stopped early on purpose, work is checkpointed, run me again" -- distinct from 0
 # (finished) and from any real failure, so a submission script can requeue on it alone.
@@ -41,7 +55,9 @@ EXIT_RESUME = 75
 # Copied to `--keep`; everything else in the work dir is rebuildable from the zip.
 # - all gcp files generated and run log / json stats
 # - `*_L1_b*.tif`: the final warped raster at the registration band (only 1 band, 10s of MB)
-KEEP_GLOBS = ("*.gcps", "chunk*_fit.json", "chunks.json", "summary.json", "run.log", "*_L1_b*.tif")
+# - `*.vrt`: the GCP sidecar for that raster; it names its tif relative to itself, so the pair has
+#   to travel together or the vrt dangles.
+KEEP_GLOBS = ("*.gcps", "chunk*_fit.json", "chunks.json", "summary.json", "run.log", "*_L1_b*.tif", "*.vrt")
 
 # Set by `main` from argv; module-level because `build_l1` and `log` both need them.
 SID = ""
@@ -174,10 +190,16 @@ def _dem_key(path: str) -> str:
 def _cached_chunk(out: Path, c: dict, good_corr: float, decay_m: float, tweaks: dict):
     """The prior solve of chunk `c['i']` if it is still valid, else None.
 
-    Valid means its band, DEM pair, row bounds, aoi, decay_m and tweaks all match `c` and it
-    wasn't rejected, at corr >= `good_corr`. Convergence isn't required -- a non-converged chunk
-    that still passed quality (5-iter cap, no plateau) re-solves to the same result every time, so
-    treating it as cache-invalid just burns wall-clock re-deriving an answer that won't change.
+    Valid means its band, DEM pair, row bounds, aoi, decay_m, tweaks and the iirspy version that
+    wrote it all match `c` and it wasn't rejected, at corr >= `good_corr`. The version is in the key
+    because none of the other fields say anything about the *code* that solved the chunk, so without
+    it a rerun or an `EXIT_RESUME` requeue after an algorithm change mixes old and new solves in one
+    product. `"0+source"` (not installed as a distribution, so the version cannot invalidate
+    anything) always misses; the cluster venv picks up a bump when iirspy is reinstalled into it.
+
+    Convergence isn't required -- a non-converged chunk that still passed quality (5-iter cap, no
+    plateau) re-solves to the same result every time, so treating it as cache-invalid just burns
+    wall-clock re-deriving an answer that won't change.
     The DEM pair is part of the key (by product name, see `_dem_key`) because `plan_chunks` picks
     the far tier per chunk, so two runs can agree on shape and still have used different
     references. Returns (fit, gcps_by_rc).
@@ -187,7 +209,9 @@ def _cached_chunk(out: Path, c: dict, good_corr: float, decay_m: float, tweaks: 
         return None
     fit = json.loads(ffit.read_text())
     same = (
-        fit.get("band") == c["band"]
+        __version__ != "0+source"
+        and fit.get("version") == __version__
+        and fit.get("band") == c["band"]
         and _dem_key(fit.get("dem_near", "")) == _dem_key(c["dem_near"])
         and _dem_key(fit.get("dem_far", "")) == _dem_key(c["dem_far"])
         and fit.get("row0") == c["row0"]
@@ -410,13 +434,21 @@ def _scene_scan0(fgeom: Path, lat_range: tuple[float, float]) -> int:
     return int(xyext[2])
 
 
-def _make_glt(merged: dict, cfg0, scan0: int, glt_dir: str, overwrite: bool = False) -> Path:
-    """Build the scene's GLT from the merged GCPs."""
+def _gcp_list(merged: dict) -> list:
+    """The merged `{(row, col): (x, y)}` mapping as the GCP list rasterio and the VRT writer want."""
     from rasterio.control import GroundControlPoint
 
+    return [
+        GroundControlPoint(row=float(row), col=float(col), x=float(x), y=float(y))
+        for (row, col), (x, y) in merged.items()
+    ]
+
+
+def _make_glt(merged: dict, cfg0, scan0: int, glt_dir: str, overwrite: bool = False) -> Path:
+    """Build the scene's GLT from the merged GCPs."""
     from iirspy import georef
 
-    gcps = [GroundControlPoint(row=r, col=c, x=x, y=y) for (r, c), (x, y) in merged.items()]
+    gcps = _gcp_list(merged)
     xs, ys = [g.x for g in gcps], [g.y for g in gcps]
     cfg = replace(cfg0, aoi=(min(xs), min(ys), max(xs), max(ys)))
     return georef.scene_glt(SID, GROUP, gcps, cfg, scan0, glt_dir, overwrite)
@@ -441,14 +473,9 @@ def _glt_only(args, cfg0, fgeom, lat_range) -> bool:
 
 def _warp_merged(merged: dict, used_chunks: list[dict], cfg0, ftif: Path):
     """Warp the band once through the merged GCPs, cropped to the union of the solved chunk AOIs."""
-    from rasterio.control import GroundControlPoint
-
     from iirspy.georef import project, read_band, save_grid
 
-    gcps = [
-        GroundControlPoint(row=float(row), col=float(col), x=float(x), y=float(y))
-        for (row, col), (x, y) in merged.items()
-    ]
+    gcps = _gcp_list(merged)
     final_cfg = replace(
         cfg0,
         aoi=(
@@ -538,6 +565,26 @@ def _merge_gcps(results) -> tuple[dict, dict]:
     return merged, agree_summary
 
 
+def _solve_grade(agree_summary, p95_stop_m: float):
+    """Grade the merged product from the worst chunk-boundary p95 in `agree_summary`.
+
+    The per-chunk `rejected`/`converged` flags do not track whether the product landed -- every
+    human-verified-good scene has rejected chunks too -- while this does: over 11 verified scenes
+    the worst good scene sat at 383 m and the best bad one at 6487 m.
+
+    >>> [_solve_grade({"0-1": {"p95_m": v}}, 16.5) for v in (12.0, 382.9, 6486.6)]
+    ['tight', 'acceptable', 'failed']
+    >>> _solve_grade({}, 16.5) is None
+    True
+    """
+    worst = max((v["p95_m"] for v in agree_summary.values()), default=None)
+    if worst is None:
+        return None
+    if worst <= p95_stop_m:
+        return "tight"
+    return "acceptable" if worst <= GRADE_ACCEPTABLE_M else "failed"
+
+
 def _accepted(r):
     """Whether a `_solve_one` result solved cleanly (not None, not quality-rejected)."""
     return r is not None and not r["fit"].get("quality", {}).get("rejected")
@@ -548,6 +595,53 @@ def _shift_of(r):
     return tuple(r["fit"]["stats"]["coarse"].get("total_shift_m", (0.0, 0.0))) if r else (0.0, 0.0)
 
 
+def _is_anchor(r, cfg0) -> bool:
+    """Whether `r`'s coarse shift was corroborated, so it may vote on the strip consensus.
+
+    `_accepted` is not enough: a chunk rejected for "coarse shift refused" applied no shift of its
+    own (`georef.coarse_shift` returns 0,0), so its `total_shift_m` is just the seed it inherited
+    and would vote for whatever the forward pass happened to carry.
+    """
+    if r is None:
+        return False
+    coarse = r["fit"].get("stats", {}).get("coarse", {})
+    frac = (r["fit"].get("quality") or {}).get("match_frac")
+    return bool(coarse.get("accepted")) and frac is not None and frac >= cfg0.min_match_frac
+
+
+def _consensus_shift(shifts, tol_m: float = CONSENSUS_TOL_M):
+    """Per-axis median of `shifts` after dropping points further than max(3*MAD, `tol_m`) from it.
+
+    None when there is nothing to vote. See `CONSENSUS_TOL_M` for why a plain median is not enough.
+
+    >>> _consensus_shift([(0.0, -8800.0), (320.0, -8640.0), (9920.0, -320.0)])
+    (160.0, -8720.0)
+    >>> _consensus_shift([]) is None
+    True
+    """
+    if not shifts:
+        return None
+    a = np.asarray(shifts, float)
+    med = np.median(a, axis=0)
+    dev = np.hypot(*(a - med).T)
+    keep = a[dev <= max(3 * float(np.median(dev)), tol_m)]
+    return tuple(float(v) for v in np.median(keep, axis=0))
+
+
+def _dev_m(shift, consensus) -> float:
+    """Distance in metres from a chunk's own coarse shift to the strip consensus."""
+    return float(np.hypot(shift[0] - consensus[0], shift[1] - consensus[1]))
+
+
+def _chunk_grade(r) -> str:
+    """How much a chunk's own solve can be trusted: `ok`, `fallback` (refused the coarse shift, so
+    it kept its seed rigidly -- safe), or `suspect` (accepted a coarse shift and was then rejected
+    on match rate -- the case that lands a chunk kilometres off)."""
+    if _accepted(r):
+        return "ok"
+    return "suspect" if r["fit"].get("stats", {}).get("coarse", {}).get("accepted") else "fallback"
+
+
 def _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
     """Solve chunk `c` seeded from `seed` (a prior coarse shift in metres), or reuse its cache.
 
@@ -555,7 +649,16 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
     would not fit in the time left (see `--max-seconds`) -- stopping *before* a chunk rather than
     being killed inside one keeps every finished chunk's cache intact for the requeue.
     """
-    from iirspy.georef import project, read_band, register, render_reference, save_grid
+    from iirspy.georef import (
+        project,
+        read_band,
+        register,
+        render_reference,
+        render_wac,
+        save_grid,
+        sun_geometry,
+        use_wac,
+    )
 
     i = c["i"]
     cached = _cached_chunk(OUT, c, ck.GOOD_CORR, decay_m, tweaks)
@@ -589,10 +692,16 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
     )
 
     t0 = time.time()
-    ref, hs_info = render_reference(fgeom, fspm, cfg, ck.kernels(SID[:8]))
+    kernels = ck.kernels(SID[:8])
+    # Which reference is decided by the sun, not by trying one and detecting failure: above
+    # `georef.WAC_MIN_ELEV_DEG` there is no shadow contrast for a hillshade to carry (0 of 16 chunks
+    # above 70 deg ever matched one) and the scene reads as albedo, which is what WAC shows.
+    _, elev, _ = sun_geometry(fgeom, fspm, cfg, kernels)
+    wac = use_wac(elev, cfg)
+    ref, hs_info = (render_wac if wac else render_reference)(fgeom, fspm, cfg, kernels)
     hs_s = time.time() - t0
     save_grid(OUT / f"chunk{i}_hs.tif", ref, cfg)
-    log(f"chunk {i}: hillshade {hs_s:.1f}s, shape {ref.shape}")
+    log(f"chunk {i}: {'wac' if wac else 'hillshade'} ref {hs_s:.1f}s, shape {ref.shape}")
 
     with phase(f"chunk {i} register") as ph:
         try:
@@ -614,6 +723,8 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
 
     fit = {
         "chunk": i,
+        "version": __version__,
+        "reference": "wac" if wac else "hillshade",
         "band": c["band"],
         "dem_near": c["dem_near"],
         "dem_far": c["dem_far"],
@@ -666,44 +777,70 @@ def _solve_chunks_hillshade(chunks, cfg0, fgeom, fspm):
         )
 
 
-def _retry_leading_rejects(chunks, results, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
-    """Walk backward from each accepted chunk, retrying its rejected left neighbour seeded from
-    it; stop at the first retry that doesn't flip to accepted."""
-    for idx in range(len(chunks) - 2, -1, -1):
-        if _accepted(results[idx]) or not _accepted(results[idx + 1]):
+def _consensus_pass(chunks, results, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
+    """Re-solve every chunk that disagrees with the strip's consensus coarse shift, seeded from it.
+
+    The coarse search estimates a quantity that is near-constant along a strip, so running it
+    independently per chunk gives one chance per chunk to latch a spurious correlation peak -- the
+    entire catastrophic failure mode. The consensus of the corroborated chunks (`_is_anchor`)
+    overrides the rest. With no anchor there is no consensus and the forward pass stands, which
+    means the product is uncorrected raw geometry rather than solved.
+
+    Returns (results, info) with `info` for the summary.
+    """
+    consensus = _consensus_shift([_shift_of(r) for r in results if _is_anchor(r, cfg0)])
+    if consensus is None:
+        log("\nno anchor chunk in this strip: no consensus coarse shift, product is UNCORRECTED")
+        return results, {"coarse_consensus_m": None, "consensus_enforced": False, "uncorrected": True}
+
+    enforce = GROUP == "equatorial" or CONSENSUS_ALL_GROUPS
+    log(
+        f"\nconsensus coarse shift {tuple(round(v) for v in consensus)} m from "
+        f"{sum(_is_anchor(r, cfg0) for r in results)} anchor chunk(s), "
+        f"tol={CONSENSUS_TOL_M:.0f}m, enforced={enforce}"
+    )
+    for idx, c in enumerate(chunks):
+        dev = _dev_m(_shift_of(results[idx]), consensus)
+        # A chunk already sitting on the consensus (a `fallback` that inherited it as its seed)
+        # would re-solve to exactly what it has, so the 90 s it costs buys nothing.
+        off = dev > 1.0 and (not _accepted(results[idx]) or dev > CONSENSUS_TOL_M)
+        log(f"  chunk {c['i']}: shift={_shift_of(results[idx])} dev={dev:.0f}m {'RESEED' if off else 'keep'}")
+        if not (off and enforce):
             continue
-        seed = _shift_of(results[idx + 1])
-        log(f"chunk {chunks[idx]['i']}: retrying seeded from chunk {chunks[idx + 1]['i']}'s shift {seed}")
-        retried = _solve_one(chunks[idx], seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks)
-        if not _accepted(retried):
-            break
-        results[idx] = retried
-    return results
+        results[idx] = _solve_one(c, consensus, cfg0, ftif, fgeom, fspm, decay_m, tweaks)
+        if results[idx] is not None:
+            results[idx]["fit"]["reseeded"] = True
+    return results, {"coarse_consensus_m": list(consensus), "consensus_enforced": enforce, "uncorrected": False}
 
 
 def _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, hillshade_only):
     """Solve each chunk against its own hillshade, reusing any prior good solve of the same shape.
 
-    Each chunk is seeded with the coarse shift of the last chunk solved (forward pass). Any chunk
-    still rejected once its neighbour towards the end of the strip has solved is retried seeded
-    from that neighbour's shift, walking back towards the start until a retry doesn't improve
-    things (`_retry_leading_rejects`).
+    A forward pass seeds each chunk with the last accepted chunk's coarse shift, then
+    `_consensus_pass` re-solves whatever disagrees with the strip as a whole.
 
-    Returns one {"chunk", "gcps", "fit"} per solved chunk, empty when `hillshade_only`.
+    Returns (results, info): one {"chunk", "gcps", "fit"} per solved chunk plus the consensus
+    decision, both empty when `hillshade_only`.
     """
     if hillshade_only:
         _solve_chunks_hillshade(chunks, cfg0, fgeom, fspm)
-        return []
+        return [], {}
 
-    results = [None] * len(chunks)
+    results: list[dict | None] = [None] * len(chunks)
     seed = (0.0, 0.0)
     for idx, c in enumerate(chunks):
         results[idx] = _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks)
         if _accepted(results[idx]):
             seed = _shift_of(results[idx])
 
-    results = _retry_leading_rejects(chunks, results, cfg0, ftif, fgeom, fspm, decay_m, tweaks)
-    return [r for r in results if r is not None]
+    results, info = _consensus_pass(chunks, results, cfg0, ftif, fgeom, fspm, decay_m, tweaks)
+    solved = [r for r in results if r is not None]
+    consensus = info.get("coarse_consensus_m")
+    for r in solved:
+        r["fit"]["chunk_grade"] = _chunk_grade(r)
+        r["fit"].setdefault("reseeded", False)
+        r["fit"]["shift_dev_m"] = round(_dev_m(_shift_of(r), consensus), 1) if consensus else None
+    return solved, info
 
 
 # Per-band solve-time model: {hillshade_s, overhead_s, iter_s} @ the 4-core SBATCH default.
@@ -954,6 +1091,7 @@ def _open_run(out: str | None) -> None:
 
 def main(argv: list[str] | None = None) -> None:
 
+    from iirspy import georef
     from iirspy.georef import read_band
 
     args = _parser().parse_args(argv)
@@ -1019,7 +1157,7 @@ def main(argv: list[str] | None = None) -> None:
         "gcp_row_margin": args.gcp_row_margin,
     }
 
-    results = _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, args.hillshade_only)
+    results, consensus_info = _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, args.hillshade_only)
 
     if args.hillshade_only:
         log(f"\n--hillshade-only: wrote {len(chunks)} hillshade(s), no solve.")
@@ -1043,6 +1181,11 @@ def main(argv: list[str] | None = None) -> None:
     _save_gcps(fgcps, merged)
     log(f"\nmerged gcps: {len(merged)} points -> {fgcps}")
 
+    # The L1 raster holds a geotransform for `scan0`, so its GCPs have to ride in a sidecar; without
+    # it the kept raster is camera-space only and nothing but iirspy can place it.
+    fvrt = georef.save_gcp_vrt(ftif, _gcp_list(merged), georef.stereo_crs(GROUP))
+    log(f"gcp vrt: {fvrt}")
+
     final_cfg, final = _warp_merged(merged, used_chunks, cfg0, ftif)
     fglt = _make_glt(merged, cfg0, scan0, args.keep or str(ck.recal_dir(SID, GROUP)), overwrite=True)
     log(f"glt: {fglt}")
@@ -1059,6 +1202,8 @@ def main(argv: list[str] | None = None) -> None:
         "chunks": chunks,
         "per_chunk_fit": [r["fit"] for r in results],
         "overlap_agreement": agree_summary,
+        "solve_grade": _solve_grade(agree_summary, max(c["p95_stop_m"] for c in used_chunks)),
+        **consensus_info,
         "n_merged_gcps": len(merged),
         "scan0": scan0,
         "glt": str(fglt),

@@ -100,6 +100,7 @@ class GeorefConfig:
     # (JP2 ships one) instead of needing a separate, coarser DEM product for reach alone
     margin_m: float = 2_000.0
     iirs_gsd_m: float = 76.5  # reconstructed from the IK+SPK; blur the reference to this
+    wac_mosaic: str | None = None
 
     # --- coarse search
     coarse_dec: int = 4  # decimation; 160 m/px keeps the unbounded search fast
@@ -550,6 +551,40 @@ def render_reference(fgeom, fspm, cfg, kernels=None):
     ci = np.clip(((mx - tr_n.c) / tr_n.a).astype(int), 0, f.shape[1] - 1)
     ri = np.clip(((my - tr_n.f) / tr_n.e).astype(int), 0, f.shape[0] - 1)
     return f[ri, ci].astype("float32"), {"az_grid": az, "elev": el, "r_sun": r_sun, "lit_frac": float(lit.mean())}
+
+
+WAC_MIN_ELEV_DEG = 55.0
+
+
+def use_wac(elev_deg, cfg) -> bool:
+    return bool(cfg.wac_mosaic) and elev_deg >= WAC_MIN_ELEV_DEG
+
+
+def render_wac(fgeom, fspm, cfg, kernels=None):
+    from rasterio.vrt import WarpedVRT
+
+    az, el, r_sun = sun_geometry(fgeom, fspm, cfg, kernels)
+    if not cfg.wac_mosaic:
+        raise ValueError("cfg.wac_mosaic is unset; no WAC mosaic to render from")
+    _, _, tr, prof = grid_of(cfg)
+    with (
+        rasterio.open(cfg.wac_mosaic) as src,
+        WarpedVRT(
+            src,
+            crs=prof["crs"],
+            transform=tr,
+            width=prof["width"],
+            height=prof["height"],
+            resampling=Resampling.bilinear,
+        ) as vrt,
+    ):
+        a = vrt.read(1).astype("float32")
+    return _to_gsd(a, cfg.ps, cfg).astype("float32"), {
+        "az_grid": az,
+        "elev": el,
+        "r_sun": r_sun,
+        "lit_frac": 1.0,
+    }
 
 
 def slope_aspect(gx, gy):
