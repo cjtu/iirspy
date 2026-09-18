@@ -269,6 +269,7 @@ def build_l1(
     calibrate_kwargs: dict | None = None,
     out_bands: list[int] | None = None,
     chunk_y: int = 1024,
+    keep_raw: bool = False,
 ) -> tuple[Path, int, tuple[float, float]]:
     """Extract the nri zip and calibrate it, cropped to `lat_range`.
 
@@ -285,8 +286,19 @@ def build_l1(
     pure I/O nobody uses. None (default, what `iirspy.refl` wants) writes every calibrated band.
 
     calibrate_kwargs overrides CALIBRATE_KWS (e.g. interp_bands=None, exclude_wl=[...]) for a
-    one-off reprocessing run without touching the production default. `chunk_y` is the dask y-chunk
-    the cube is read and written in, and so also the write/resume block size.
+    one-off reprocessing run without touching the production default -- it's part of the cache key
+    (via the `.meta.json` sidecar) same as `lat_range`/`bands`, so a rebuild with different
+    calibration settings into the same `ftif_out` never returns the other run's cube. A cached
+    file with no recorded `calibrate_kwargs` (written before this check existed) is treated as
+    unknown, not as "assume production defaults", and rebuilt once to backfill the tag. `chunk_y`
+    is the dask y-chunk the cube is read and written in, and so also the write/resume block size.
+
+    keep_raw : bool
+        Skip deleting the extracted raw `.qub`/`.hdr` after calibration. Default False (production
+        behaviour: extract, calibrate, delete -- C: is the scarce drive). Set True for iterative
+        reprocessing of the same scene (e.g. re-deriving L1 with different calibrate_kwargs) so
+        `_stage_inputs` can reuse the already-extracted raw cube instead of re-reading the zip
+        (which usually lives on `IIRS_ARCHIVE`, i.e. ddata) on every call.
     """
     # Ancillary only (spm, oat, xml, csv -- excludes the qub by default): a few MB, so cheap enough
     # to always re-run even on an L1 cache hit. Without this, a cache hit skips `_stage_inputs`
@@ -306,16 +318,24 @@ def build_l1(
                 shutil.copyfile(fsrc, dst_dir / fsrc.name)
 
     saved_bands = out_bands if out_bands is not None else bands
+    effective_calibrate_kws = {**CALIBRATE_KWS, **(calibrate_kwargs or {})}
     fmeta = ftif_out.with_suffix(".meta.json")
     if ftif_out.exists() and fmeta.exists():
         meta = json.loads(fmeta.read_text())
         cached_range = tuple(meta["lat_range"])
-        if cached_range[0] <= lat_range[0] and lat_range[1] <= cached_range[1] and meta.get("bands") == saved_bands:
+        if (
+            cached_range[0] <= lat_range[0]
+            and lat_range[1] <= cached_range[1]
+            and meta.get("bands") == saved_bands
+            and "calibrate_kwargs" in meta
+            and meta["calibrate_kwargs"] == effective_calibrate_kws
+        ):
             log(f"L1 already built: {ftif_out} (covers {cached_range}, requested {lat_range})")
             return ftif_out, meta["scan0"], cached_range
         log(
-            f"cached L1 {cached_range}/bands={meta.get('bands')} does not cover requested "
-            f"{lat_range}/{bands} -- rebuilding"
+            f"cached L1 {cached_range}/bands={meta.get('bands')}/"
+            f"calibrate_kwargs={meta.get('calibrate_kwargs', '<unrecorded>')} does not match requested "
+            f"{lat_range}/{bands}/{effective_calibrate_kws} -- rebuilding"
         )
     import iirspy.utils as utils
     from iirspy import L0
@@ -325,10 +345,7 @@ def build_l1(
 
     # `chunk_y` sets both the dask y-chunk and, through `_row_block`, the write/resume block.
     with phase("L0 read + calibrate (graph build; the compute lands in the write)"):
-        l1 = L0(SID, STAGE, chunk={"band": -1, "y": chunk_y, "x": -1}).calibrate(**{
-            **CALIBRATE_KWS,
-            **(calibrate_kwargs or {}),
-        })
+        l1 = L0(SID, STAGE, chunk={"band": -1, "y": chunk_y, "x": -1}).calibrate(**effective_calibrate_kws)
     # l1.img already holds exactly `bands` -- that's what _stage_inputs staged.
     _, xyext = utils.parse_geom(l1.csv, latlonextent=(-180, 180, *lat_range))
     ymin, ymax = xyext[2], xyext[3]
@@ -339,9 +356,17 @@ def build_l1(
         l1.img = l1.img.sel(band=out_bands)
     with phase(f"L1 write ({l1.img.shape[0]} band x {l1.img.shape[1]} rows, chunk_y={chunk_y})"):
         l1.save(str(ftif_out))
-    fmeta.write_text(json.dumps({"scan0": int(ymin), "lat_range": list(lat_range), "bands": saved_bands}))
-    raw_qub.unlink(missing_ok=True)
-    raw_qub.with_suffix(".hdr").unlink(missing_ok=True)
+    fmeta.write_text(
+        json.dumps({
+            "scan0": int(ymin),
+            "lat_range": list(lat_range),
+            "bands": saved_bands,
+            "calibrate_kwargs": effective_calibrate_kws,
+        })
+    )
+    if not keep_raw:
+        raw_qub.unlink(missing_ok=True)
+        raw_qub.with_suffix(".hdr").unlink(missing_ok=True)
     log(f"L1 saved: {ftif_out}")
     return ftif_out, int(ymin), lat_range
 

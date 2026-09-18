@@ -871,7 +871,7 @@ def coarse_shift(img, ref, cfg):
     overlap and returns a shift that puts the swath outside its own AOI.
 
     Every number is gated: inject a known shift, re-measure, and require the answer to move by
-    that much. Searches up to `coarse_topk` correlation peaks if necessary. 
+    that much. Searches up to `coarse_topk` correlation peaks if necessary.
     """
     from skimage.registration._masked_phase_cross_correlation import cross_correlate_masked
 

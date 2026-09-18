@@ -48,6 +48,7 @@ DARK_PCT = 0.5  # darkest percentile of rows used to estimate the shadow floor +
 DARK_K = 8.0  # row shadow threshold = floor + DARK_K * sigma
 DARK_SIGMA_FLOOR = 0.15  # min row-median scatter [DN], keeps the bootstrap threshold off zero
 DARK_SMOOTH_FRAC = 0.25  # shadow rows carry under this share of the scene's typical cross-track structure
+DARK_FILL_ZERO_FRAC = 0.4  # exact-zero fraction above this is fill/clipped, not shadow (genuine <31%, fill >43%)
 DARK_PEDESTAL_DN = 25.0  # a dark frame above this did not have its onboard subtraction applied
 NOISE_FLOOR = 0.5  # min noise [DN] to avoid divide-by-zero in the SNR
 SHADOW_SNR = 2.0  # broadband SNR below this is shadow (per-pixel dark noise, as LIT_SNR)
@@ -156,13 +157,24 @@ def cross_track_hf(P, win=CROSS_WIN):
     return np.nanmedian(np.abs(hp - np.nanmedian(hp, axis=1, keepdims=True)), axis=1) * MAD_TO_SIGMA
 
 
+def zero_frac(img, block):
+    """Fraction of `block`'s rows in the raw cube that are exactly zero: fill/clipped, not measured DN.
+
+    Measured on the cube, not the panchromatic average: fill is zero in some bands and not others,
+    so averaging over PAN_BANDS dilutes an 80%-fill block to a few percent.
+    """
+    a, b = block
+    return float((img.isel(y=slice(a, b)).values == 0).mean())
+
+
 def is_shadow(P, block, hf=None):
     """True when `block` holds no cross-track scene structure - shadow, not merely dim terrain.
 
     Level cannot decide this. A scene whose onboard dark subtraction never happened puts its
     shadow at hundreds of DN (20201203T1859574285: 291-347, against 0-10 across every e1g2 scene
     here), which any absolute or scene-relative level cut reads as "too bright to be shadow" and
-    throws the dark frame away. Structure decides it at any pedestal.
+    throws the dark frame away. Structure decides it at any pedestal. Fill/clipped data is also
+    structure-free and passes this test; `zero_frac` rejects that separately, on the raw cube.
     """
     hf = cross_track_hf(P) if hf is None else hf
     a, b = block
@@ -423,7 +435,7 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
         d0, d1 = longest_run(dark_mask)
         if d1 - d0 >= MIN_ROWS:
             d0, d1 = refine_dark_block(P, (d0, d1))
-        if d1 - d0 >= MIN_ROWS and is_shadow(P, (d0, d1)):
+        if d1 - d0 >= MIN_ROWS and is_shadow(P, (d0, d1)) and zero_frac(img, (d0, d1)) < DARK_FILL_ZERO_FRAC:
             dark = img.isel(y=slice(d0, d1)).median("y").compute().astype("float32")
             snr = broadband_snr(P, d0, d1)
             dark_block = (d0, d1)
@@ -446,10 +458,25 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
                     stacklevel=2,
                 )
         else:
-            warnings.warn("no shadow rows found; skipping empirical dark subtraction", UserWarning, stacklevel=2)
+            too_short = d1 - d0 < MIN_ROWS
+            if too_short:
+                frac, reason = None, "too-short"
+            else:
+                frac = zero_frac(img, (d0, d1))
+                reason = "fill" if frac >= DARK_FILL_ZERO_FRAC else "no-structure"
+            warnings.warn(
+                f"no shadow rows found ({reason}); skipping empirical dark subtraction", UserWarning, stacklevel=2
+            )
             dark = xr.zeros_like(P.isel(y=0), dtype="float32").drop_vars("y")
             snr = None
-            emp_notes.update(has_shadow=False, dark_rows=None, dark_threshold=None, dark_source="auto")
+            emp_notes.update(
+                has_shadow=False,
+                dark_rows=None,
+                dark_threshold=None,
+                dark_source="auto",
+                reject_reason=reason,
+                dark_zero_frac=frac,
+            )
 
     lit = lit_rows(P, dark_block)
     rs = row_roughness(P)
