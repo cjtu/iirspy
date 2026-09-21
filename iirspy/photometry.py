@@ -23,8 +23,14 @@ Slope, aspect and the cast-shadow lit fraction come from the DEM sampled into ca
     azimuth degrees clockwise from grid north; elevation degrees above the horizon
 """
 
+import functools
+
 import numpy as np
 import xarray as xr
+
+from iirspy.utils import PKG_DATA
+
+M3_DATA = PKG_DATA.joinpath("m3")
 
 
 def lambert(mu0, mu, g):
@@ -65,6 +71,35 @@ def get_model(photom):
         return MODELS[photom]
     except KeyError:
         raise ValueError(f"unknown photometric model {photom!r}; have {sorted(MODELS)}") from None
+
+
+@functools.lru_cache(maxsize=1)
+def _m3_phase_table():
+    """(alpha_deg, wl_nm, f) from the vendored Besse et al. (2013) M3 highland F_ALPHA table."""
+    tab = np.loadtxt(M3_DATA.joinpath("M3G20111109_RFL_F_ALPHA_HIL.TAB").open(), skiprows=1)
+    alpha, f = tab[:86, 0], tab[:86, 1:]
+    wl = np.loadtxt(M3_DATA.joinpath("M3G20110224_RFL_SOLAR_SPEC.TAB").open())[:, 0]
+    if f.shape[1] != wl.size:
+        raise ValueError(f"M3 phase table has {f.shape[1]} channels but solar spectrum has {wl.size}")
+    return alpha, wl, f
+
+
+def besse_phase(g, wl_nm):
+    """Besse et al. (2013) M3 highland phase-function ratio f(30)/f(g), interpolated to wl_nm [nm].
+
+    >>> round(float(besse_phase(75.0, 950.06)), 4)
+    1.5474
+    >>> round(float(besse_phase(30.0, 950.06)), 4)
+    1.0
+    >>> bool(besse_phase(200.0, 950.06) == besse_phase(85.0, 950.06))  # clamped to the domain edge
+    True
+    """
+    alpha, wl, f = _m3_phase_table()
+    wl_arr = np.atleast_1d(np.asarray(wl_nm, dtype=float))
+    f_wl = np.vstack([np.interp(np.clip(wl_arr, wl.min(), wl.max()), wl, row) for row in f])  # (86, n_wl)
+    g_arr = np.clip(np.asarray(g, dtype=float), 0.0, 85.0)
+    ratio = np.stack([f_wl[30, j] / np.interp(g_arr, alpha, f_wl[:, j]) for j in range(wl_arr.size)], axis=0)
+    return ratio if np.ndim(wl_nm) else ratio[0]
 
 
 def cos_angle(slope, aspect, az, elev):

@@ -6,7 +6,7 @@ group's CRS. No re-registration -- if the scene isn't solved yet, this refuses t
 
     iirs-compute-refl <sid> --group south|north|equatorial [--out WORKDIR] [--keep DIR]
         [--keep-l1 DIR] [--clean] [--gcps PATH] [--thermal-corr ""|verma]
-        [--photom lambert|lommel_seeliger|lunar_lambert] [--no-topo] [--min-lit FRAC]
+        [--photom lambert|lommel_seeliger|lunar_lambert] [--no-topo] [--min-lit FRAC] [--mu-min FRAC]
 
 `--gcps` defaults to the standard `iirs-solve-scene --keep` layout:
 geometry/recalibrated/<day>/<sid>_<group>/<sid>_<group>.gcps under `IIRS_RECAL_ROOT`.
@@ -32,6 +32,9 @@ L2_DIAGNOSTIC_ATTRS = (
     "thermal_corr",
     "photom",
     "min_lit",
+    "mu_min",
+    "mu0_floor_frac",
+    "mu_floor_frac",
     "sun_az_offset",
     "topo_used",
     "solar_distance_au",
@@ -152,6 +155,13 @@ def _parser():
         default=0.9,
         help="null pixels the terrain leaves less than this fraction lit; no-op without topo",
     )
+    ap.add_argument(
+        "--mu-min",
+        type=float,
+        default=0.0,
+        help="floor mu0 and mu individually before the disk function; clamps grazing incidence/"
+        "emission pixels instead of nulling (Besse's rule, e.g. cos(85deg) ~= 0.0872)",
+    )
     return ap
 
 
@@ -221,7 +231,11 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
     solve.log(f"topo: {ftopo or 'skipped (--no-topo)'}")
 
     l2 = l1.calibrate(
-        thermal_corr=args.thermal_corr, photom=args.photom, topo=str(ftopo) if ftopo else None, min_lit=args.min_lit
+        thermal_corr=args.thermal_corr,
+        photom=args.photom,
+        topo=str(ftopo) if ftopo else None,
+        min_lit=args.min_lit,
+        mu_min=args.mu_min,
     )
     solve.log(
         f"L2 computed (thermal_corr={args.thermal_corr or 'none'}, photom={args.photom}, "

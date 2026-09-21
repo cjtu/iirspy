@@ -1,0 +1,59 @@
+PDS_VERSION_ID               = PDS3                                           
+RECORD_TYPE                  = "FIXED_LENGTH"                                 
+RECORD_BYTES                 = 26                                             
+FILE_RECORDS                 = 85                                             
+                                                                              
+^TABLE                       = "M3G20110224_RFL_SOLAR_SPEC.TAB"               
+                                                                              
+DATA_SET_ID                  = "CH1-ORB-L-M3-4-L2-REFLECTANCE-V1.0"           
+PRODUCT_ID                   = "M3G20110224_RFL_SOLAR_SPEC"                   
+MISSION_ID                   = "CH1"                                          
+MISSION_NAME                 = "CHANDRAYAAN-1"                                
+INSTRUMENT_HOST_ID           = "CH1-ORB"                                      
+INSTRUMENT_HOST_NAME         = "CHANDRAYAAN-1 ORBITER"                        
+INSTRUMENT_NAME              = "MOON MINERALOGY MAPPER"                       
+INSTRUMENT_ID                = M3                                             
+TARGET_NAME                  = "MOON"                                         
+TARGET_TYPE                  = "SATELLITE"                                    
+PRODUCT_CREATION_TIME        = 2011-02-24T12:09:00                            
+                                                                              
+OBJECT     = TABLE                                                            
+  INTERCHANGE_FORMAT = "ASCII"                                                
+  NAME               = "GLOBAL_MODE_SOLAR_SPECTRUM_TABLE"                     
+  ROWS               = 85                                                     
+  ROW_BYTES          = 26                                                     
+  COLUMNS            = 2                                                      
+  DESCRIPTION        = "                                                      
+    This table provides the wavelength-dependent solar spectrum for           
+    converting global-mode radiance data to reflectance.  This is an          
+    exo-atmospheric solar spectrum at 1 AU as determined with MODTRAN.        
+    For more information see G. P. Anderson et al. (2000) Proc. SPIE,         
+    4049, 176-183 [ANDERSONETAL2000] and R. L. Kurucz (1995), Proceedings     
+    of the 17th Annual Review Conference on Atmospheric Transmission          
+    Models, 333-334 [KURUCZ1995]."                                            
+                                                                              
+  OBJECT     = COLUMN                                                         
+    COLUMN_NUMBER = 1                                                         
+    NAME          = "WAVELENGTH"                                              
+    START_BYTE    = 1                                                         
+    BYTES         = 11                                                        
+    DATA_TYPE     = "ASCII_REAL"                                              
+    FORMAT        = "F11.6"                                                   
+    UNIT          = "NANOMETER"                                               
+    DESCRIPTION   = "Wavelength"                                              
+  END_OBJECT = COLUMN                                                         
+                                                                              
+  OBJECT     = COLUMN                                                         
+    COLUMN_NUMBER = 2                                                         
+    NAME          = "SOLAR_IRRADIANCE"                                        
+    START_BYTE    = 14                                                        
+    BYTES         = 11                                                        
+    DATA_TYPE     = "ASCII_REAL"                                              
+    FORMAT        = "F11.6"                                                   
+    UNIT          = "W/(m^2 um)"                                              
+    DESCRIPTION   = "Solar irradiance"                                        
+  END_OBJECT = COLUMN                                                         
+                                                                              
+END_OBJECT = TABLE                                                            
+                                                                              
+END                                                                           
