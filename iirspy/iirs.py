@@ -143,6 +143,21 @@ def _narrow_bands(rad, output_bands):
     return rad if output_bands is None else rad.sel(band=output_bands)
 
 
+def _attach_empirical_frames(rad, dark, flat, smile, attach):
+    """Attach dark/flat/smile as (band, x) coords on `rad` when `attach`, for save()'s sidecar.
+
+    dark is (x,)-only zeros when no shadow was found; broadcast to flat's (band, x) so all three
+    sidecar frames share one shape.
+    """
+    if not attach:
+        return rad
+    return rad.assign_coords(
+        empirical_dark=(("band", "x"), dark.broadcast_like(flat).values),
+        empirical_flat=(("band", "x"), flat.values),
+        empirical_smile=(("band", "x"), smile.values),
+    )
+
+
 class IIRSData(ABC):
     """Abstract base class for IIRS data products."""
 
@@ -232,7 +247,7 @@ class IIRSData(ABC):
         """Mask invalid bands (OSF, bad bands)."""
         self.img = self.img.where(~self.img.band.isin((*utils.OSF, *utils.INVALID)))
 
-    def save(self, fout, sub_rows=None, snr_sidecar=True):
+    def save(self, fout, sub_rows=None, snr_sidecar=True, empirical_sidecar=True):
         """
         Stream the image cube to disk with bounded memory.
 
@@ -244,6 +259,12 @@ class IIRSData(ABC):
         a float32 sidecar `<basename>_snr<ext>` is written alongside it in the same format (ENVI
         coords don't survive the BIL write), unless snr_sidecar is False.
 
+        When the cube carries `empirical_dark`/`empirical_flat`/`empirical_smile` coordinates (from
+        calibrate_to_rad with attach_empirical_frames), they're written to a single
+        `<basename>_empirical.npz` (keys dark/flat/smile/band/x) beside fout, unless
+        empirical_sidecar is False -- these are (band, x) diagnostic frames, not a raster, so they
+        skip the cube writer entirely.
+
         Parameters
         ----------
         fout : str or Path
@@ -253,6 +274,8 @@ class IIRSData(ABC):
             dask y-chunk, so a write block and a compute block are the same rows.
         snr_sidecar : bool
             Write the broadband `snr` field (if present) to a float32 sidecar next to fout.
+        empirical_sidecar : bool
+            Write the empirical dark/flat/smile frames (if present) to an `.npz` sidecar next to fout.
 
         Returns
         -------
@@ -261,6 +284,8 @@ class IIRSData(ABC):
         fout = str(fout)
         if snr_sidecar and "snr" in self.img.coords:
             self._save_snr_sidecar(fout, sub_rows)
+        if empirical_sidecar and "empirical_flat" in self.img.coords:
+            self._save_empirical_sidecar(fout)
         return self._write(self.img, fout, sub_rows)
 
     def _write(self, da, fout, row_block=None):
@@ -282,6 +307,20 @@ class IIRSData(ABC):
         snr.attrs = {"name": "SNR", "units": ""}
         f = Path(fout)
         return self._write(snr, f.with_name(f.stem + "_snr" + f.suffix), row_block)
+
+    def _save_empirical_sidecar(self, fout):
+        """Write the (band, x) empirical dark/flat/smile frames beside fout as one .npz."""
+        f = Path(fout)
+        fnpz = f.with_name(f.stem + "_empirical.npz")
+        np.savez_compressed(
+            fnpz,
+            dark=self.img.empirical_dark.values.astype("float32"),
+            flat=self.img.empirical_flat.values.astype("float32"),
+            smile=self.img.empirical_smile.values.astype("float32"),
+            band=self.img.band.values,
+            x=self.img.x.values,
+        )
+        return str(fnpz)
 
     def _save_geotiff(self, fout, row_block, da=None):
         """Write a float32 BigTIFF sequentially in windowed blocks (bounded memory).
@@ -435,6 +474,7 @@ class L0(IIRSData):
         interp_bands=None,
         interp_spatial=False,
         attach_snr=True,
+        attach_empirical_frames=False,
         empirical_kws=None,
         bad_pixel_mask=True,
         calib_dir=utils.DCALIB,
@@ -490,6 +530,11 @@ class L0(IIRSData):
             downstream users threshold the SNR themselves (a typical cut is empirical.SHADOW_SNR) to
             null, ignore, or study low-signal shadow pixels. save() can write it to a float32 sidecar
             (ENVI coords don't survive the BIL write).
+        attach_empirical_frames : bool
+            When empirical, attach the derived dark/flat/smile (band, x) frames as non-dimension
+            coordinates on the returned DataArray, for diagnosing the empirical correction itself
+            (e.g. comparing flat shape/RMS across scenes). save() writes them to an `.npz` sidecar
+            when present. Off by default -- these are diagnostic, not part of the production output.
         empirical_kws : dict or None
             Extra keyword arguments forwarded to empirical.empirical_frames, e.g.
             dark_yrange=(ylow, yhigh) / flat_yrange=(ylow, yhigh) to override the auto dark-row /
@@ -532,6 +577,7 @@ class L0(IIRSData):
             else:
                 # No zero reference: the lab offset is the only zero-point info, so keep it
                 rad = 10 * (gain_med * self.img / fs + offset_med)
+            rad = _attach_empirical_frames(rad, dark, flat, smile, attach_empirical_frames)
         else:
             # Apply per-element gain and offset to convert DN -> Radiance
             rad = 10 * (self.img * gain + offset)  # [mW/cm^2/sr/μm] -> [W/m^2/sr/um]
@@ -808,7 +854,9 @@ class L1(IIRSData):
         thermal_corr="",
         topo=None,
         photom="lambert",
+        phase=None,
         min_lit=0.9,
+        mu0_min=0.0,
         sun_az_offset=0.0,
     ):
         """Calibrate to L2 reflectance object (requires SPM file for solar angles).
@@ -816,6 +864,14 @@ class L1(IIRSData):
         `topo` (camera-space slope/aspect, see iirspy.photometry.load_topo) and `photom` (a
         iirspy.photometry model name or callable) select the photometric normalization; the
         defaults reproduce the flat-surface Lambert I/F this pipeline has always produced.
+
+        `phase` : bool, optional. When True, layers iirspy.photometry.besse_phase on top of
+        `photom`. Default None/False is a no-op (current behaviour).
+
+        `mu0_min` floors mu0 before it enters the disk function, so near-terminator pixels (mu0
+        near 0) don't blow up the I/F division. Default 0.0 is a no-op (current behaviour).
+        Pixels below the floor are CLAMPED (level capped, pixel kept), not nulled -- the fraction
+        that hit the floor is recorded in refl.attrs["mu0_floor_frac"] so it can be masked later.
         """
         if self.spm is None:
             raise FileNotFoundError(
@@ -831,9 +887,19 @@ class L1(IIRSData):
             thermal_corr=thermal_corr,
             topo=topo,
             photom=photom,
+            phase=phase,
             min_lit=min_lit,
+            mu0_min=mu0_min,
             sun_az_offset=sun_az_offset,
         )
+
+
+def _apply_besse_phase(refl, photom, g, wl):
+    """Rescale `refl` from `photom`'s own f=1 normalization onto Besse's RADF(30,0,30) convention."""
+    xl_ref = photometry.get_model(photom)(np.cos(np.radians(30.0)), 1.0, 30.0)
+    g_dims = getattr(g, "dims", ("y",))
+    f_ratio = xr.DataArray(photometry.besse_phase(np.asarray(g), wl.values), dims=("band", *g_dims))
+    return refl * xl_ref * f_ratio
 
 
 class L2(IIRSData):
@@ -906,7 +972,9 @@ class L2(IIRSData):
         thermal_corr="",
         topo=None,
         photom="lambert",
+        phase=None,
         min_lit=0.9,
+        mu0_min=0.0,
         sun_az_offset=0.0,
     ):
         """Internal method to create L2 from L1 instance."""
@@ -933,7 +1001,9 @@ class L2(IIRSData):
             thermal_corr=thermal_corr,
             topo=topo,
             photom=photom,
+            phase=phase,
             min_lit=min_lit,
+            mu0_min=mu0_min,
             sun_az_offset=sun_az_offset,
         )
         instance.img.attrs["calibration_source"] = "user"
@@ -951,7 +1021,9 @@ class L2(IIRSData):
         thermal_corr="",
         topo=None,
         photom="lambert",
+        phase=None,
         min_lit=0.9,
+        mu0_min=0.0,
         sun_az_offset=0.0,
     ):
         """
@@ -986,9 +1058,19 @@ class L2(IIRSData):
         photom : str or callable, optional
             Photometric model, by name from iirspy.photometry.MODELS or as any f(mu0, mu, g)
             callable. Default "lambert".
+        phase : bool, optional
+            When True, layers iirspy.photometry.besse_phase on top of `photom`. Default
+            None/False is a no-op.
         min_lit : float, optional
             Null pixels the terrain leaves less than this fraction of the solar disk illuminated,
             from the topo product's `lit` band. Default 0.9. No-op without `topo`.
+        mu0_min : float, optional
+            Floor applied to mu0 (cosine of local solar incidence) before it enters the disk
+            function, so grazing-incidence pixels (mu0 -> 0, e.g. near the terminator or on
+            slopes facing away from a low sun) don't blow up in the I/F division. Default 0.0 is
+            a no-op, matching all existing callers. Pixels below the floor are CLAMPED, not
+            nulled: their reflectance level is capped rather than the pixel being dropped. The
+            fraction of valid pixels that hit the floor is recorded in refl.attrs["mu0_floor_frac"].
         sun_az_offset : float, optional
             Degrees added to the spm solar azimuth, which is measured from local north, to bring
             it into the grid-north frame the topo product's aspect uses. Default 0.0.
@@ -1042,6 +1124,11 @@ class L2(IIRSData):
         else:
             inc_deg = np.degrees(np.arccos(np.clip(cos_inc, -1.0, 1.0)))
             mu0, mu, g = cos_inc, xr.ones_like(cos_inc), photometry.phase_angle(sun_az, 90 - inc_deg)
+        mu0_floor_frac = 0.0
+        if mu0_min > 0.0:
+            below_floor = mu0 < mu0_min
+            mu0_floor_frac = float(np.asarray(below_floor).mean())
+            mu0 = mu0.clip(min=mu0_min) if hasattr(mu0, "clip") else np.clip(mu0, mu0_min, None)
         # photfn is the disk function times the lit fraction. Facets the sun does not reach have
         # no direct beam to normalize by, so they are nulled rather than clipped.
         photfn = photometry.get_model(photom)(mu0, mu, g) * lit
@@ -1050,6 +1137,7 @@ class L2(IIRSData):
         photfn = photfn.where(photfn > 0) if hasattr(photfn, "where") else photfn
 
         refl = (rad - trad) / (photfn * solar_flux)
+        refl = _apply_besse_phase(refl, photom, g, rad.wl) if phase else refl
         # add wl array as coordinate if missing
         if "wl" not in refl.coords:
             refl = refl.assign_coords(wl=rad.wl)
@@ -1060,7 +1148,10 @@ class L2(IIRSData):
         inc_deg = np.degrees(np.arccos(np.clip(cos_inc, -1.0, 1.0)))
         refl.attrs["thermal_corr"] = thermal_corr
         refl.attrs["photom"] = photom if isinstance(photom, str) else getattr(photom, "__name__", "custom")
+        refl.attrs["phase"] = bool(phase)
         refl.attrs["min_lit"] = min_lit
+        refl.attrs["mu0_min"] = mu0_min
+        refl.attrs["mu0_floor_frac"] = mu0_floor_frac
         refl.attrs["sun_az_offset"] = sun_az_offset
         refl.attrs["topo_used"] = topo is not None
         refl.attrs["solar_distance_au"] = sdist
