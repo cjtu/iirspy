@@ -19,9 +19,9 @@ def _fit(rejected, shift, accepted=True, match_frac=0.6):
 def _outlier_strip(calls, seen):
     """Four chunks agreeing on `CONSENSUS`, except chunk 2 latches a spurious 15 km peak once."""
 
-    def fake_solve_one(c, seed, *_):
+    def fake_solve_one(c, seed, *_, pin_coarse=False):
         i = c["i"]
-        calls.append((i, seed))
+        calls.append((i, seed, pin_coarse))
         seen[i] = seen.get(i, 0) + 1
         return {"chunk": c, "gcps": {}, "fit": _fit(False, (15000.0, 200.0) if i == 2 and seen[i] == 1 else CONSENSUS)}
 
@@ -40,7 +40,8 @@ def test_a_chunk_disagreeing_with_the_strip_is_reseeded_from_the_consensus(monke
     assert info["consensus_enforced"] and not info["uncorrected"]
     # Only the outlier is re-solved, and only once; chunks already on the consensus are left alone.
     assert seen == {0: 1, 1: 1, 2: 2, 3: 1}
-    assert calls[-1] == (2, CONSENSUS)
+    # Pinned: the re-solve may not run its own coarse search and walk back off the consensus.
+    assert calls[-1] == (2, CONSENSUS, True)
     assert [r["fit"]["reseeded"] for r in results] == [False, False, True, False]
 
 
@@ -75,6 +76,41 @@ def test_polar_records_the_consensus_without_reseeding(monkeypatch):
     assert not info["consensus_enforced"]
     assert seen == {0: 1, 1: 1, 2: 1, 3: 1}  # nothing re-solved
     assert results[2]["fit"]["shift_dev_m"] > solve.CONSENSUS_TOL_M  # but the disagreement is on record
+
+
+def test_a_registered_chunk_anchors_even_when_its_coarse_peak_was_refused(monkeypatch):
+    """E1 `20191217T2335209162`, verbatim: (match_frac, accepted, total_shift_m) per chunk.
+
+    Only the two mis-latched chunks (match_frac 0.004, 10-15 km out) had `coarse.accepted`; the one
+    chunk that actually registered (ch6, 0.167) refused its peak and kept its zero seed. Requiring
+    both left the strip with no anchor and shipped the 15 km chunks uncorrected.
+    """
+    monkeypatch.setattr(solve, "log", lambda msg: None)
+    monkeypatch.setattr(solve, "GROUP", "equatorial")
+    strip = [
+        (0.013, False, (0.0, 0.0)),
+        (0.012, False, (0.0, 0.0)),
+        (0.008, False, (0.0, 0.0)),
+        (0.004, True, (14880.0, 160.0)),
+        (0.044, False, (0.0, 0.0)),
+        (0.004, True, (-10240.0, -640.0)),
+        (0.167, False, (0.0, 0.0)),
+    ]
+    pinned = []
+
+    def fake_solve_one(c, seed, *_, pin_coarse=False):
+        frac, accepted, shift = strip[c["i"]]
+        if pin_coarse:
+            pinned.append(c["i"])
+            shift, accepted = seed, True
+        return {"chunk": c, "gcps": {}, "fit": _fit(frac < 0.10, shift, accepted, frac)}
+
+    monkeypatch.setattr(solve, "_solve_one", fake_solve_one)
+    results, info = solve._solve_chunks([{"i": i} for i in range(7)], CFG0, None, None, None, 0.0, {}, False)
+
+    assert info["coarse_consensus_m"] == [0.0, 0.0] and not info["uncorrected"]
+    assert pinned == [3, 5]  # the two mis-latched chunks, and only those
+    assert all(r["fit"]["shift_dev_m"] == 0.0 for r in results)
 
 
 def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeypatch):

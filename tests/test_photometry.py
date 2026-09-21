@@ -107,6 +107,108 @@ def test_photom_model_changes_the_answer_and_takes_a_callable():
     np.testing.assert_allclose(lam.values, same.values)
 
 
+COS_85 = np.cos(np.radians(85.0))
+
+
+def test_mu_min_floors_grazing_incidence_without_changing_default():
+    """mu_min=0 is a no-op; a nonzero floor caps the I/F of a near-terminator pixel."""
+    rad = _synthetic_l1()  # solar_inc=80 deg everywhere -> mu0 ~ 0.17, well above any floor here
+    flat = xr.zeros_like(rad.isel(band=0, drop=True))
+    baseline = _refl(rad, min_lit=0.0)
+    np.testing.assert_allclose(baseline.values, _refl(rad, min_lit=0.0, mu_min=0.0).values, rtol=0, atol=0)
+
+    grazing = rad.copy()
+    grazing["solar_inc"] = ("y", np.full(grazing.sizes["y"], 89.9))  # mu0 ~ 0.0017, near-terminator
+    unclamped = _refl(grazing, min_lit=0.0)
+    clamped = _refl(grazing, min_lit=0.0, mu_min=0.05)
+    assert np.all(np.abs(clamped.values) <= np.abs(unclamped.values) + 1e-9)
+    assert np.abs(clamped.values).max() <= 1.0 / 0.05 + 1e-6
+    assert clamped.attrs["mu_min"] == 0.05
+    assert clamped.attrs["mu0_floor_frac"] == 1.0  # every pixel here is below the floor
+    assert clamped.attrs["mu_floor_frac"] == 0.0  # nadir view (no topo view tilt) here
+    assert _refl(rad, min_lit=0.0, topo=(flat, flat, xr.ones_like(flat)), mu_min=0.0).attrs["mu0_floor_frac"] == 0.0
+
+
+def _mu_dependent_photom(mu0, mu, g):
+    """mu0*mu -- unlike lambert/lommel_seeliger/lunar_lambert this actually diverges as mu -> 0,
+    so it exercises what an emission floor is for even though none of the built-in models do."""
+    return mu0 * mu
+
+
+def test_mu_min_floors_grazing_emission_independently_of_incidence():
+    """A steep facet drives mu (emission cosine) toward 0 under nadir view; mu_min clamps it too."""
+    rad = _synthetic_l1()
+    rad["solar_inc"] = ("y", np.full(rad.sizes["y"], 10.0))  # near-overhead sun: mu0 stays high
+    flat = xr.zeros_like(rad.isel(band=0, drop=True))
+    steep = xr.full_like(flat, 89.0)  # mu = cos(89deg) ~= 0.0175 under nadir view, near-grazing
+    aspect = xr.full_like(flat, 210.0)  # face the sun so mu0 is not also collapsed by the tilt
+    lit = xr.ones_like(flat)
+
+    unclamped = _refl(rad, min_lit=0.0, topo=(steep, aspect, lit), photom=_mu_dependent_photom)
+    clamped = _refl(rad, min_lit=0.0, topo=(steep, aspect, lit), photom=_mu_dependent_photom, mu_min=COS_85)
+    assert np.all(np.abs(clamped.values) < np.abs(unclamped.values))
+    assert clamped.attrs["mu_floor_frac"] == 1.0  # every pixel here has mu below the floor
+    assert clamped.attrs["mu0_floor_frac"] == 0.0  # incidence itself is nowhere near the floor
+
+
+def test_grazing_incidence_and_emission_together_stay_bounded():
+    """Besse's rule: clamping incidence and emission at 85 deg keeps I/F from blowing up either way."""
+    rad = _synthetic_l1()
+    rad["solar_inc"] = ("y", np.full(rad.sizes["y"], 89.5))  # grazing incidence
+    flat = xr.zeros_like(rad.isel(band=0, drop=True))
+    steep = xr.full_like(flat, 89.0)  # and grazing emission
+    # aspect cross-slope to the sun (sun_az=210, aspect=300) so the 89deg tilt doesn't itself
+    # correct the incidence angle back toward normal -- it stays grazing, same as flat ground.
+    aspect = xr.full_like(flat, 300.0)
+    lit = xr.ones_like(flat)
+
+    unclamped = _refl(rad, min_lit=0.0, topo=(steep, aspect, lit), photom=_mu_dependent_photom)
+    clamped = _refl(rad, min_lit=0.0, topo=(steep, aspect, lit), photom=_mu_dependent_photom, mu_min=COS_85)
+    assert np.all(np.isfinite(clamped.values))
+    assert np.all(np.abs(clamped.values) < np.abs(unclamped.values))
+    assert np.abs(clamped.values).max() <= 1.0 / COS_85**2 + 1e-3
+    assert clamped.attrs["mu0_floor_frac"] == 1.0
+    assert clamped.attrs["mu_floor_frac"] == 1.0
+
+
+def test_besse_phase_table_parses_known_value():
+    """Spot-check against the notes: ch19/950.06 nm, f(75)/f(30) ~ 0.6462 (Besse's own table)."""
+    _, wl, f = ph._m3_phase_table()
+    i = int(np.argmin(np.abs(wl - 950.06)))
+    assert f[30, i] == pytest.approx(0.255755, abs=1e-6)
+    assert (f[75, i] / f[30, i]) == pytest.approx(0.6462, abs=1e-4)
+
+
+def test_besse_phase_ratio_matches_spot_check_and_is_identity_at_30():
+    assert ph.besse_phase(30.0, 950.06) == pytest.approx(1.0)
+    assert ph.besse_phase(75.0, 950.06) == pytest.approx(1.548, abs=2e-3)
+
+
+def test_besse_phase_clamps_beyond_the_85deg_domain():
+    """Past 85 deg the table is quartic-rollover garbage (notes S4); usage must clamp there."""
+    at_edge = ph.besse_phase(85.0, 950.06)
+    assert ph.besse_phase(90.0, 950.06) == pytest.approx(at_edge)
+    assert ph.besse_phase(150.0, 950.06) == pytest.approx(at_edge)
+
+
+def test_besse_phase_broadcasts_over_wavelength_and_geometry():
+    g = np.array([10.0, 30.0, 75.0])
+    out = ph.besse_phase(g, np.array([950.06, 1508.99]))
+    assert out.shape == (2, 3)
+    np.testing.assert_allclose(out[:, 1], 1.0)  # alpha=30 is the identity for every band
+
+
+def test_phase_wiring_reproduces_a_scene_at_the_reference_geometry():
+    """At phase=30 with lommel_seeliger, besse_phase is 1 everywhere, so `phase` only rescales by
+    the fixed XL(30,0,30) reference constant -- the ratio to the no-phase run is that constant."""
+    rad = _synthetic_l1()
+    rad["solar_inc"] = ("y", np.full(rad.sizes["y"], 30.0))  # nadir view: phase == incidence
+    baseline = _refl(rad, photom="lommel_seeliger", min_lit=0.0)
+    with_phase = _refl(rad, photom="lommel_seeliger", phase=True, min_lit=0.0)
+    xl_ref = ph.lommel_seeliger(np.cos(np.radians(30.0)), 1.0, 30.0)
+    np.testing.assert_allclose(with_phase.values, baseline.values * xl_ref, rtol=1e-6)
+
+
 def test_penumbra_is_dropped_by_the_min_lit_default():
     """min_lit defaults to 0.9: a half-blocked solar disk is nulled, and the cut is opt-outable."""
     rad = _synthetic_l1()

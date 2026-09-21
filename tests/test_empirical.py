@@ -98,6 +98,28 @@ def test_uniformly_lit_scene_yields_no_dark_subtraction():
     assert notes["has_shadow"] is False
 
 
+def test_fill_block_is_rejected_even_when_the_panchromatic_average_hides_it():
+    """A mostly-exact-zero block is fill/clipped data, not shadow, and must not anchor the dark.
+
+    Fill is zero in some bands and not others, so the PAN_BANDS average dilutes it to a few
+    percent: measuring on the cube is what makes the test bite (real blocks read 72-84% zero on
+    the cube and under 5% on the panchromatic).
+    """
+    cube = synth_cube()
+    block = (0, 200)
+    assert emp.zero_frac(cube, block) < emp.DARK_FILL_ZERO_FRAC, "genuine low-DN block is not fill"
+    assert emp.empirical_frames(cube)[-1]["has_shadow"] is True
+
+    fill = cube.copy()
+    fill[1:, :200, :] = 0.0  # every band but the first, so the panchromatic stays nonzero
+    assert emp.panchromatic(fill).values[:200].min() > 0, "the average hides the fill; the cube must not"
+    assert emp.zero_frac(fill, block) >= emp.DARK_FILL_ZERO_FRAC
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        notes = emp.empirical_frames(fill)[-1]
+    assert notes["has_shadow"] is False and notes["reject_reason"] == "fill"
+
+
 def test_shadow_is_found_through_an_unsubtracted_dark_pedestal():
     """The failure 20201203T1859574285 shows: shadow at ~290 DN, which any level cut calls lit.
 

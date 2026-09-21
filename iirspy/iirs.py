@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pdr
+import rasterio
 import xarray as xr
 from rioxarray.exceptions import NoDataInBounds
 
@@ -60,8 +61,6 @@ def _resume_row(fout, fprog, key):
     block size -- a different one is a different product, not a resume), and `fout` still opens for
     update. A file killed mid-flush may not reopen at all, so that case restarts from 0 too.
     """
-    import rasterio
-
     if not (Path(fout).exists() and Path(fprog).exists()):
         return 0
     try:
@@ -330,7 +329,6 @@ class IIRSData(ABC):
         wall clock therefore loses one block, not the whole cube -- which for a long strip is the
         difference between a resumable requeue and starting the scene from zero.
         """
-        import rasterio
         from dask.diagnostics import ProgressBar
         from rasterio.windows import Window
 
@@ -372,6 +370,58 @@ class IIRSData(ABC):
                     dst.set_band_description(i + 1, wl)
         fprog.unlink(missing_ok=True)
         return fout
+
+    def clip_aoi(self, fglt, geometry, crs=None, scan0=None):
+        """Clip the cube by geometry polygon and write the projected AOI GeoTIFF using the GLT.
+
+        Assumes `geometry` AOI is small. It is reprojected to the GLT's CRS, then finds the window 
+        it occupies and sets any GLT entry outside the polygon to null. Then `georef.apply_glt`
+        resamples onto the AOI's grid. `scan0` defaults to the GLT's own build scan0.
+
+        Returns
+        -------
+        xarray.DataArray
+            (band, y, x) cube on the AOI's map grid, crs/transform set, ready for
+            `.rio.to_raster(fout)`.
+        """
+        from rasterio.features import geometry_mask, geometry_window
+        from rasterio.warp import transform_geom
+
+        from iirspy import georef
+
+        crs = georef.LONLAT if crs is None else crs
+        with rasterio.open(fglt) as src:
+            geom = transform_geom(crs, src.crs, geometry)
+            window = geometry_window(src, [geom])
+            sub_glt = src.read(window=window)
+            crop_transform = src.window_transform(window)
+            glt_crs = src.crs
+            tags = {k: json.loads(v) for k, v in src.tags().items() if k in georef.TAG_KEYS}
+
+        poly_mask = geometry_mask([geom], out_shape=sub_glt.shape[1:], transform=crop_transform, invert=True)
+        sub_glt[0][~poly_mask] = georef.NODATA  # outside the true polygon, not just its bbox
+        inside = sub_glt[0] >= 0
+        if not inside.any():
+            raise ValueError(f"no camera pixels of {fglt} fall within the given geometry")
+
+        cube_scan0 = tags["scan0"] if scan0 is None else scan0
+        cam_nrow, cam_ncol = self.img.sizes["y"], self.img.sizes["x"]
+        cam_rows = sub_glt[1][inside] - cube_scan0
+        cam_cols = sub_glt[0][inside]
+        cam_r0, cam_r1 = max(int(cam_rows.min()), 0), min(int(cam_rows.max()) + 1, cam_nrow)
+        cam_c0, cam_c1 = max(int(cam_cols.min()), 0), min(int(cam_cols.max()) + 1, cam_ncol)
+
+        sub_img = self.img.isel(y=slice(cam_r0, cam_r1), x=slice(cam_c0, cam_c1))
+        local_glt = sub_glt.copy()
+        local_glt[0] = np.where(inside, sub_glt[0] - cam_c0, sub_glt[0])
+        local_glt[1] = np.where(inside, sub_glt[1] - cube_scan0 - cam_r0, sub_glt[1])
+        warped = georef.apply_glt(sub_img.values, local_glt, cube_scan0=0)
+
+        da = xr.DataArray(warped, dims=("band", "y", "x"), coords={"band": self.img.band.values})
+        if "wl" in self.img.coords:
+            da = da.assign_coords(wl=("band", self.img.wl.values))
+        da.attrs = dict(self.img.attrs)
+        return da.rio.write_crs(glt_crs).rio.write_transform(crop_transform)
 
     @abstractmethod
     def plot(self, band=12, yrange=(None, None), xrange=(None, None), **kwargs):

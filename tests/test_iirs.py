@@ -79,3 +79,95 @@ def test_geotiff_write_resumes_from_progress_sidecar(tmp_path):
     from iirspy.iirs import _resume_row
 
     assert _resume_row(fout, fprog, {"shape": [2, ny, 3], "row_block": block}) == 0
+
+
+def test_empirical_sidecar_roundtrips_dark_flat_smile(tmp_path):
+    """`attach_empirical_frames` coords -> `_save_empirical_sidecar` -> one .npz with all three."""
+    import numpy as np
+    import xarray as xr
+
+    from iirspy.iirs import IIRSData
+
+    bands, x = [10, 20, 30], np.arange(4.0)
+    img = xr.DataArray(
+        np.zeros((3, 2, 4), "float32"),
+        dims=("band", "y", "x"),
+        coords={
+            "band": bands,
+            "x": x,
+            "empirical_dark": (("band", "x"), np.full((3, 4), 1.0, "float32")),
+            "empirical_flat": (("band", "x"), np.full((3, 4), 2.0, "float32")),
+            "empirical_smile": (("band", "x"), np.full((3, 4), 3.0, "float32")),
+        },
+    )
+    from types import SimpleNamespace
+
+    fout = tmp_path / "cube.tif"
+    fnpz = IIRSData._save_empirical_sidecar(SimpleNamespace(img=img), fout)
+
+    assert fnpz == str(tmp_path / "cube_empirical.npz")
+    d = np.load(fnpz)
+    np.testing.assert_array_equal(d["dark"], 1.0)
+    np.testing.assert_array_equal(d["flat"], 2.0)
+    np.testing.assert_array_equal(d["smile"], 3.0)
+    np.testing.assert_array_equal(d["band"], bands)
+
+
+def test_clip_aoi_warps_onto_the_map_grid_and_matches_a_polygon_masked_apply_glt(tmp_path):
+    """`clip_aoi` must equal `apply_glt` run on a GLT window whose out-of-polygon cells were
+    nulled first, and come back with its own crs/transform -- no GCP sidecar needed."""
+    from types import SimpleNamespace
+
+    import numpy as np
+    import rasterio
+    import xarray as xr
+    from rasterio.control import GroundControlPoint
+    from rasterio.features import geometry_mask, geometry_window
+    from rasterio.warp import transform_geom
+
+    from iirspy import georef
+    from iirspy.iirs import IIRSData
+
+    cfg = georef.GeorefConfig(aoi=(0.0, 0.0, 4000.0, 4000.0), ps=40.0)
+    ny, nx = 60, 20
+    gcps = [
+        GroundControlPoint(row=float(r), col=float(c), x=500.0 + 30.0 * c, y=3500.0 - 50.0 * r)
+        for r in np.arange(0, ny, 5)
+        for c in np.arange(0, nx, 2)
+    ]
+    glt = georef.make_glt(gcps, cfg, (ny, nx))
+    fglt = georef.save_glt(
+        tmp_path / "glt.tif",
+        glt,
+        cfg,
+        sid="sid",
+        group="south",
+        scan0=0,
+        lat_range=(-90.0, -60.0),
+        camera_shape=(ny, nx),
+    )
+
+    cube = np.arange(ny * nx, dtype="float32").reshape(1, ny, nx)
+    img = xr.DataArray(cube, dims=("band", "y", "x"), coords={"band": [1]})
+    inst = SimpleNamespace(img=img)
+
+    with rasterio.open(fglt) as src:
+        crs_wkt = src.crs.to_wkt()
+
+    x0, y0, x1, y1 = 900.0, 2900.0, 1400.0, 3400.0
+    geom = {"type": "Polygon", "coordinates": [[(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]]}
+
+    out = IIRSData.clip_aoi(inst, fglt, geom, crs=crs_wkt)
+
+    with rasterio.open(fglt) as src:
+        want_geom = transform_geom(crs_wkt, src.crs, geom)
+        window = geometry_window(src, [want_geom])
+        sub_glt = src.read(window=window)
+        crop_transform = src.window_transform(window)
+    poly_mask = geometry_mask([want_geom], out_shape=sub_glt.shape[1:], transform=crop_transform, invert=True)
+    sub_glt[0][~poly_mask] = georef.NODATA
+    want = georef.apply_glt(cube, sub_glt, cube_scan0=0)
+
+    np.testing.assert_array_equal(out.values, want)
+    assert out.rio.crs == rasterio.CRS.from_wkt(crs_wkt)
+    assert out.rio.transform() == crop_transform
