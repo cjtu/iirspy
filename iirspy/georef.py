@@ -907,12 +907,21 @@ def coarse_shift(img, ref, cfg):
 
     Every number is gated: inject a known shift, re-measure, and require the answer to move by
     that much. Searches up to `coarse_topk` correlation peaks if necessary.
+
+    `coarse_max_m=0` pins the caller's seed -- no search, nothing to gate, no shift:
+
+    >>> from dataclasses import replace
+    >>> x = np.zeros((8, 8))
+    >>> coarse_shift(x, x, replace(GeorefConfig(), coarse_max_m=0.0))[:2]
+    (0.0, 0.0)
     """
     from skimage.registration._masked_phase_cross_correlation import cross_correlate_masked
 
     d = cfg.coarse_dec
     a, b = img[::d, ::d], ref[::d, ::d]
     cap_px = round(cfg.coarse_max_m / (cfg.ps * d))
+    if cap_px == 0:
+        return 0.0, 0.0, {"shift_km": [0.0, 0.0], "pinned": True, "trustworthy": True, "accepted": True}
 
     def measure(x, y):
         mx, my = np.isfinite(x), np.isfinite(y)

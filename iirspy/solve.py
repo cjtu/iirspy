@@ -596,17 +596,29 @@ def _shift_of(r):
 
 
 def _is_anchor(r, cfg0) -> bool:
-    """Whether `r`'s coarse shift was corroborated, so it may vote on the strip consensus.
+    """Whether `r` registered well enough to vote on the strip consensus: match rate alone.
 
-    `_accepted` is not enough: a chunk rejected for "coarse shift refused" applied no shift of its
-    own (`georef.coarse_shift` returns 0,0), so its `total_shift_m` is just the seed it inherited
-    and would vote for whatever the forward pass happened to carry.
+    How the chunk arrived at its shift does not matter, only that the shift it ended up with
+    *registers*. A chunk that refused its coarse peak and kept its seed (`coarse.accepted=False`)
+    and then reached `match_frac=0.21` has corroborated that seed as well as anything can; requiring
+    `coarse.accepted` too left both dead E1 strips with no anchor at all, because there the only
+    accepted chunks were the mis-latched ones. Those are excluded by `min_match_frac` regardless --
+    a chunk kilometres off keeps 0.003-0.017 of its tie-point candidates.
+
+    >>> from dataclasses import replace
+    >>> from iirspy.georef import GeorefConfig
+    >>> cfg = replace(GeorefConfig(), min_match_frac=0.10)
+    >>> _is_anchor({"fit": {"quality": {"match_frac": 0.167}}}, cfg)  # refused its peak, matched
+    True
+    >>> _is_anchor({"fit": {"quality": {"match_frac": 0.004}}}, cfg)  # accepted a 15 km peak
+    False
+    >>> _is_anchor(None, cfg)
+    False
     """
     if r is None:
         return False
-    coarse = r["fit"].get("stats", {}).get("coarse", {})
     frac = (r["fit"].get("quality") or {}).get("match_frac")
-    return bool(coarse.get("accepted")) and frac is not None and frac >= cfg0.min_match_frac
+    return frac is not None and frac >= cfg0.min_match_frac
 
 
 def _consensus_shift(shifts, tol_m: float = CONSENSUS_TOL_M):
@@ -642,8 +654,13 @@ def _chunk_grade(r) -> str:
     return "suspect" if r["fit"].get("stats", {}).get("coarse", {}).get("accepted") else "fallback"
 
 
-def _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
+def _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks, pin_coarse=False):
     """Solve chunk `c` seeded from `seed` (a prior coarse shift in metres), or reuse its cache.
+
+    `pin_coarse` holds the chunk at `seed` exactly: `coarse_max_m=0` leaves the coarse search one
+    zero-lag bin to pick from, so it adds nothing and `total_shift_m == seed`, while the fine
+    tie-point iterations still run. The cache is keyed on everything but the seed, so a pinned
+    re-solve must not read it -- it would hand back the very fit the reseed exists to replace.
 
     Returns {"chunk", "gcps", "fit"}, or None on total failure. Exits `EXIT_RESUME` if this chunk
     would not fit in the time left (see `--max-seconds`) -- stopping *before* a chunk rather than
@@ -661,7 +678,7 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
     )
 
     i = c["i"]
-    cached = _cached_chunk(OUT, c, ck.GOOD_CORR, decay_m, tweaks)
+    cached = None if pin_coarse else _cached_chunk(OUT, c, ck.GOOD_CORR, decay_m, tweaks)
     if cached is not None:
         fit, gcps_by_rc = cached
         log(f"chunk {i} [{c['band']}]: reusing cached solve, corr={fit['corr']}")
@@ -684,11 +701,12 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
         decay_m=decay_m,
         gcp_rows=(c["row0"], c["row1"]),
         seed_m=seed,
+        **({"coarse_max_m": 0.0} if pin_coarse else {}),
         **tweaks,
     )
     log(
         f"\n--- chunk {i} [{c['band']}] solve: aoi={c['aoi']} far={Path(c['dem_far']).name} "
-        f"decay_m={decay_m} seed_m={seed} {tweaks} ---"
+        f"decay_m={decay_m} seed_m={seed}{' PINNED' if pin_coarse else ''} {tweaks} ---"
     )
 
     t0 = time.time()
@@ -783,7 +801,9 @@ def _consensus_pass(chunks, results, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
     The coarse search estimates a quantity that is near-constant along a strip, so running it
     independently per chunk gives one chance per chunk to latch a spurious correlation peak -- the
     entire catastrophic failure mode. The consensus of the corroborated chunks (`_is_anchor`)
-    overrides the rest. With no anchor there is no consensus and the forward pass stands, which
+    overrides the rest, and the re-solve is pinned to it: re-running the coarse search from the
+    consensus seed just hands the chunk a second chance to latch the same peak on top of it
+    (`20231204T2004426846` chunk 1 did exactly that, reseeded to -80 m and back out to 6.4 km). With no anchor there is no consensus and the forward pass stands, which
     means the product is uncorrected raw geometry rather than solved.
 
     Returns (results, info) with `info` for the summary.
@@ -807,7 +827,7 @@ def _consensus_pass(chunks, results, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
         log(f"  chunk {c['i']}: shift={_shift_of(results[idx])} dev={dev:.0f}m {'RESEED' if off else 'keep'}")
         if not (off and enforce):
             continue
-        results[idx] = _solve_one(c, consensus, cfg0, ftif, fgeom, fspm, decay_m, tweaks)
+        results[idx] = _solve_one(c, consensus, cfg0, ftif, fgeom, fspm, decay_m, tweaks, pin_coarse=True)
         if results[idx] is not None:
             results[idx]["fit"]["reseeded"] = True
     return results, {"coarse_consensus_m": list(consensus), "consensus_enforced": enforce, "uncorrected": False}
