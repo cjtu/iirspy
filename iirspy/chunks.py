@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from math import ceil
 from functools import lru_cache
 from itertools import pairwise
+from math import ceil
 from pathlib import Path
 
 import numpy as np
@@ -333,7 +333,7 @@ def _even_chunks(length_m: float, width_range_km: tuple[float, float], overlap_f
     >>> [(round(a), round(z)) for a, z in _even_chunks(400_000.0, (100.0, 150.0), 0.10)]
     [(0, 142857), (128571, 271429), (257143, 400000)]
     """
-    lo_m, hi_m = width_range_km[0] * 1000, width_range_km[1] * 1000
+    hi_m = width_range_km[1] * 1000
     if length_m <= hi_m:
         return [(0.0, length_m)]
     # smallest n whose width is <= hi_m; w(n) is monotonically decreasing so a search for

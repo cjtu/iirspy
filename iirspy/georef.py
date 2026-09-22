@@ -1320,13 +1320,15 @@ def data_window(arr, pad=8):
     )
 
 
-def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None, out=None):
+def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None, out=None, dst_nodata=np.nan):
     """One reproject of a camera-space band -- or a whole (band, y, x) cube -- onto the AOI grid.
 
     Pass the cube, not one band at a time: GDAL solves the warp once per call.
     - `window` crops the output to (r0, r1, c0, c1) of the AOI grid (down from several GB strip).
     - `out` is a `rasterio.band(dataset, indexes)` to warp straight into, for a destination too big
     to hold -- see :func:`warp`. Default allocates an array and returns it.
+    - `dst_nodata` must match `out`'s dtype when `out` is given (e.g. an int sentinel for an int32
+    `out`) -- GDAL writes it verbatim, it is not a float-only convention.
     - SRC_METHOD=GCP_TPS: thin-plate-spline interpolation.
     - tolerance=0 is the exact transformer (rasterio's default 0.125 replaces TPS with a
     polynomial fitted within an eighth of a pixel which added 5 m of noise at 40 m/px)
@@ -1351,7 +1353,7 @@ def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None, out=No
         dst_crs=stereo_crs(cfg.pole),
         resampling=resampling,
         src_nodata=np.nan,
-        dst_nodata=np.nan,
+        dst_nodata=dst_nodata,
         tolerance=0.0,
         num_threads=len(os.sched_getaffinity(0)),  # parallize warp kernel over available cores
         SRC_METHOD="GCP_TPS",
@@ -1726,11 +1728,11 @@ def make_glt(gcps, cfg, camera_shape, scan0=0, window=None) -> np.ndarray:
     """
     nrow, ncol = camera_shape
     cols, rows = np.meshgrid(np.arange(ncol, dtype="float32"), np.arange(scan0, scan0 + nrow, dtype="float32"))
-    warped = project(np.stack([cols, rows]), gcps, cfg, resampling=Resampling.nearest, window=window)
-    out = np.full(warped.shape, NODATA, "int32")
-    inside = np.isfinite(warped[0]) & np.isfinite(warped[1])
-    out[0][inside] = warped[0][inside].astype("int32")
-    out[1][inside] = warped[1][inside].astype("int32")
+    shape, _ = window_of(cfg, window)
+    # Nearest resampling copies whole-number camera indices exactly, so GDAL can cast and fill
+    # NODATA straight into one int32 buffer -- no separate float `warped` array or isfinite mask.
+    out = np.full((2, *shape), NODATA, "int32")
+    project(np.stack([cols, rows]), gcps, cfg, resampling=Resampling.nearest, window=window, out=out, dst_nodata=NODATA)
     return out
 
 

@@ -1208,6 +1208,8 @@ def main(argv: list[str] | None = None) -> None:
     log(f"gcp vrt: {fvrt}")
 
     final_cfg, final = _warp_merged(merged, used_chunks, cfg0, ftif)
+    final_shape = list(final.shape)
+    del final  # written to disk by _warp_merged; only the shape is still needed below
     fglt = _make_glt(merged, cfg0, scan0, args.keep or str(ck.recal_dir(SID, GROUP)), overwrite=True)
     log(f"glt: {fglt}")
 
@@ -1229,7 +1231,7 @@ def main(argv: list[str] | None = None) -> None:
         "scan0": scan0,
         "glt": str(fglt),
         "final_aoi_m": final_cfg.aoi,
-        "final_shape": list(final.shape),
+        "final_shape": final_shape,
         "total_s": round(time.time() - t_start, 1),
     }
     (OUT / "summary.json").write_text(json.dumps(summary, indent=1, default=str))
