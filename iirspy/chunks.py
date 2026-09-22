@@ -443,6 +443,11 @@ def plan_chunks(fgeom: Path, width_range_km: tuple[float, float] = (100.0, 150.0
         for cs0, cs1 in _even_chunks(run.s_hi - run.s_lo, width_range_km, overlap_frac):
             gs0, gs1 = run.s_lo + cs0, run.s_lo + cs1
             in_chunk = scans[(s >= gs0) & (s <= gs1)]
+            if in_chunk.size == 0:
+                # short seam-widened or single-scan run: window fell between two sample
+                # points. Fall back to the nearest scan so the chunk still owns a row.
+                idx = int(np.argmin(np.abs(s - (gs0 + gs1) / 2)))
+                in_chunk = scans[idx : idx + 1]
             chunks.append({
                 "i": len(chunks),
                 "band": run.band,
