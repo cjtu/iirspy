@@ -18,7 +18,9 @@ from math import ceil
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
+from iirspy import utils
 from iirspy.georef import MOON_RADIUS_M, GeorefConfig, to_stereo
 
 ARCHIVE = Path(os.environ.get("IIRS_ARCHIVE", "/mnt/d/ddata/moon/ch2_iirs"))
@@ -239,8 +241,6 @@ def kernels(day: str) -> list[Path]:
     """
     import re
 
-    import pandas as pd
-
     if not SPICE.is_dir():
         raise FileNotFoundError(f"SPICE kernel tree not found at {SPICE} -- set IIRS_SPICE")
     ks = [SPICE / p for p in ("lsk/naif0012.tls", "pck/pck00010.tpc", "sclk/ch2_sclk_v1.tsc", "fk/ch2_v01.tf")]
@@ -308,9 +308,7 @@ def strip_backbone(fgeom: Path, lat_min: float = -90.0, lat_max: float = 90.0):
     Left in lon/lat rather than projected, since a strip can cross groups with different CRSs and
     arc length is measured on the sphere by `_haversine_m`.
     """
-    import pandas as pd
-
-    df = pd.read_csv(fgeom)
+    df = utils.read_geom_csv(fgeom)
     df["Longitude"] = (df["Longitude"] + 180) % 360 - 180
     df = df[(df.Latitude >= lat_min) & (df.Latitude <= lat_max)]
     g = df.groupby("Scan")[["Longitude", "Latitude"]].median().sort_index()
@@ -422,8 +420,6 @@ def plan_chunks(fgeom: Path, width_range_km: tuple[float, float] = (100.0, 150.0
 
     Callers filter by `group` and only merge within one group.
     """
-    import pandas as pd
-
     scans, lon, lat = strip_backbone(fgeom)
     if len(scans) < 2:
         return []
@@ -433,7 +429,7 @@ def plan_chunks(fgeom: Path, width_range_km: tuple[float, float] = (100.0, 150.0
         order = np.argsort(s)
         scans, lon, lat, s = scans[order], lon[order], lat[order], s[order]
 
-    df = pd.read_csv(fgeom)
+    df = utils.read_geom_csv(fgeom)
     df["Longitude"] = (df["Longitude"] + 180) % 360 - 180
 
     resolved = bands()

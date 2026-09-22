@@ -378,7 +378,7 @@ def sun_geometry(fgeom, fspm, cfg, kernels=None):
     for k in kernels or []:
         sp.furnsh(str(k))
 
-    df = pd.read_csv(fgeom)
+    df = utils.read_geom_csv(fgeom)
     lon = np.where(df.Longitude > 180, df.Longitude - 360, df.Longitude)
     gx, gy = to_stereo(cfg.pole).transform(lon, df.Latitude.values)
     ins = (gx > cfg.aoi[0]) & (gx < cfg.aoi[2]) & (gy > cfg.aoi[1]) & (gy < cfg.aoi[3])

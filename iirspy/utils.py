@@ -756,6 +756,17 @@ def get_iirs_paths(
     return out
 
 
+def read_geom_csv(fgeom) -> pd.DataFrame:
+    """IIRS geometry csv, minus the (0, 0) fill rows some bundles pad the tail with.
+
+    Seen on real scenes (e.g. 20240523T1600301891): trailing rows with Pixel=Scan=0 and
+    Longitude=Latitude=0.0 exactly, duplicating the legit Scan=0 row. No lunar limb sample lands
+    on (0.0, 0.0) to full float precision, so safe to drop.
+    """
+    df = pd.read_csv(fgeom)
+    return df[(df.Longitude != 0.0) | (df.Latitude != 0.0)]
+
+
 def get_wls(fwavelengths=FWAVELENGTHS):
     """Return the wavelength [nm] for each band from IIRS wavelengths file."""
     df = pd.read_csv(fwavelengths, header=0, names=["band", "wl"], usecols=[0, 1])
@@ -780,7 +791,7 @@ def get_iirs_latlon(fgeom, center=False):
 
     Note: Provided lat/lon are reported for every 50th line/sample, not every pixel.
     """
-    df = pd.read_csv(fgeom).rename(columns={"Pixel": "x", "Scan": "y"})
+    df = read_geom_csv(fgeom).rename(columns={"Pixel": "x", "Scan": "y"})
     df["Longitude"] = (df["Longitude"] + 180) % 360 - 180  # lon in [-180, 180]
     # set coords from 1 to max(coord) unless center coords, which start at 0.5
     df["x"] = df.x + 1 - 0.5 * center
@@ -850,7 +861,7 @@ def parse_geom(
         raise ValueError("Only one of latlonextent or xyextent can be specified, not both.")
 
     # Read GCPs from iirs geometry file
-    df = pd.read_csv(fgeom)
+    df = read_geom_csv(fgeom)
     df["Longitude"] = (df["Longitude"] + 180) % 360 - 180  # lon in [-180, 180]
 
     # Use pixel centers if requested

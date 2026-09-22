@@ -1191,7 +1191,7 @@ def main(argv: list[str] | None = None) -> None:
         log(f"\n--chunks given: solved {len(results)} chunk(s), skipping merge/warp.")
         return
 
-    if len(results) < 2:
+    if len(results) < min(2, len(chunks)):
         sys.exit("fewer than 2 chunks solved -- nothing to merge")
 
     results.sort(key=lambda r: r["chunk"]["i"])
