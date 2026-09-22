@@ -376,6 +376,7 @@ def build_l1(
     log(f"L1 crop lat={lat_range}: scan {ymin}-{ymax} ({ymax - ymin} rows)")
     l1.img = l1.img.sel(y=slice(ymin, ymax))
     l1.img = l1.img / utils.RAD_NATIVE_SCALE
+    l1.img.attrs["units"] = "1000 mW/cm^2/sr/um"
     if out_bands is not None:
         l1.img = l1.img.sel(band=out_bands)
     with phase(f"L1 write ({l1.img.shape[0]} band x {l1.img.shape[1]} rows, chunk_y={chunk_y})"):

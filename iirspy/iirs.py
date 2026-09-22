@@ -142,6 +142,19 @@ def _narrow_bands(rad, output_bands):
     return rad if output_bands is None else rad.sel(band=output_bands)
 
 
+def _expand_to_full_bands(da):
+    """Reindex `da`'s band dim onto the full 1..256 IIRS range, NaN-filling any band not present.
+
+    A cube narrowed to a band subset writes only its own bands contiguously, this restores the full
+    1:1 mapping so the dropped/OSF/invalid bands become all-NaN, consistent with IIRS images.
+    """
+    all_bands = np.arange(1, len(utils.get_wls()) + 1)
+    if da.sizes["band"] == len(all_bands) and np.array_equal(da.band.values, all_bands):
+        return da
+    da = da.reindex(band=all_bands)
+    return da.assign_coords(wl=("band", utils.get_wls()))
+
+
 def _attach_empirical_frames(rad, dark, flat, smile, attach):
     """Attach dark/flat/smile as (band, x) coords on `rad` when `attach`, for save()'s sidecar.
 
@@ -155,6 +168,79 @@ def _attach_empirical_frames(rad, dark, flat, smile, attach):
         empirical_flat=(("band", "x"), flat.values),
         empirical_smile=(("band", "x"), smile.values),
     )
+
+
+def _write_camera_product(da, fout, row_block=None):
+    """Format dispatch for any camera-space product: `.tif` -> GeoTIFF, else ENVI BIL.
+
+    Module-level (not a method) so callers with just a DataArray -- not a full IIRSData instance
+    -- can write a product too (e.g. `IIRSData.clip_aoi`, which only needs `self.img`).
+    """
+    fout = str(fout)
+    row_block = _row_block(da, row_block)
+    if fout.lower().endswith(".tif"):
+        return _save_geotiff(fout, row_block, da)
+    return utils.write_envi_bil(da, fout, row_block, f"IIRS {da.attrs.get('name', '')}".strip())
+
+
+def _save_geotiff(fout, row_block, da):
+    """Write a float32 BigTIFF sequentially in windowed blocks (bounded memory).
+
+    Restartable: each finished block records `rows_done` in a `<fout>.progress` sidecar, and a
+    rerun of the same shape reopens the file and picks up there. A cluster task killed at its
+    wall clock therefore loses one block, not the whole cube -- which for a long strip is the
+    difference between a resumable requeue and starting the scene from zero.
+    """
+    from dask.diagnostics import ProgressBar
+    from rasterio.windows import Window
+
+    nband, ny, nx = da.shape
+    profile = {
+        "driver": "GTiff",
+        "height": ny,
+        "width": nx,
+        "count": nband,
+        "dtype": "float32",
+        "nodata": np.nan,
+        "crs": da.rio.crs if da.rio.crs else None,
+        "transform": da.rio.transform(),
+        "compress": "LZW",
+        "tiled": True,
+        "interleave": "band",  # per-band planes: viewers read one band without decompressing all 256
+        "BIGTIFF": "YES",
+    }
+    wls = [f"{float(w):.2f}" for w in da.wl.values] if "wl" in da.coords else None
+    # Provenance: scalar attrs (incl. empirical_notes JSON) round-trip as GDAL metadata tags.
+    # Drop stale band-count/name tags a source raster may carry in da.attrs (e.g. from GDAL
+    # metadata on read) -- band_numbers/per-band descriptions below are the actual truth and
+    # must not be contradicted by a leftover count/name list from an earlier band selection.
+    tags = {
+        k: str(v)
+        for k, v in da.attrs.items()
+        if isinstance(v, str | int | float | bool) and k not in ("bands", "band_names")
+    }
+    # Which IIRS bands these planes are: 1..256 on a full cube, arbitrary on a subset
+    tags["band_numbers"] = ",".join(str(int(b)) for b in da.band.values)
+    fprog = Path(str(fout) + ".progress")
+    key = {"shape": [nband, ny, nx], "row_block": int(row_block)}
+    y_start = _resume_row(fout, fprog, key)
+    mode = "r+" if y_start else "w"
+    with rasterio.open(fout, mode, **({} if y_start else profile)) as dst, ProgressBar():
+        if tags:
+            dst.update_tags(**tags)
+        for y0 in range(y_start, ny, row_block):
+            y1 = min(y0 + row_block, ny)
+            block = da.isel(y=slice(y0, y1)).values.astype("float32", copy=False)
+            dst.write(block, window=Window(0, y0, nx, y1 - y0))
+            _write_json_atomic(fprog, {**key, "rows_done": y1})
+        if wls:
+            for i, wl in enumerate(wls):
+                dst.set_band_description(i + 1, wl)
+                # Per-band "wavelength"/"wavelength_units" is the generic hyperspectral metadata
+                # GDAL/QGIS read for spectral band labels; description alone isn't.
+                dst.update_tags(i + 1, wavelength=wl, wavelength_units="Nanometers")
+    fprog.unlink(missing_ok=True)
+    return fout
 
 
 class IIRSData(ABC):
@@ -246,7 +332,7 @@ class IIRSData(ABC):
         """Mask invalid bands (OSF, bad bands)."""
         self.img = self.img.where(~self.img.band.isin((*utils.OSF, *utils.INVALID)))
 
-    def save(self, fout, sub_rows=None, snr_sidecar=True, empirical_sidecar=True):
+    def save(self, fout, sub_rows=None, snr_sidecar=True, empirical_sidecar=True, full_bands=True):
         """
         Stream the image cube to disk with bounded memory.
 
@@ -275,6 +361,10 @@ class IIRSData(ABC):
             Write the broadband `snr` field (if present) to a float32 sidecar next to fout.
         empirical_sidecar : bool
             Write the empirical dark/flat/smile frames (if present) to an `.npz` sidecar next to fout.
+        full_bands : bool
+            Reindex the cube onto the full 1..256 IIRS band range before writing, NaN-filling any
+            band a subset dropped (e.g. `output_bands`, OSF/invalid), so band position always
+            matches the real IIRS band number and wavelength. Default True.
 
         Returns
         -------
@@ -285,20 +375,12 @@ class IIRSData(ABC):
             self._save_snr_sidecar(fout, sub_rows)
         if empirical_sidecar and "empirical_flat" in self.img.coords:
             self._save_empirical_sidecar(fout)
-        return self._write(self.img, fout, sub_rows)
+        img = _expand_to_full_bands(self.img) if full_bands else self.img
+        return self._write(img, fout, sub_rows)
 
     def _write(self, da, fout, row_block=None):
-        """Format dispatch for any camera-space product: `.tif` -> GeoTIFF, else ENVI BIL.
-
-        Everything goes out through here -- cube, SNR sidecar, derived planes -- because both
-        writers record the absolute first line, without which a product is not GLT-addressable.
-        The one place `row_block` is resolved, so every product's write step matches its own chunks.
-        """
-        fout = str(fout)
-        row_block = _row_block(da, row_block)
-        if fout.lower().endswith(".tif"):
-            return self._save_geotiff(fout, row_block, da)
-        return utils.write_envi_bil(da, fout, row_block, f"IIRS {da.attrs.get('name', '')}".strip())
+        """Format dispatch for any camera-space product: `.tif` -> GeoTIFF, else ENVI BIL."""
+        return _write_camera_product(da, fout, row_block)
 
     def _save_snr_sidecar(self, fout, row_block=None):
         """Write the (y, x) empirical broadband SNR field beside fout, in fout's own format."""
@@ -321,68 +403,29 @@ class IIRSData(ABC):
         )
         return str(fnpz)
 
-    def _save_geotiff(self, fout, row_block, da=None):
-        """Write a float32 BigTIFF sequentially in windowed blocks (bounded memory).
-
-        Restartable: each finished block records `rows_done` in a `<fout>.progress` sidecar, and a
-        rerun of the same shape reopens the file and picks up there. A cluster task killed at its
-        wall clock therefore loses one block, not the whole cube -- which for a long strip is the
-        difference between a resumable requeue and starting the scene from zero.
-        """
-        from dask.diagnostics import ProgressBar
-        from rasterio.windows import Window
-
-        da = self.img if da is None else da
-        nband, ny, nx = da.shape
-        profile = {
-            "driver": "GTiff",
-            "height": ny,
-            "width": nx,
-            "count": nband,
-            "dtype": "float32",
-            "nodata": np.nan,
-            "crs": da.rio.crs if da.rio.crs else None,
-            "transform": da.rio.transform(),
-            "compress": "LZW",
-            "tiled": True,
-            "interleave": "band",  # per-band planes: viewers read one band without decompressing all 256
-            "BIGTIFF": "YES",
-        }
-        wls = [f"{float(w):.2f}" for w in da.wl.values] if "wl" in da.coords else None
-        # Provenance: scalar attrs (incl. empirical_notes JSON) round-trip as GDAL metadata tags
-        tags = {k: str(v) for k, v in da.attrs.items() if isinstance(v, str | int | float | bool)}
-        # Which IIRS bands these planes are: 1..256 on a full cube, arbitrary on a subset
-        tags["band_numbers"] = ",".join(str(int(b)) for b in da.band.values)
-        fprog = Path(str(fout) + ".progress")
-        key = {"shape": [nband, ny, nx], "row_block": int(row_block)}
-        y_start = _resume_row(fout, fprog, key)
-        mode = "r+" if y_start else "w"
-        with rasterio.open(fout, mode, **({} if y_start else profile)) as dst, ProgressBar():
-            if tags:
-                dst.update_tags(**tags)
-            for y0 in range(y_start, ny, row_block):
-                y1 = min(y0 + row_block, ny)
-                block = da.isel(y=slice(y0, y1)).values.astype("float32", copy=False)
-                dst.write(block, window=Window(0, y0, nx, y1 - y0))
-                _write_json_atomic(fprog, {**key, "rows_done": y1})
-            if wls:
-                for i, wl in enumerate(wls):
-                    dst.set_band_description(i + 1, wl)
-        fprog.unlink(missing_ok=True)
-        return fout
-
-    def clip_aoi(self, fglt, geometry, crs=None, scan0=None):
+    def clip_aoi(self, fglt, geometry, fout=None, crs=None, scan0=None, row_block=None, full_bands=True):
         """Clip the cube by geometry polygon and write the projected AOI GeoTIFF using the GLT.
 
-        Assumes `geometry` AOI is small. It is reprojected to the GLT's CRS, then finds the window 
+        Assumes `geometry` AOI is small. It is reprojected to the GLT's CRS, then finds the window
         it occupies and sets any GLT entry outside the polygon to null. Then `georef.apply_glt`
         resamples onto the AOI's grid. `scan0` defaults to the GLT's own build scan0.
 
+        Parameters
+        ----------
+        fout : str or Path, optional
+            If given, write the clip via `self._write` (band wavelength descriptions and attrs-as-
+            tags, same as `save()`) and return the path instead of the DataArray. `.rio.to_raster`
+            skips that metadata, so prefer this over calling it directly on the returned DataArray.
+        full_bands : bool
+            When writing (`fout` given), reindex onto the full 1..256 IIRS band range first,
+            NaN-filling any band `self.img` doesn't hold, so band position always matches the real
+            IIRS band number and wavelength. Default True. No effect on the returned DataArray.
+
         Returns
         -------
-        xarray.DataArray
-            (band, y, x) cube on the AOI's map grid, crs/transform set, ready for
-            `.rio.to_raster(fout)`.
+        xarray.DataArray or str
+            (band, y, x) cube on the AOI's map grid, crs/transform set. Or, if `fout` is given,
+            the path written.
         """
         from rasterio.features import geometry_mask, geometry_window
         from rasterio.warp import transform_geom
@@ -421,7 +464,10 @@ class IIRSData(ABC):
         if "wl" in self.img.coords:
             da = da.assign_coords(wl=("band", self.img.wl.values))
         da.attrs = dict(self.img.attrs)
-        return da.rio.write_crs(glt_crs).rio.write_transform(crop_transform)
+        da = da.rio.write_crs(glt_crs).rio.write_transform(crop_transform)
+        if fout is None:
+            return da
+        return _write_camera_product(_expand_to_full_bands(da) if full_bands else da, fout, row_block)
 
     @abstractmethod
     def plot(self, band=12, yrange=(None, None), xrange=(None, None), **kwargs):
