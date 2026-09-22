@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from math import ceil
 from functools import lru_cache
 from itertools import pairwise
 from pathlib import Path
@@ -335,12 +336,11 @@ def _even_chunks(length_m: float, width_range_km: tuple[float, float], overlap_f
     lo_m, hi_m = width_range_km[0] * 1000, width_range_km[1] * 1000
     if length_m <= hi_m:
         return [(0.0, length_m)]
-    n = 2
-    while True:
-        w = length_m / (1 + (n - 1) * (1 - overlap_frac))
-        if lo_m <= w <= hi_m:
-            break
-        n += 1
+    # smallest n whose width is <= hi_m; w(n) is monotonically decreasing so a search for
+    # lo_m <= w <= hi_m can step clean over a narrow window and never terminate (or land on
+    # a degenerate n) -- solve directly instead.
+    n = max(2, ceil((length_m / hi_m - 1) / (1 - overlap_frac) + 1))
+    w = length_m / (1 + (n - 1) * (1 - overlap_frac))
     step = w * (1 - overlap_frac)
     return [(i * step, min(i * step + w, length_m)) for i in range(n)]
 
