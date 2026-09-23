@@ -62,10 +62,10 @@ def _topo_info(ftopo: Path | None) -> dict:
     return {"path": str(ftopo), "bands_used": t.get("bands_used"), "n_pieces": t.get("n_pieces")}
 
 
-def _solve_quality(fgcps: Path) -> dict:
-    """converged/corr/n_merged_gcps/overlap agreement from the solve's own summary.json, if kept
+def _solve_quality(fgcps: Path, group: str) -> dict:
+    """converged/corr/n_merged_gcps/overlap agreement from the solve's own summary json, if kept
     next to the GCPs -- so a suspect refl product points at the registration it was built on."""
-    fsummary = fgcps.parent / "summary.json"
+    fsummary = fgcps.parent / f"georef_solve_summary_{ck.GROUP_SHORT[group]}.json"
     if not fsummary.exists():
         return {}
     s = json.loads(fsummary.read_text())
@@ -265,7 +265,7 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
         "resources": resources,
         "gcps": str(fgcps),
         "n_gcps": len(gcps),
-        "solve_quality": _solve_quality(fgcps),
+        "solve_quality": _solve_quality(fgcps, group),
         "lat_range": list(lat_range),
         "bands": bands,
         "thermal_corr": args.thermal_corr,

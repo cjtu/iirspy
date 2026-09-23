@@ -60,6 +60,21 @@ LONLAT = CRS.from_authority("IAU", "30100")
 STEREO = CRS.from_wkt(utils.IIRS_PROJ_DICT["polarstereographicsouthpole"])
 TO_STEREO = Transformer.from_crs(LONLAT, STEREO, always_xy=True)
 TO_LONLAT = Transformer.from_crs(STEREO, LONLAT, always_xy=True)
+GEOCENTRIC = CRS.from_proj4(f"+proj=geocent +a={MOON_RADIUS_M} +b={MOON_RADIUS_M} +units=m +no_defs")
+TO_XYZ = Transformer.from_crs(LONLAT, GEOCENTRIC, always_xy=True)
+FROM_XYZ = Transformer.from_crs(GEOCENTRIC, LONLAT, always_xy=True)
+
+
+def lonlat_to_xyz(lon, lat, radius=MOON_RADIUS_M):
+    """Body-fixed XYZ [m] from lon/lat [deg] + radius [m], on the IAU Moon sphere."""
+    height = np.broadcast_to(np.asarray(radius) - MOON_RADIUS_M, np.shape(lon))
+    return TO_XYZ.transform(lon, lat, height)
+
+
+def xyz_to_lonlat(x, y, z):
+    """(lon [deg], lat [deg], radius [m]) from body-fixed XYZ [m]."""
+    lon, lat, h = FROM_XYZ.transform(x, y, z)
+    return lon, lat, np.asarray(h) + MOON_RADIUS_M
 
 
 @lru_cache
@@ -77,6 +92,11 @@ def to_stereo(pole: str = "south") -> Transformer:
 @lru_cache
 def to_lonlat(pole: str = "south") -> Transformer:
     return Transformer.from_crs(stereo_crs(pole), LONLAT, always_xy=True)
+
+
+def xy_to_lonlat(x, y, pole: str = "south"):
+    """lon/lat [deg] from a group's projected (x, y) [m]; thin wrapper on `to_lonlat`."""
+    return to_lonlat(pole).transform(x, y)
 
 
 @dataclass
@@ -687,7 +707,7 @@ def save_topo(fout, slope, aspect, lit, tags=None, sun_az=None, sun_elev=None):
     No CRS or transform -- this is camera space, and iirspy.photometry.load_topo matches it to the
     L1 cube by shape. Small enough (a few MB) to ship beside every L1.
     """
-    bands = [("slope", slope), ("aspect", aspect), ("lit", lit)]
+    bands = [("slope", slope), ("aspect", aspect), ("lit_frac", lit)]
     if sun_az is not None:
         sun_az, sun_elev = np.asarray(sun_az), np.asarray(sun_elev)
         if sun_az.ndim == 1:
@@ -1848,6 +1868,107 @@ def scene_glt(sid, group, gcps, cfg, scan0, glt_dir, overwrite=False) -> Path:
     cam = (int(max(g.row for g in gcps)) + 1, int(max(g.col for g in gcps)) + 1)
     table = make_glt(gcps, cfg, cam, scan0=scan0)
     return save_glt(f, table, cfg, sid, group, scan0, cfg.lat_band, cam, n_gcps=len(gcps))
+
+
+def glt_from_loc(loc: xr.Dataset, group: str, cfg, window=None) -> tuple[np.ndarray, rasterio.Affine]:
+    """GLT on `cfg`'s AOI grid from a `read_loc`-style dataset, by the same "which camera pixel
+    lands on this map pixel" semantics as `scene_glt`: a nearest-neighbour inverse (KD-tree query
+    per output pixel against every valid camera pixel's projected (x, y) in `group`'s stereo CRS).
+
+    Query cutoff is half the camera pixel's own diagonal (99th-percentile row/col neighbour
+    spacing in `loc`, not `cfg.ps`), so every output cell whose centre falls inside the camera
+    footprint gets its nearest camera pixel and cells outside come back `NODATA`.
+    """
+    (ny, nx), tr = window_of(cfg, window)
+    lon, lat = loc.lon.values, loc.lat.values
+    x, y = to_stereo(group).transform(lon, lat)
+    x, y = np.asarray(x), np.asarray(y)
+    valid = np.isfinite(x) & np.isfinite(y)
+    rr, cc = np.where(valid)
+    abs_rows = np.asarray(loc.y.values)[rr]
+    cam_cols = np.asarray(loc.x.values)[cc]
+    tree = cKDTree(np.stack([x[valid], y[valid]], axis=1))
+
+    row_step = np.nanpercentile(np.hypot(*np.diff(np.stack([x, y]), axis=1)), 99) if x.shape[0] > 1 else 0.0
+    col_step = np.nanpercentile(np.hypot(*np.diff(np.stack([x, y]), axis=2)), 99) if x.shape[1] > 1 else 0.0
+    cutoff = max(0.5 * float(np.hypot(row_step, col_step)), cfg.ps)
+
+    xs = tr.c + (np.arange(nx) + 0.5) * tr.a
+    ys = tr.f + (np.arange(ny) + 0.5) * tr.e
+    gx, gy = np.meshgrid(xs, ys)
+    _, idx = tree.query(np.stack([gx.ravel(), gy.ravel()], axis=1), distance_upper_bound=cutoff)
+
+    out = np.full((2, ny * nx), NODATA, "int32")
+    inside = idx < len(abs_rows)
+    out[0, inside] = cam_cols[idx[inside]]
+    out[1, inside] = abs_rows[idx[inside]]
+    return out.reshape(2, ny, nx), tr
+
+
+def pole_from_crs(crs) -> str:
+    """Which of the three IIRS projected CRSs `crs` is ("south", "north", or "equatorial").
+
+    Raises ValueError if `crs` matches none of them.
+    """
+    crs = CRS.from_user_input(crs)
+    for pole in ("south", "north", "equatorial"):
+        if crs == stereo_crs(pole):
+            return pole
+    raise ValueError(f"{crs} is not one of the IIRS projected CRSs (south/north polar stereo, equatorial cylindrical)")
+
+
+def geoloc_vrt(cube_path, loc: xr.Dataset, crs, out_dir) -> Path:
+    """Write `loc`'s (lon, lat) reprojected into `crs` as a 2-band float64 GeoTIFF, then a VRT
+    over `cube_path` with a GEOLOCATION metadata domain pointing at it (pixel/line offset 0,
+    step 1). GDAL's geolocation warp needs the array in the target CRS rather than lon/lat,
+    since the inverse search breaks down near the poles where a degree of longitude collapses
+    to a few metres. `loc` must cover `cube_path`'s grid 1:1 (same shape and origin).
+    """
+    import xml.etree.ElementTree as ET
+
+    cube_path = Path(cube_path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(cube_path) as src:
+        ny, nx, count, dtype = src.height, src.width, src.count, src.dtypes[0]
+    if loc.lon.shape != (ny, nx):
+        raise ValueError(f"loc shape {loc.lon.shape} != {cube_path} shape {(ny, nx)}")
+
+    pole = pole_from_crs(crs)
+    x, y = to_stereo(pole).transform(loc.lon.values, loc.lat.values)
+    fgeo = out_dir / f"{cube_path.stem}_geoloc.tif"
+    with rasterio.open(fgeo, "w", driver="GTiff", height=ny, width=nx, count=2, dtype="float64") as dst:
+        dst.write(np.asarray(x, dtype="float64"), 1)
+        dst.write(np.asarray(y, dtype="float64"), 2)
+        dst.set_band_description(1, "x")
+        dst.set_band_description(2, "y")
+
+    root = ET.Element("VRTDataset", rasterXSize=str(nx), rasterYSize=str(ny))
+    meta = ET.SubElement(root, "Metadata", domain="GEOLOCATION")
+    fields = {
+        "SRS": CRS.from_user_input(crs).to_wkt(),
+        "X_DATASET": str(fgeo),
+        "X_BAND": "1",
+        "Y_DATASET": str(fgeo),
+        "Y_BAND": "2",
+        "PIXEL_OFFSET": "0",
+        "LINE_OFFSET": "0",
+        "PIXEL_STEP": "1",
+        "LINE_STEP": "1",
+    }
+    for k, v in fields.items():
+        ET.SubElement(meta, "MDI", key=k).text = v
+    for b in range(1, count + 1):
+        band = ET.SubElement(root, "VRTRasterBand", dataType=dtype.capitalize(), band=str(b))
+        src_el = ET.SubElement(band, "SimpleSource")
+        ET.SubElement(src_el, "SourceFilename", relativeToVRT="0").text = str(cube_path)
+        ET.SubElement(src_el, "SourceBand").text = str(b)
+        for tag in ("SrcRect", "DstRect"):
+            ET.SubElement(src_el, tag, xOff="0", yOff="0", xSize=str(nx), ySize=str(ny))
+
+    out = out_dir / f"{cube_path.stem}_geoloc.vrt"
+    out.write_bytes(ET.tostring(root))
+    return Path(out)
 
 
 def _gcps_and_aoi(fgcps: Path) -> tuple[list[GroundControlPoint], tuple[float, float, float, float]]:

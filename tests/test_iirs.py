@@ -46,14 +46,14 @@ def test_geotiff_write_resumes_from_progress_sidecar(tmp_path):
     import rasterio
     import xarray as xr
 
-    from iirspy.iirs import IIRSData
+    from iirspy.iirs import _save_geotiff
 
     ny, block = 12, 4
     data = np.arange(2 * ny * 3, dtype="float32").reshape(2, ny, 3)
     da = xr.DataArray(data, dims=("band", "y", "x"), coords={"band": [10, 20]}).rio.write_crs("EPSG:4326")
     fout = tmp_path / "cube.tif"
 
-    IIRSData._save_geotiff(None, str(fout), block, da)
+    _save_geotiff(str(fout), block, da)
     fprog = tmp_path / "cube.tif.progress"
     assert not fprog.exists()  # a finished write leaves no sidecar behind
     with rasterio.open(fout) as src:
@@ -67,7 +67,7 @@ def test_geotiff_write_resumes_from_progress_sidecar(tmp_path):
         dst.write(np.zeros((2, block, 3), "float32"), window=rasterio.windows.Window(0, 2 * block, 3, block))
     fprog.write_text(json.dumps({"shape": [2, ny, 3], "row_block": block, "rows_done": 2 * block}))
 
-    IIRSData._save_geotiff(None, str(fout), block, da)
+    _save_geotiff(str(fout), block, da)
     with rasterio.open(fout) as src:
         got = src.read()
     assert not got[:, :block].any()  # block 0 skipped, still poisoned
@@ -114,60 +114,56 @@ def test_empirical_sidecar_roundtrips_dark_flat_smile(tmp_path):
 
 
 def test_clip_aoi_warps_onto_the_map_grid_and_matches_a_polygon_masked_apply_glt(tmp_path):
-    """`clip_aoi` must equal `apply_glt` run on a GLT window whose out-of-polygon cells were
-    nulled first, and come back with its own crs/transform -- no GCP sidecar needed."""
-    from types import SimpleNamespace
+    from types import MethodType, SimpleNamespace
 
     import numpy as np
-    import rasterio
+    import pytest
     import xarray as xr
-    from rasterio.control import GroundControlPoint
-    from rasterio.features import geometry_mask, geometry_window
+    from rasterio.features import geometry_mask
     from rasterio.warp import transform_geom
 
     from iirspy import georef
     from iirspy.iirs import IIRSData
 
-    cfg = georef.GeorefConfig(aoi=(0.0, 0.0, 4000.0, 4000.0), ps=40.0)
-    ny, nx = 60, 20
-    gcps = [
-        GroundControlPoint(row=float(r), col=float(c), x=500.0 + 30.0 * c, y=3500.0 - 50.0 * r)
-        for r in np.arange(0, ny, 5)
-        for c in np.arange(0, nx, 2)
-    ]
-    glt = georef.make_glt(gcps, cfg, (ny, nx))
-    fglt = georef.save_glt(
-        tmp_path / "glt.tif",
-        glt,
-        cfg,
-        sid="sid",
-        group="south",
-        scan0=0,
-        lat_range=(-90.0, -60.0),
-        camera_shape=(ny, nx),
+    ny, nx = 10, 8
+    rows, cols = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
+    x, y = 500.0 + 30.0 * cols, 3500.0 - 50.0 * rows
+    lon, lat = georef.xy_to_lonlat(x, y, "south")
+    loc = xr.Dataset(
+        {"lon": (("y", "x"), lon), "lat": (("y", "x"), lat)},
+        coords={"y": np.arange(ny), "x": np.arange(nx)},
     )
 
     cube = np.arange(ny * nx, dtype="float32").reshape(1, ny, nx)
     img = xr.DataArray(cube, dims=("band", "y", "x"), coords={"band": [1]})
-    inst = SimpleNamespace(img=img)
+    inst = SimpleNamespace(img=img, _loc_cache=loc)
+    inst.glt = MethodType(IIRSData.glt, inst)
+    inst._cube_scan0 = MethodType(IIRSData._cube_scan0, inst)
+    inst._read_loc = MethodType(IIRSData._read_loc, inst)
+    inst.clip_aoi = MethodType(IIRSData.clip_aoi, inst)
 
-    with rasterio.open(fglt) as src:
-        crs_wkt = src.crs.to_wkt()
+    crs = georef.stereo_crs("south")
+    x0, y0, x1, y1 = 500.0, 3000.0, 800.0, 3400.0
+    corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+    geom_lonlat = {
+        "type": "Polygon",
+        "coordinates": [[georef.to_lonlat("south").transform(px, py) for px, py in corners]],
+    }
 
-    x0, y0, x1, y1 = 900.0, 2900.0, 1400.0, 3400.0
-    geom = {"type": "Polygon", "coordinates": [[(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]]}
+    out = inst.clip_aoi(geom_lonlat, crs, res=40.0)
 
-    out = IIRSData.clip_aoi(inst, fglt, geom, crs=crs_wkt)
-
-    with rasterio.open(fglt) as src:
-        want_geom = transform_geom(crs_wkt, src.crs, geom)
-        window = geometry_window(src, [want_geom])
-        sub_glt = src.read(window=window)
-        crop_transform = src.window_transform(window)
-    poly_mask = geometry_mask([want_geom], out_shape=sub_glt.shape[1:], transform=crop_transform, invert=True)
-    sub_glt[0][~poly_mask] = georef.NODATA
-    want = georef.apply_glt(cube, sub_glt, cube_scan0=0)
+    want_geom = transform_geom(georef.LONLAT, crs, geom_lonlat)
+    gxs, gys = zip(*want_geom["coordinates"][0], strict=False)
+    table, tr = inst.glt(crs, 40.0, bounds=(min(gxs), min(gys), max(gxs), max(gys)))
+    poly_mask = geometry_mask([want_geom], out_shape=table.shape[1:], transform=tr, invert=True)
+    table[0][~poly_mask] = georef.NODATA
+    want = georef.apply_glt(cube, table, cube_scan0=0)
 
     np.testing.assert_array_equal(out.values, want)
-    assert out.rio.crs == rasterio.CRS.from_wkt(crs_wkt)
-    assert out.rio.transform() == crop_transform
+    from pyproj import Transformer
+
+    out_x, out_y = Transformer.from_crs(georef.LONLAT, out.rio.crs, always_xy=True).transform(45.0, -80.0)
+    want_x, want_y = georef.to_stereo("south").transform(45.0, -80.0)
+    assert out_x == pytest.approx(want_x, abs=1e-6)
+    assert out_y == pytest.approx(want_y, abs=1e-6)
+    assert out.rio.transform() == tr

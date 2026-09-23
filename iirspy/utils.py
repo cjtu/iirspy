@@ -2,6 +2,7 @@ import hashlib
 import re
 import warnings
 import zipfile
+from importlib import metadata
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,10 @@ INVALID = (*range(1, 7), *range(252, 257))  # Invalid band list
 RAD_NATIVE_SCALE = 0.01  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
 E1_EXPOSURE_MS = 1.0  # exposure duration the e1g2 gain LUT was measured at (see get_gain_offset)
 AU_KM = 1.495978707e8
+try:
+    IIRSPY_VERSION = metadata.version("iirspy")
+except metadata.PackageNotFoundError:  # running from a source tree not pip-installed
+    IIRSPY_VERSION = "0+source"
 
 
 ## Reflectance corr
@@ -714,42 +719,93 @@ def iirsbasename(input_str):
     return match.group()
 
 
+def _iirs_basename(img_path_obj):
+    """Return IIRS basename e.g. 20210122T0920157625 from pathlib path."""
+    return img_path_obj.stem.split("_")[3]
+
+
+def _find_direct(ddir, subdir, ext, bnames):
+    """Fast lookup under IIRS archive path: `<ddir>/<subdir>/<sid[:8]>/*.<ext>`."""
+    found: dict[str, Path] = {}
+    for sid in bnames:
+        date_dir = Path(ddir) / subdir / sid[:8]
+        if date_dir.is_dir():
+            for f in date_dir.glob(f"*.{ext}"):
+                if _iirs_basename(f) == sid:
+                    found[sid] = f
+    return found
+
+
+def _find_flat(ddir, ext, wanted):
+    """Fast lookup for files dropped directly in `ddir` instead of the normal tree."""
+    return {b: f for f in Path(ddir).glob(f"*.{ext}") if f.is_file() and (b := _iirs_basename(f)) in wanted}
+
+
+def _find_recursive(ddir, subdir, ext, wanted):
+    """Slow full recursive walk search for missing files (last resort)."""
+    return {b: f for f in Path(ddir).glob(f"**/{subdir}/**/*.{ext}") if (b := _iirs_basename(f)) in wanted}
+
+
+def _find_reprocessed(ddir, subdir, bnames, filename):
+    """O(1) lookup for reprocessed per-sid products at `<ddir>/<subdir>/<sid[:8]>/<sid>/<filename(sid)>`
+    (no group in the path)."""
+    found: dict[str, Path] = {}
+    for sid in bnames:
+        f = Path(ddir) / subdir / sid[:8] / sid / filename(sid)
+        if f.is_file():
+            found[sid] = f
+    return found
+
+
+def _find_by_basename(ddir, subdir, ext, bnames):
+    """Look up each sid in `bnames`, cheapest strategy first (see `_find_direct`/`_find_flat`/
+    `_find_recursive`), only escalating for sids the previous tier didn't find."""
+    found = _find_direct(ddir, subdir, ext, bnames)
+    missing = [sid for sid in bnames if sid not in found]
+    if missing:
+        found.update(_find_flat(ddir, ext, missing))
+        missing = [sid for sid in bnames if sid not in found]
+    if missing:
+        found.update(_find_recursive(ddir, subdir, ext, missing))
+    return found
+
+
+def _resolve_ext(ddir, ext, level, bnames):
+    """Every path `get_iirs_paths` knows how to locate for one `ext` at one `level`."""
+    LVL2DIR = {0: "raw", 1: "calibrated", 2: "derived"}
+    if ext == "gcps":
+        return _find_reprocessed(ddir, "geometry/recalibrated", bnames, lambda s: f"{s}.gcps")
+    if ext in ("loc", "obs"):
+        return _find_reprocessed(ddir, "geometry/recalibrated", bnames, lambda s, e=ext: f"{s}_{e}.tif")
+    if ext == "tif":
+        suffix = "l1_rad" if level == 1 else "l2_refl"
+        return _find_reprocessed(ddir, "data/recalibrated", bnames, lambda s, suf=suffix: f"{s}_{suf}.tif")
+    if ext in ("png", "xml-png"):
+        subdir = "browse/" + LVL2DIR[level]
+    elif ext in ("hdr", "qub", "xml"):
+        subdir = "data/" + LVL2DIR[level]
+    elif ext in ("csv", "xml-csv"):
+        subdir = "geometry/calibrated"
+    elif ext in ("lbr", "oat", "oath", "spm"):
+        subdir = "miscellaneous/" + LVL2DIR[level]
+    else:
+        raise ValueError(f"Unknown IIRS file extension: {ext}")
+    return _find_by_basename(ddir, subdir, ext.split("-")[0], bnames)
+
+
 def get_iirs_paths(
     ddir,
+    basenames,
     exts=("qub", "hdr", "xml", "csv", "xml-csv", "lbr", "oat", "oath", "spm", "png", "xml-png"),
     level=1,
-    basenames=None,
 ):
-    """Return a list of paths to IIRS image, geom, and misc files."""
-
-    def basename(img_path_obj):
-        """Return IIRS basename e.g. 20210122T0920157625 from pathlib path."""
-        return img_path_obj.stem.split("_")[3]
-
-    LVL2DIR = {0: "raw", 1: "calibrated", 2: "derived"}
+    """Return a list of paths to IIRS image, geom, and misc files for the given sids."""
     out: dict[str, Any] = {}
+    bnames = [basenames] if isinstance(basenames, str) else list(basenames)
     for ext in exts:
-        subdir = "."
-        if ext in ("png", "xml-png"):
-            subdir = "browse/" + LVL2DIR[level]
-        elif ext in ("hdr", "qub", "xml"):
-            subdir = "data/" + LVL2DIR[level]
-        elif ext in ("csv", "xml-csv"):
-            subdir = "geometry/calibrated"
-        elif ext in ("lbr", "oat", "oath", "spm"):
-            subdir = "miscellaneous/" + LVL2DIR[level]
-        else:
-            raise ValueError(f"Unknown IIRS file extension: {ext}")
-        paths = Path(ddir).glob(f"**/{subdir}/**/*.{ext.split('-')[0]}")
-
-        if basenames is not None:
-            basenames = [basenames] if isinstance(basenames, str) else basenames
-            out[ext] = {basename(f): f for f in paths if basename(f) in basenames}
-        else:
-            out[ext] = {basename(f): f for f in paths}
-        # Drop this entry from dict if it is empty
-        if not out[ext]:
-            del out[ext]
+        found = _resolve_ext(ddir, ext, level, bnames)
+        if found:
+            out[ext] = found
     # Add list of basenames to dict
     if "qub" in out:
         out["imgs"] = list(out["qub"].keys())
@@ -1260,52 +1316,101 @@ def write_envi(da, fout):
 
 
 ## ENVI BIL streaming writer
-def write_envi_hdr(fhdr, nx, ny, nband, wls, description="IIRS", bands=None, x_start=1, y_start=1):
-    """Write an ENVI header for a float32 BIL cube (data type 4, little-endian).
+ENVI_DTYPE_CODES = {"uint8": 1, "int16": 2, "int32": 3, "float32": 4, "float64": 5, "uint16": 12}
+
+
+def write_envi_hdr(
+    fhdr,
+    nx,
+    ny,
+    nband,
+    wls,
+    description="IIRS",
+    bands=None,
+    x_start=1,
+    y_start=1,
+    dtype="float32",
+    band_names=None,
+    extra_tags=None,
+):
+    """Write an ENVI header for a BIL cube.
 
     `bands` are the IIRS band numbers of the planes (default 1..nband); they go in `band names` so
-    a band subset reads back as itself rather than 1..N. `x_start`/`y_start` are the 1-indexed
-    sample/line of this crop in the parent scene: ENVI carries no transform, so they are the only
-    place a crop's absolute position survives (GeoTIFF uses the geotransform instead).
+    a band subset reads back as itself rather than 1..N, unless `band_names` (arbitrary strings,
+    e.g. a backplane's own per-band names) overrides them -- that also drops the wavelength lines,
+    since a non-wavelength product has none. `x_start`/`y_start` are the 1-indexed sample/line of
+    this crop in the parent scene: ENVI carries no transform, so they are the only place a crop's
+    absolute position survives (GeoTIFF uses the geotransform instead). `extra_tags` (scalar
+    provenance attrs) are written as extra header keys; GDAL surfaces unknown ENVI header keys as
+    dataset metadata, so this keeps ENVI output as provenance-rich as GeoTIFF tags.
     """
-    bands = range(1, nband + 1) if bands is None else bands
-    band_names = ", ".join(str(int(b)) for b in bands)
-    wl_str = ", ".join(f"{float(w):.4f}" for w in wls)
+    dtype_code = ENVI_DTYPE_CODES[str(np.dtype(dtype))]
+    if band_names is not None:
+        names = ", ".join(str(n) for n in band_names)
+        wl_lines = ""
+    else:
+        bands = range(1, nband + 1) if bands is None else bands
+        names = ", ".join(str(int(b)) for b in bands)
+        if wls is None:
+            wl_lines = ""
+        else:
+            wl_str = ", ".join(f"{float(w):.4f}" for w in wls)
+            wl_lines = f"wavelength units = Nanometers\nwavelength = {{{wl_str}}}\n"
+    extra_lines = "".join(f"{k} = {v}\n" for k, v in (extra_tags or {}).items())
     Path(fhdr).write_text(
         "ENVI\n"
         f"description = {{ {description} }}\n"
         f"samples = {nx}\nlines = {ny}\nbands = {nband}\n"
         "header offset = 0\nfile type = ENVI Standard\n"
-        "data type = 4\ninterleave = bil\nbyte order = 0\n"
+        f"data type = {dtype_code}\ninterleave = bil\nbyte order = 0\n"
         f"x start = {int(x_start)}\ny start = {int(y_start)}\n"
-        "wavelength units = Nanometers\n"
-        f"band names = {{{band_names}}}\n"
-        f"wavelength = {{{wl_str}}}\n"
+        f"band names = {{{names}}}\n"
+        f"{wl_lines}{extra_lines}"
     )
 
 
-def _write_bil_rows(f, da, i0, i1, sub_rows):
-    """Stream rows [i0:i1) of a (band, y, x) DataArray to open file f as ENVI BIL float32."""
+def _write_bil_rows(f, da, i0, i1, sub_rows, dtype="float32"):
+    """Stream rows [i0:i1) of a (band, y, x) DataArray to open file f as ENVI BIL."""
     for a in range(i0, i1, sub_rows):
         b = min(a + sub_rows, i1)
-        blk = np.asarray(da.isel(y=slice(a, b)).values, dtype="float32")  # (band, rows, x)
+        blk = np.asarray(da.isel(y=slice(a, b)).values, dtype=dtype)  # (band, rows, x)
         blk.transpose(1, 0, 2).tofile(f)  # C-order of (row, band, x) == ENVI BIL
 
 
 def write_envi_bil(da, fout, sub_rows, description="IIRS"):
-    """Sequentially stream a (band, y, x) DataArray to an ENVI BIL float32 file (bounded memory).
+    """Sequentially stream a (band, y, x) DataArray to an ENVI BIL file (bounded memory).
 
+    Integer dtypes are written as-is (e.g. QA's uint16); everything else is written float32.
     `sub_rows` is required: it is resolved once in `IIRSData._write`, so no second default can
     drift away from the cube's dask chunking.
     """
     fout = str(fout)
     nband, ny, nx = da.shape
+    dtype = str(da.dtype) if np.issubdtype(da.dtype, np.integer) else "float32"
     with open(fout, "wb") as f:
-        _write_bil_rows(f, da, 0, ny, sub_rows)
-    wls = da.wl.values if "wl" in da.coords else np.arange(1, nband + 1)
+        _write_bil_rows(f, da, 0, ny, sub_rows, dtype)
+    has_wl = "wl" in da.coords
+    wls = da.wl.values if has_wl else None
+    band_names = None if has_wl else da.coords.get("band_name")
+    if band_names is not None:
+        band_names = [str(n) for n in band_names.values]
     # Pixel centres (n + 0.5) -> ENVI's 1-indexed sample/line of the crop's upper-left pixel
     x_start, y_start = (int(np.floor(float(da[d].min()))) + 1 for d in ("x", "y"))
-    write_envi_hdr(Path(fout).with_suffix(".hdr"), nx, ny, nband, wls, description, da.band.values, x_start, y_start)
+    extra_tags = {k: v for k, v in da.attrs.items() if isinstance(v, str | int | float | bool)}
+    write_envi_hdr(
+        Path(fout).with_suffix(".hdr"),
+        nx,
+        ny,
+        nband,
+        wls,
+        description,
+        da.band.values,
+        x_start,
+        y_start,
+        dtype=dtype,
+        band_names=band_names,
+        extra_tags=extra_tags,
+    )
     return fout
 
 

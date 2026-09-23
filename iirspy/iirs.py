@@ -170,7 +170,7 @@ def _attach_empirical_frames(rad, dark, flat, smile, attach):
     )
 
 
-def _write_camera_product(da, fout, row_block=None):
+def _write_camera_product(da, fout, row_block=None, compress="ZSTD", predictor=None):
     """Format dispatch for any camera-space product: `.tif` -> GeoTIFF, else ENVI BIL.
 
     Module-level (not a method) so callers with just a DataArray -- not a full IIRSData instance
@@ -179,37 +179,48 @@ def _write_camera_product(da, fout, row_block=None):
     fout = str(fout)
     row_block = _row_block(da, row_block)
     if fout.lower().endswith(".tif"):
-        return _save_geotiff(fout, row_block, da)
+        return _save_geotiff(fout, row_block, da, compress=compress, predictor=predictor)
     return utils.write_envi_bil(da, fout, row_block, f"IIRS {da.attrs.get('name', '')}".strip())
 
 
-def _save_geotiff(fout, row_block, da):
-    """Write a float32 BigTIFF sequentially in windowed blocks (bounded memory).
+def _save_geotiff(fout, row_block, da, compress="ZSTD", predictor=None):
+    """Write a BigTIFF sequentially in windowed blocks (bounded memory).
 
     Restartable: each finished block records `rows_done` in a `<fout>.progress` sidecar, and a
     rerun of the same shape reopens the file and picks up there. A cluster task killed at its
     wall clock therefore loses one block, not the whole cube -- which for a long strip is the
     difference between a resumable requeue and starting the scene from zero.
+
+    Integer `da` (e.g. QA's uint16) keeps its own dtype and nodata from `da.attrs["nodata"]` (or
+    none); everything else writes float32 with NaN nodata. `compress`/`predictor` default to ZSTD
+    with predictor 2 (int) or 3 (float) -- not frozen, callers may override either.
     """
     from dask.diagnostics import ProgressBar
     from rasterio.windows import Window
 
     nband, ny, nx = da.shape
+    is_int = np.issubdtype(da.dtype, np.integer)
+    dtype = str(da.dtype) if is_int else "float32"
+    predictor = predictor if predictor is not None else (2 if is_int else 3)
+    nodata = da.attrs.get("nodata") if is_int else np.nan
     profile = {
         "driver": "GTiff",
         "height": ny,
         "width": nx,
         "count": nband,
-        "dtype": "float32",
-        "nodata": np.nan,
+        "dtype": dtype,
+        "nodata": nodata,
         "crs": da.rio.crs if da.rio.crs else None,
         "transform": da.rio.transform(),
-        "compress": "LZW",
+        "compress": compress,
+        "predictor": predictor,
         "tiled": True,
         "interleave": "band",  # per-band planes: viewers read one band without decompressing all 256
         "BIGTIFF": "YES",
     }
     wls = [f"{float(w):.2f}" for w in da.wl.values] if "wl" in da.coords else None
+    band_names = None if wls or "band_name" not in da.coords else da.coords["band_name"].values
+    band_units = None if band_names is None else da.coords["units"].values
     # Provenance: scalar attrs (incl. empirical_notes JSON) round-trip as GDAL metadata tags.
     # Drop stale band-count/name tags a source raster may carry in da.attrs (e.g. from GDAL
     # metadata on read) -- band_numbers/per-band descriptions below are the actual truth and
@@ -219,8 +230,10 @@ def _save_geotiff(fout, row_block, da):
         for k, v in da.attrs.items()
         if isinstance(v, str | int | float | bool) and k not in ("bands", "band_names")
     }
-    # Which IIRS bands these planes are: 1..256 on a full cube, arbitrary on a subset
-    tags["band_numbers"] = ",".join(str(int(b)) for b in da.band.values)
+    tags["PROVENANCE_IIRSPY_VERSION"] = utils.IIRSPY_VERSION
+    if wls:
+        # Which IIRS bands these planes are: 1..256 on a full cube, arbitrary on a subset
+        tags["band_numbers"] = ",".join(str(int(b)) for b in da.band.values)
     fprog = Path(str(fout) + ".progress")
     key = {"shape": [nband, ny, nx], "row_block": int(row_block)}
     y_start = _resume_row(fout, fprog, key)
@@ -230,7 +243,7 @@ def _save_geotiff(fout, row_block, da):
             dst.update_tags(**tags)
         for y0 in range(y_start, ny, row_block):
             y1 = min(y0 + row_block, ny)
-            block = da.isel(y=slice(y0, y1)).values.astype("float32", copy=False)
+            block = da.isel(y=slice(y0, y1)).values.astype(dtype, copy=False)
             dst.write(block, window=Window(0, y0, nx, y1 - y0))
             _write_json_atomic(fprog, {**key, "rows_done": y1})
         if wls:
@@ -239,6 +252,10 @@ def _save_geotiff(fout, row_block, da):
                 # Per-band "wavelength"/"wavelength_units" is the generic hyperspectral metadata
                 # GDAL/QGIS read for spectral band labels; description alone isn't.
                 dst.update_tags(i + 1, wavelength=wl, wavelength_units="Nanometers")
+        elif band_names is not None and band_units is not None:
+            for i, (name, unit) in enumerate(zip(band_names, band_units, strict=True)):
+                dst.set_band_description(i + 1, str(name))
+                dst.update_tags(i + 1, UNITS=str(unit), DEFINITION=f"{name} [{unit}]")
     fprog.unlink(missing_ok=True)
     return fout
 
@@ -371,6 +388,10 @@ class IIRSData(ABC):
         str : the path written.
         """
         fout = str(fout)
+        if self.level in (1, 2):
+            self.img.attrs.setdefault("IIRS_PRODUCT", "L1" if self.level == 1 else "L2")
+            self.img.attrs.setdefault("IIRS_FORMAT_VERSION", "1")
+            self.img.attrs.setdefault("IIRS_SID", self.basename)
         if snr_sidecar and "snr" in self.img.coords:
             self._save_snr_sidecar(fout, sub_rows)
         if empirical_sidecar and "empirical_flat" in self.img.coords:
@@ -378,9 +399,9 @@ class IIRSData(ABC):
         img = _expand_to_full_bands(self.img) if full_bands else self.img
         return self._write(img, fout, sub_rows)
 
-    def _write(self, da, fout, row_block=None):
+    def _write(self, da, fout, row_block=None, compress="ZSTD", predictor=None):
         """Format dispatch for any camera-space product: `.tif` -> GeoTIFF, else ENVI BIL."""
-        return _write_camera_product(da, fout, row_block)
+        return _write_camera_product(da, fout, row_block, compress=compress, predictor=predictor)
 
     def _save_snr_sidecar(self, fout, row_block=None):
         """Write the (y, x) empirical broadband SNR field beside fout, in fout's own format."""
@@ -403,68 +424,100 @@ class IIRSData(ABC):
         )
         return str(fnpz)
 
-    def clip_aoi(self, fglt, geometry, fout=None, crs=None, scan0=None, row_block=None, full_bands=True):
-        """Clip the cube by geometry polygon and write the projected AOI GeoTIFF using the GLT.
+    def _cube_scan0(self):
+        """Absolute scan row of this cube's first line.
 
-        Assumes `geometry` AOI is small. It is reprojected to the GLT's CRS, then finds the window
-        it occupies and sets any GLT entry outside the polygon to null. Then `georef.apply_glt`
-        resamples onto the AOI's grid. `scan0` defaults to the GLT's own build scan0.
-
-        Parameters
-        ----------
-        fout : str or Path, optional
-            If given, write the clip via `self._write` (band wavelength descriptions and attrs-as-
-            tags, same as `save()`) and return the path instead of the DataArray. `.rio.to_raster`
-            skips that metadata, so prefer this over calling it directly on the returned DataArray.
-        full_bands : bool
-            When writing (`fout` given), reindex onto the full 1..256 IIRS band range first,
-            NaN-filling any band `self.img` doesn't hold, so band position always matches the real
-            IIRS band number and wavelength. Default True. No effect on the returned DataArray.
-
-        Returns
-        -------
-        xarray.DataArray or str
-            (band, y, x) cube on the AOI's map grid, crs/transform set. Or, if `fout` is given,
-            the path written.
+        `self.img`'s `y` coord is never reset by cropping (`.sel`, not `.isel`), so the first
+        label is already the absolute scan row.
         """
-        from rasterio.features import geometry_mask, geometry_window
+        return int(self.img.y.values[0])
+
+    def _read_loc(self, group=None):
+        """This sid's `<sid>_loc.tif`, loaded via `utils.get_iirs_paths` and cached on the instance.
+
+        Raises FileNotFoundError if no LOC product exists yet.
+        """
+        if getattr(self, "_loc_cache", None) is None:
+            from iirspy import backplanes
+
+            paths = utils.get_iirs_paths(self.directory, level=self.level, basenames=[self.basename], exts=("loc",))
+            floc = paths.get("loc", {}).get(self.basename)
+            if floc is None:
+                raise FileNotFoundError(f"no <sid>_loc.tif for {self.basename} under {self.directory}")
+            self._loc_cache = backplanes.read_loc(floc)
+        return self._loc_cache
+
+    def glt(self, crs, res, bounds=None):
+        """(table, transform) GLT for this sid's whole strip on `crs` at `res` m/px.
+
+        `crs` must be one of the three IIRS projected CRSs (`georef.pole_from_crs`), since that
+        ties camera pixels to a group's own TPS. `bounds` defaults to the loc's own finite extent
+        in `crs`.
+        """
+        from iirspy import georef
+
+        group = georef.pole_from_crs(crs)
+        loc = self._read_loc(group)
+        if bounds is None:
+            x, y = georef.to_stereo(group).transform(loc.lon.values, loc.lat.values)
+            x, y = np.asarray(x), np.asarray(y)
+            finite = np.isfinite(x) & np.isfinite(y)
+            if not finite.any():
+                raise ValueError(f"{self.basename}'s loc has no finite (x, y) in {crs}")
+            bounds = (float(x[finite].min()), float(y[finite].min()), float(x[finite].max()), float(y[finite].max()))
+        cfg = georef.GeorefConfig(pole=group, aoi=tuple(bounds), ps=res)
+        return georef.glt_from_loc(loc, group, cfg)
+
+    def to_geotiff(self, fout, crs, res, bounds=None, bands=None, row_block=None, full_bands=True):
+        """Render `self.img` onto `crs` at `res` m/px (via `self.glt` + `georef.apply_glt`) and write it.
+
+        `bands` narrows which band numbers render; `full_bands` reindexes the output to the full
+        1..256 IIRS band range before writing.
+        """
+        from iirspy import georef
+
+        table, tr = self.glt(crs, res, bounds)
+        img = self.img if bands is None else self.img.sel(band=list(bands))
+        warped = georef.apply_glt(img.values, table, cube_scan0=self._cube_scan0())
+        da = xr.DataArray(warped, dims=("band", "y", "x"), coords={"band": img.band.values})
+        if "wl" in img.coords:
+            da = da.assign_coords(wl=("band", img.wl.values))
+        da.attrs = dict(self.img.attrs)
+        da = da.rio.write_crs(crs).rio.write_transform(tr)
+        return _write_camera_product(_expand_to_full_bands(da) if full_bands else da, fout, row_block)
+
+    def clip_aoi(self, geometry, crs, res, geom_crs=None, fout=None, row_block=None, full_bands=True):
+        """Render `self.img` clipped to a polygon `geometry`, via a GLT built from this sid's loc.
+
+        `geometry`'s bounding box in `crs` becomes the GLT's bounds to keep the render small, then
+        any GLT cell outside the true polygon (not just its bbox) is nulled before `apply_glt`
+        resamples. Returns the clipped `DataArray` if `fout` is None, else writes it and returns
+        the written path.
+        """
+        from rasterio.features import geometry_mask
         from rasterio.warp import transform_geom
 
         from iirspy import georef
 
-        crs = georef.LONLAT if crs is None else crs
-        with rasterio.open(fglt) as src:
-            geom = transform_geom(crs, src.crs, geometry)
-            window = geometry_window(src, [geom])
-            sub_glt = src.read(window=window)
-            crop_transform = src.window_transform(window)
-            glt_crs = src.crs
-            tags = {k: json.loads(v) for k, v in src.tags().items() if k in georef.TAG_KEYS}
+        geom_crs = georef.LONLAT if geom_crs is None else geom_crs
+        geom = transform_geom(geom_crs, crs, geometry)
+        xs, ys = zip(*geom["coordinates"][0], strict=False)
+        bounds = (min(xs), min(ys), max(xs), max(ys))
 
-        poly_mask = geometry_mask([geom], out_shape=sub_glt.shape[1:], transform=crop_transform, invert=True)
-        sub_glt[0][~poly_mask] = georef.NODATA  # outside the true polygon, not just its bbox
-        inside = sub_glt[0] >= 0
+        table, tr = self.glt(crs, res, bounds=bounds)
+        poly_mask = geometry_mask([geom], out_shape=table.shape[1:], transform=tr, invert=True)
+        table = table.copy()
+        table[0][~poly_mask] = georef.NODATA  # outside the true polygon, not just its bbox
+        inside = table[0] >= 0
         if not inside.any():
-            raise ValueError(f"no camera pixels of {fglt} fall within the given geometry")
+            raise ValueError(f"no camera pixels of {self.basename} fall within the given geometry")
 
-        cube_scan0 = tags["scan0"] if scan0 is None else scan0
-        cam_nrow, cam_ncol = self.img.sizes["y"], self.img.sizes["x"]
-        cam_rows = sub_glt[1][inside] - cube_scan0
-        cam_cols = sub_glt[0][inside]
-        cam_r0, cam_r1 = max(int(cam_rows.min()), 0), min(int(cam_rows.max()) + 1, cam_nrow)
-        cam_c0, cam_c1 = max(int(cam_cols.min()), 0), min(int(cam_cols.max()) + 1, cam_ncol)
-
-        sub_img = self.img.isel(y=slice(cam_r0, cam_r1), x=slice(cam_c0, cam_c1))
-        local_glt = sub_glt.copy()
-        local_glt[0] = np.where(inside, sub_glt[0] - cam_c0, sub_glt[0])
-        local_glt[1] = np.where(inside, sub_glt[1] - cube_scan0 - cam_r0, sub_glt[1])
-        warped = georef.apply_glt(sub_img.values, local_glt, cube_scan0=0)
-
+        warped = georef.apply_glt(self.img.values, table, cube_scan0=self._cube_scan0())
         da = xr.DataArray(warped, dims=("band", "y", "x"), coords={"band": self.img.band.values})
         if "wl" in self.img.coords:
             da = da.assign_coords(wl=("band", self.img.wl.values))
         da.attrs = dict(self.img.attrs)
-        da = da.rio.write_crs(glt_crs).rio.write_transform(crop_transform)
+        da = da.rio.write_crs(crs).rio.write_transform(tr)
         if fout is None:
             return da
         return _write_camera_product(_expand_to_full_bands(da) if full_bands else da, fout, row_block)

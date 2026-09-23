@@ -164,6 +164,9 @@ for _a, _ba in BANDS.items():
 
 GROUPS = ("south", "north", "equatorial")
 GROUP_PRIMARY_BAND = {"south": "south", "north": "north", "equatorial": "equatorial"}
+GROUP_SHORT = {"south": "south", "north": "north", "equatorial": "eq"}  # filename codes
+
+
 AOI_BUFFER_M = 15_000.0  # covers coarse_shift's bulk error plus the tie-point window half-width
 ROW_STEP = 25  # GCP lattice row spacing
 # Extra latitude kept in the L1 crop beyond the solved bands, so a swath shifted equatorward by the

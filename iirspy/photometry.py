@@ -153,7 +153,7 @@ def _sun_tags(attrs):
 def load_topo(topo, like=None):
     """(slope, aspect, lit, sun) from a camera-space topo product; `lit` is 1.0 when it has none.
 
-    `topo` is a raster written by iirspy.georef.save_topo (bands slope/aspect[/lit]), a tuple of
+    `topo` is a raster written by iirspy.georef.save_topo (bands slope/aspect[/lit_frac]), a tuple of
     those DataArrays, or a Dataset carrying them as variables. `lit` is the fraction of the solar
     disk the terrain leaves visible. `sun` is the (azimuth, elevation) the product's tags record,
     in the same tangent-plane frame as its slope and aspect, or None.
@@ -169,13 +169,13 @@ def load_topo(topo, like=None):
         sun = rest[1] if len(rest) > 1 else None
     elif isinstance(topo, xr.Dataset):
         slope, aspect = topo["slope"], topo["aspect"]
-        lit = topo.get("lit")
+        lit = topo.get("lit_frac")
         sun = _sun_tags(topo.attrs)
     else:
         da = topo if isinstance(topo, xr.DataArray) else xr.open_dataarray(topo, engine="rasterio")
-        names = [str(n) for n in np.atleast_1d(da.attrs.get("long_name", ["slope", "aspect", "lit"]))]
+        names = [str(n) for n in np.atleast_1d(da.attrs.get("long_name", ["slope", "aspect", "lit_frac"]))]
         pick = lambda n: da.isel(band=names.index(n), drop=True) if n in names else None
-        slope, aspect, lit = pick("slope"), pick("aspect"), pick("lit")
+        slope, aspect, lit = pick("slope"), pick("aspect"), pick("lit_frac")
         if slope is None or aspect is None:
             raise ValueError(f"topo product has bands {names}; need at least slope and aspect")
         sun_az, sun_elev = pick("sun_az"), pick("sun_elev")
