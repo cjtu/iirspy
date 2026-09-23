@@ -55,7 +55,7 @@ def make(cls, bands, directory):
 def test_roundtrip_preserves_bands_and_data(cls, ext, bands, tmp_path):
     inst = make(cls, bands, tmp_path)
     fout = tmp_path / f"roundtrip{ext}"
-    inst.save(fout, snr_sidecar=False)
+    inst.save(fout, snr_sidecar=False, full_bands=False)
 
     back = xr.open_dataarray(fout, engine="rasterio")
     np.testing.assert_allclose(back.values, inst.img.values, rtol=1e-6)
@@ -70,7 +70,7 @@ def test_roundtrip_preserves_bands_and_data(cls, ext, bands, tmp_path):
 def test_from_file_preserves_bands_wls_and_absolute_lines(bands, ext, tmp_path):
     inst = make(L1, bands, tmp_path)
     fout = tmp_path / f"roundtrip{ext}"
-    inst.save(fout, snr_sidecar=False)
+    inst.save(fout, snr_sidecar=False, full_bands=False)
 
     back = L1.from_file(fout, BASENAME, tmp_path)
     assert list(back.img.band.values) == bands

@@ -720,8 +720,10 @@ def iirsbasename(input_str):
 
 
 def _iirs_basename(img_path_obj):
-    """Return IIRS basename e.g. 20210122T0920157625 from pathlib path."""
-    return img_path_obj.stem.split("_")[3]
+    """Return IIRS basename e.g. 20210122T0920157625 from pathlib path, or None if the filename
+    doesn't follow the IIRS naming convention."""
+    parts = img_path_obj.stem.split("_")
+    return parts[3] if len(parts) > 3 else None
 
 
 def _find_direct(ddir, subdir, ext, bnames):
