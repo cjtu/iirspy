@@ -48,6 +48,21 @@ def test_indexing_through_the_glt_is_a_nearest_warp(tmp_path):
     np.testing.assert_array_equal(georef.apply_glt(cube, g), want)
 
 
+def test_glt_and_projection_are_unchanged_when_spilled_to_disk(tmp_path, monkeypatch):
+    """The memmap destination is uninitialised, so this also proves GDAL fills nodata itself."""
+    gcps, cube = _gcps(), _cube()
+    g_ram = georef.make_glt(gcps, CFG, (NY, NX))
+    p_ram = georef.project(cube, gcps, CFG)
+    monkeypatch.setattr(georef, "MAX_RAM_BYTES", 0)
+    monkeypatch.setenv("SLURM_TMPDIR", str(tmp_path))
+    g_disk = georef.make_glt(gcps, CFG, (NY, NX))
+    p_disk = georef.project(cube, gcps, CFG)
+    assert isinstance(g_disk, np.memmap) and isinstance(p_disk, np.memmap)
+    np.testing.assert_array_equal(g_disk, g_ram)
+    np.testing.assert_array_equal(p_disk, p_ram)
+    assert not list(tmp_path.iterdir())  # spill files are unlinked, not left behind
+
+
 def test_glt_marks_only_the_camera_footprint(tmp_path):
     """Nodata means "no camera pixel here", never "that pixel had no data" -- so one GLT serves L1,
     L2 and anything built later, each bringing its own NaN pattern."""

@@ -1048,9 +1048,7 @@ def _coreg_pass(gref, gtgt, cfg, max_shift_px, grid_res, transform, ref, bad_tgt
         min_reliability=cfg.min_reliability,
         tieP_filter_level=3,
         # arosics defaults `CPUs` to `multiprocessing.cpu_count()`, which reports the machine's
-        # cores and not the cgroup's -- inside a Slurm allocation that is the whole node (192 on
-        # Nibi) no matter how few `--cpus-per-task` were granted, so the default oversubscribes by
-        # ~50x and thrashes. `sched_getaffinity` is the count this process may actually use.
+        # cores and not the available cores on a cluster. Use `sched_getaffinity` instead.
         CPUs=len(os.sched_getaffinity(0)),
         **kw,
     )
@@ -1340,6 +1338,19 @@ def data_window(arr, pad=8):
     )
 
 
+def warp_destination(shape, dtype) -> np.ndarray:
+    """Uninitialised destination for a GDAL warp: in RAM up to `MAX_RAM_BYTES`, else a disk-backed
+    memmap in `$SLURM_TMPDIR` (local disk on a node; `/tmp` there may be RAM-backed and count against
+    `--mem`). Left uninitialised because `reproject`'s `init_dest_nodata` fills it with `dst_nodata`.
+    The spill file is unlinked on return and lives only as long as the array.
+    """
+    dtype = np.dtype(dtype)
+    if np.prod(shape) * dtype.itemsize <= MAX_RAM_BYTES:
+        return np.empty(shape, dtype)
+    with tempfile.NamedTemporaryFile(dir=os.environ.get("SLURM_TMPDIR")) as tmp:
+        return np.memmap(tmp.name, dtype=dtype, mode="w+", shape=shape)
+
+
 def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None, out=None, dst_nodata=np.nan):
     """One reproject of a camera-space band -- or a whole (band, y, x) cube -- onto the AOI grid.
 
@@ -1356,14 +1367,8 @@ def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None, out=No
     shape, tr = window_of(cfg, window)
     shape = np.shape(band)[:-2] + shape
     if out is None:
-        # One call keeps the TPS solve to one, but a full AOI cube is multiple GB, so spill past
-        # MAX_RAM_BYTES. Left uninitialised: GDAL's INIT_DEST=NO_DATA fills the whole destination.
-        if np.prod(shape) * 4 > MAX_RAM_BYTES:
-            tmp = tempfile.NamedTemporaryFile(suffix=".f32", delete=False)  # noqa: SIM115
-            out = np.memmap(tmp.name, dtype="float32", mode="w+", shape=shape)
-            Path(tmp.name).unlink()  # unlinked but held open: the pages die with the array
-        else:
-            out = np.empty(shape, "float32")
+        # One call keeps the TPS solve to one, even for a multi-GB AOI cube.
+        out = warp_destination(shape, "float32")
     reproject(
         source=band,
         destination=out,
@@ -1751,7 +1756,8 @@ def make_glt(gcps, cfg, camera_shape, scan0=0, window=None) -> np.ndarray:
     shape, _ = window_of(cfg, window)
     # Nearest resampling copies whole-number camera indices exactly, so GDAL can cast and fill
     # NODATA straight into one int32 buffer -- no separate float `warped` array or isfinite mask.
-    out = np.full((2, *shape), NODATA, "int32")
+    # A near-pole-to-pole equatorial strip's AOI grid alone can exceed a solve's --mem.
+    out = warp_destination((2, *shape), "int32")
     project(np.stack([cols, rows]), gcps, cfg, resampling=Resampling.nearest, window=window, out=out, dst_nodata=NODATA)
     return out
 
