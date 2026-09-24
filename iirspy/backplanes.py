@@ -152,17 +152,15 @@ def _group_loc_core(gcps: dict, group: str, nrow: int | None = None, ncol: int |
     return lon, lat, radius
 
 
-def _tie_point_residual(sid: str, groups: list[str], fit_dir: Path | None = None) -> dict[str, float] | None:
-    """Aggregate p50/p95 tie-point residual [m] across every chunk fit json under `groups`' own
-    solve dirs, or `None` if no `<sid>_<group>_chunk*_fit.json` is found (an older solve, or a synthetic test)."""
+def _tie_point_residual(fits: list[dict]) -> dict[str, float] | None:
+    """Aggregate p50/p95 tie-point residual [m] across chunk `fits` (a solve summary's `per_chunk_fit`),
+    or `None` if none carries one (an older solve, or a synthetic test)."""
     med, p95 = [], []
-    for g in groups:
-        d = fit_dir if fit_dir is not None else ck.recal_dir(sid)
-        for f in sorted(Path(d).glob(f"{sid}_{g}_chunk*_fit.json")):
-            iters = json.loads(f.read_text()).get("stats", {}).get("iters", [])
-            if iters and "shift_m" in iters[-1]:
-                med.append(iters[-1]["shift_m"]["median"])
-                p95.append(iters[-1]["shift_m"]["p95"])
+    for fit in fits:
+        iters = fit.get("stats", {}).get("iters", [])
+        if iters and "shift_m" in iters[-1]:
+            med.append(iters[-1]["shift_m"]["median"])
+            p95.append(iters[-1]["shift_m"]["p95"])
     if not med:
         return None
     return {"p50_m": float(np.median(med)), "p95_m": float(np.max(p95))}
@@ -204,7 +202,7 @@ def write_loc(
     predictor: int = 3,
     dtype: str = "float32",
     row0: int = 0,
-    fit_dir: Path | None = None,
+    fits: list[dict] | None = None,
 ) -> Path:
     """Write `<sid>_loc.tif`/`.img`: 3 bands lon [deg, 0-360 E], lat [deg, planetocentric], radius
     [m from Moon centre], matching the M3 LOC band order/units. Full strip rows x 250, camera
@@ -213,12 +211,12 @@ def write_loc(
     GeoTIFF writer (`iirs._save_geotiff`) always writes float dtypes as float32, so `dtype="float64"`
     only affects the pre-write cast, not the file actually written. `compress`/`predictor`/`dtype`
     are exposed, not frozen. `row0` is this array's absolute scan row 0 (0 for the current
-    full-strip callers).
+    full-strip callers). `fits` are the solve's per-chunk fits, for the tie-point residual tags.
     """
     fout = Path(fout)
     fout.parent.mkdir(parents=True, exist_ok=True)
     lon, lat, radius = loc["lon"], loc["lat"], loc["radius"]
-    tp = _tie_point_residual(sid, list(loc["groups"]), fit_dir=fit_dir)
+    tp = _tie_point_residual(fits or [])
     tags = {
         "IIRS_PRODUCT": "LOC",
         "IIRS_FORMAT_VERSION": "1",

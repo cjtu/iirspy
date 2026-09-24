@@ -219,9 +219,7 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
     ftopo = (
         None
         if args.no_topo
-        else georef.scene_topo(
-            sid, group, gcps, l1.img.shape[-2:], fgeom, flabel, cfg, kernels, fgcps.parent, scan0=scan0
-        )
+        else georef.scene_topo(sid, group, gcps, l1.img.shape[-2:], fgeom, flabel, cfg, kernels, solve.OUT, scan0=scan0)
     )
     solve.log(f"topo: {ftopo or 'skipped (--no-topo)'}")
 
@@ -296,6 +294,8 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
 
     _keep(args.keep_l1, ftif, ftif.with_suffix(".vrt"))
     _keep(args.keep, fl2, fl2.with_suffix(".vrt"), fobs, fsummary, solve.LOG)
+    if ftopo:  # geometry, so it lands beside the GCPs rather than with L2
+        _keep(str(fgcps.parent) if args.keep else None, ftopo)
 
     if args.clean:
         shutil.rmtree(solve.OUT, ignore_errors=True)

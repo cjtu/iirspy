@@ -52,20 +52,10 @@ CONSENSUS_ALL_GROUPS = os.environ.get("IIRS_CONSENSUS_SEED") == "1"
 EXIT_RESUME = 75
 
 # Copied to `--keep`, each after the `<sid>_<group>` prefix every work-dir file carries (the keep dir
-# is a shared day dir); everything else in the work dir is rebuildable from the zip.
-# - all gcp files generated and run log / json stats
+# is a shared day dir). Everything else -- chunk gcps/fits/plan, hillshades, the L1 and its vrt -- is
+# the scratch restart cache; the summary carries the chunk plan and every chunk's fit.
 # - `_L1_b*.tif`: the final warped raster at the registration band (only 1 band, 10s of MB)
-# - `*.vrt`: the GCP sidecar for that raster; it names its tif relative to itself, so the pair has
-#   to travel together or the vrt dangles.
-KEEP_GLOBS = (
-    "*.gcps",
-    "_chunk*_fit.json",
-    "_chunks.json",
-    "_solve_summary.json",
-    "_solve.log",
-    "_L1_b*.tif",
-    "*.vrt",
-)
+KEEP_GLOBS = (".gcps", "_glt.tif", "_loc.tif", "_solve_summary.json", "_solve.log", "_L1_b*.tif")
 
 # Set by `main` from argv; module-level because `build_l1` and `log` both need them.
 SID = ""
@@ -463,7 +453,7 @@ def _peak_mb() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 
-def _make_loc(merged: dict, scan0: int, loc_dir: str, fit_dir: Path, overwrite: bool = False) -> Path:
+def _make_loc(merged: dict, scan0: int, loc_dir: str, fits: list[dict], overwrite: bool = False) -> Path:
     """Write `<sid>_<group>_loc.tif` (lon, lat, LOLA radius per camera pixel) through the same TPS as the GLT."""
     from iirspy import backplanes
 
@@ -474,9 +464,15 @@ def _make_loc(merged: dict, scan0: int, loc_dir: str, fit_dir: Path, overwrite: 
     with phase("loc"):
         lon, lat, radius = backplanes._group_loc_core(merged, GROUP)
         loc = {"lon": lon, "lat": lat, "radius": radius, "groups": {GROUP: (scan0, scan0 + lon.shape[0] - 1)}}
-        backplanes.write_loc(floc, loc, SID, row0=scan0, fit_dir=fit_dir)
+        backplanes.write_loc(floc, loc, SID, row0=scan0, fits=fits)
     log(f"loc: {floc} {lon.shape}, peak RSS {peak0:.0f} -> {_peak_mb():.0f} MB")
     return floc
+
+
+def _kept_fits(keep: Path) -> list[dict]:
+    """The per-chunk fits from a kept solve summary, or [] for a solve that predates it."""
+    f = keep / f"{SID}_{GROUP}_solve_summary.json"
+    return json.loads(f.read_text()).get("per_chunk_fit", []) if f.exists() else []
 
 
 def _glt_only(args, cfg0, fgeom, lat_range) -> bool:
@@ -487,12 +483,20 @@ def _glt_only(args, cfg0, fgeom, lat_range) -> bool:
     if fgeom is None:
         sys.exit(f"missing geometry csv for {SID}")
     merged = _load_gcps(fdone)
-    glt_dir = args.keep or str(ck.recal_dir(SID))
+    keep = Path(args.keep or ck.recal_dir(SID))
     cfg = replace(cfg0, lat_band=lat_range)
     scan0 = _scene_scan0(fgeom, lat_range)
-    f = _make_glt(merged, cfg, scan0, glt_dir)
-    log(f"{fdone} exists ({len(merged)} gcps) -- skipped solve, glt: {f}")
-    _make_loc(merged, scan0, glt_dir, Path(glt_dir))
+    log(f"{fdone} exists ({len(merged)} gcps) -- skipped solve")
+    # Built on scratch, then copied: nothing is written into or read back from keep as a cache.
+    for name, build in (
+        ("glt.tif", lambda: _make_glt(merged, cfg, scan0, str(OUT))),
+        ("loc.tif", lambda: _make_loc(merged, scan0, str(OUT), _kept_fits(keep))),
+    ):
+        f = keep / f"{SID}_{GROUP}_{name}"
+        if not f.exists():
+            keep.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(build(), f)
+        log(f"{name.split('.')[0]}: {f}")
     if args.clean:
         shutil.rmtree(OUT, ignore_errors=True)
         print(f"removed work dir {OUT}", flush=True)
@@ -987,8 +991,8 @@ def _parser():
     ap.add_argument(
         "--keep",
         default=None,
-        help="copy GCPs, fits, summary, log and the GLT here when the run completes "
-        "(default geometry/recalibrated/<day> under IIRS_RECAL_ROOT)",
+        help="copy the merged GCPs, GLT, LOC, summary and log here when the run completes; an already-solved "
+        "scene's GLT/LOC backfill defaults to geometry/recalibrated/<day> under IIRS_RECAL_ROOT",
     )
     ap.add_argument("--resolve", action="store_true", help="re-solve even if merged GCPs already exist")
     ap.add_argument(
@@ -1239,9 +1243,9 @@ def main(argv: list[str] | None = None) -> None:
     final_cfg, final = _warp_merged(merged, used_chunks, cfg0, ftif)
     final_shape = list(final.shape)
     del final  # written to disk by _warp_merged; only the shape is still needed below
-    fglt = _make_glt(merged, cfg0, scan0, args.keep or str(ck.recal_dir(SID)), overwrite=True)
+    fglt = _make_glt(merged, cfg0, scan0, str(OUT), overwrite=True)
     log(f"glt: {fglt}")
-    floc = _make_loc(merged, scan0, str(fglt.parent), OUT, overwrite=True)
+    floc = _make_loc(merged, scan0, str(OUT), [r["fit"] for r in results], overwrite=True)
 
     summary = {
         "sid": SID,
@@ -1259,8 +1263,8 @@ def main(argv: list[str] | None = None) -> None:
         **consensus_info,
         "n_merged_gcps": len(merged),
         "scan0": scan0,
-        "glt": str(fglt),
-        "loc": str(floc),
+        "glt": fglt.name,
+        "loc": floc.name,
         "final_aoi_m": final_cfg.aoi,
         "final_shape": final_shape,
         "total_s": round(time.time() - t_start, 1),
