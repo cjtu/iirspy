@@ -98,10 +98,7 @@ def _chunk_report(img) -> str:
 
 
 def _peak_rss_report() -> str:
-    """Peak RSS against the Slurm allocation, so `--mem` can be right-sized off a real run.
-
-    Self only: the staging subprocess peaks separately and well below this.
-    """
+    """Peak RSS against the Slurm allocation, so `--mem` can be right-sized off a real run."""
     import resource
 
     peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
@@ -209,9 +206,7 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
     solve.log(f"L1 built: {ftif} ({len(bands)} bands), scan0={scan0}")
 
     anc = ck.ancillary(sid)
-    fgeom, fspm = anc["geometry/calibrated"], anc["miscellaneous/raw"]
-    if fspm is None:
-        fspm = next(solve.STAGE.glob(f"miscellaneous/raw/{sid[:8]}/*{sid}*.spm"), None)
+    fgeom, fspm = anc["geometry/calibrated"], ck.spm(sid, solve.STAGE)
     if fgeom is None or fspm is None:
         sys.exit(f"missing ancillary for {sid}: geometry={fgeom} spm={fspm}")
     kernels = ck.kernels(sid[:8])

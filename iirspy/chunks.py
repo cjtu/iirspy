@@ -260,13 +260,13 @@ def kernels(day: str) -> list[Path]:
     return ks
 
 
-def _one(pattern: str) -> Path | None:
-    """First `ANC_ROOTS` match for `pattern`.
+def _one(pattern: str, roots: list[Path] | None = None) -> Path | None:
+    """First match for `pattern` under `roots` (default `ANC_ROOTS`).
 
     Globbed, never rebuilt by hand: the detector suffix is not always `d32` (`20231222T0751377198`
     is `d18`).
     """
-    for root in ANC_ROOTS:
+    for root in roots or ANC_ROOTS:
         hits = sorted(root.glob(pattern))
         if hits:
             return hits[0]
@@ -288,7 +288,7 @@ def ancillary(sid: str) -> dict[str, Path | None]:
     day = sid[:8]
     out: dict[str, Path | None] = {
         "geometry/calibrated": _one(f"geometry/calibrated/{day}/ch2_iir_nci_{sid}_g_grd_*.csv"),
-        "miscellaneous/raw": _one(f"miscellaneous/raw/{day}/ch2_iir_nri_{sid}_d_img_*.spm"),
+        "miscellaneous/raw": spm(sid),
     }
     for group in GROUPS:
         d = recal_dir(sid, group)
@@ -303,6 +303,19 @@ def nri_zip(sid: str) -> Path | None:
     """The nri bundle for `sid`, searched recursively since `zips/` nests some by region."""
     hits = sorted((ARCHIVE / "zips").rglob(f"ch2_iir_nri_{sid}_d_img_*.zip"))
     return hits[0] if hits else None
+
+
+def spm(sid: str, stage: Path | None = None) -> Path | None:
+    """`sid`'s nri .spm: first `ANC_ROOTS`, then `stage`, else extracted from the nri zip into `stage`.
+
+    The spm rides inside the nri zip, so an archive copy is a shortcut, not a requirement.
+    """
+    pat = f"miscellaneous/raw/{sid[:8]}/ch2_iir_nri_{sid}_d_img_*.spm"
+    roots = [*ANC_ROOTS, Path(stage)] if stage else ANC_ROOTS
+    if (found := _one(pat, roots)) or stage is None or (fzip := nri_zip(sid)) is None:
+        return found
+    utils.extract(fzip, stage, include=("*.spm",))
+    return _one(pat, [Path(stage)])
 
 
 def strip_backbone(fgeom: Path, lat_min: float = -90.0, lat_max: float = 90.0):

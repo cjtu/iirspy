@@ -20,7 +20,6 @@ import errno
 import json
 import os
 import shutil
-import subprocess
 import sys
 import time
 import traceback
@@ -29,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-from iirspy import __version__
+from iirspy import __version__, utils
 from iirspy import chunks as ck
 
 WIDTH_RANGE_KM = (100.0, 150.0)
@@ -119,8 +118,8 @@ class phase:
     `cores` is the number that answers "would more `--cpus-per-task` help here": a stage pinned near
     1.0 is serial (GIL-bound Python, or waiting on disk) and more cores buy it nothing, while one
     that tracks `ncpu()` is already scaling. CPU time sums this process *and* its waited-for
-    children, so a subprocess stage (zip extraction) is measured on the same footing as an in-process
-    one, not reported as idle.
+    children, so a subprocess stage is measured on the same footing as an in-process one, not
+    reported as idle.
     """
 
     def __init__(self, name: str):
@@ -258,20 +257,17 @@ def _cube_bands(band: int) -> list[int]:
 def _stage_inputs(day: str, bands: list[int]) -> Path:
     """Extract the zip and assemble the one-root PDS tree `L0` reads. Returns the raw cube's path.
 
-    Ancillary is staged from every `ANC_ROOT`, not just the archive: without the nci geometry csv
-    here `l1.csv` is None and the crop dies in `parse_geom` after the whole cube has calibrated.
+    The zip brings every nri member (cube bands, spm, oat, xml); only the nci products it lacks are
+    copied in. The geometry csv comes from every `ANC_ROOT`, not just the archive: without it
+    `l1.csv` is None and the crop dies in `parse_geom` after the whole cube has calibrated.
     """
     raw_qub = STAGE / f"data/raw/{day}/{ZIP.stem}.qub"
     if not raw_qub.exists():
         log(f"extracting {ZIP.name} ({len(bands)} bands) -> {STAGE}")
-        band_arg = ",".join(str(b) for b in bands)
         with phase("extraction"):
-            subprocess.run(  # noqa: S603
-                [sys.executable, "-m", "issdc_iirs", str(ZIP), "-o", str(STAGE), "--bands", band_arg], check=True
-            )
+            utils.extract(ZIP, STAGE, bands=bands)
     for sub in (
         f"geometry/calibrated/{day}",
-        f"miscellaneous/raw/{day}",
         f"miscellaneous/calibrated/{day}",
         f"data/calibrated/{day}",
     ):
@@ -283,13 +279,12 @@ def _stage_inputs(day: str, bands: list[int]) -> Path:
         for f in src_dir.glob(f"*{SID}*"):
             if not (dst_dir / f.name).exists():
                 shutil.copyfile(f, dst_dir / f.name)
-    for key, anc in ck.ancillary(SID).items():
-        if anc is None:
-            continue
-        dst = STAGE / key / day / anc.name
+    fgeom = ck.ancillary(SID)["geometry/calibrated"]
+    if fgeom is not None:
+        dst = STAGE / "geometry/calibrated" / day / fgeom.name
         dst.parent.mkdir(parents=True, exist_ok=True)
         if not dst.exists():
-            shutil.copyfile(anc, dst)
+            shutil.copyfile(fgeom, dst)
     return raw_qub
 
 
@@ -337,7 +332,7 @@ def build_l1(
     # Ancillary only (spm, oat, xml, csv -- excludes the qub by default): a few MB, so cheap enough
     # to always re-run even on an L1 cache hit. Without this, a cache hit skips `_stage_inputs`
     # below and STAGE never gets the spm the zip carries, since it does not live in ARCHIVE.
-    subprocess.run([sys.executable, "-m", "issdc_iirs", str(ZIP), "-o", str(STAGE)], check=True)  # noqa: S603
+    utils.extract(ZIP, STAGE)
     # The nri zip's own layout only ever yields .../raw, but iirspy.L1 (level=1) always looks
     # under .../calibrated -- for spm (calibrate()'s FileNotFoundError check) and for the xml
     # label (from_xarray's solar_inc/solar_az lookup, iirs.py `paths.get("qub"/"xml")` at
@@ -371,7 +366,6 @@ def build_l1(
             f"calibrate_kwargs={meta.get('calibrate_kwargs', '<unrecorded>')} does not match requested "
             f"{lat_range}/{bands}/{effective_calibrate_kws} -- rebuilding"
         )
-    import iirspy.utils as utils
     from iirspy import L0
 
     with phase("staging"):
@@ -439,7 +433,6 @@ def keep_products(out: Path, dest: Path) -> list[Path]:
 
 def _scene_scan0(fgeom: Path, lat_range: tuple[float, float]) -> int:
     """First Scan of the group's L1 crop, from the geometry csv alone -- no cube needed."""
-    import iirspy.utils as utils
 
     _, xyext = utils.parse_geom(fgeom, latlonextent=(-180, 180, *lat_range))
     return int(xyext[2])
@@ -570,7 +563,6 @@ def _glt_only(args, cfg0, fgeom, lat_range) -> bool:
     f = _make_glt(merged, cfg, scan0, glt_dir)
     log(f"{fdone} exists ({len(merged)} gcps) -- skipped solve, glt: {f}")
 
-    import iirspy.utils as utils
     from iirspy.iirs import _write_json_atomic
 
     _, xyext = utils.parse_geom(fgeom, latlonextent=(-180, 180, *lat_range))
@@ -1253,7 +1245,7 @@ def main(argv: list[str] | None = None) -> None:
 
     cfg0 = ck.chunk_cfg(GROUP)
     anc = ck.ancillary(SID)
-    fgeom, fspm = anc["geometry/calibrated"], anc["miscellaneous/raw"]
+    fgeom = anc["geometry/calibrated"]
 
     lat_range0 = ck.l1_lat_range(GROUP)
     if _glt_only(args, cfg0, fgeom, lat_range0):
@@ -1273,10 +1265,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     cfg0 = replace(cfg0, lat_band=lat_range)
 
-    # The spm rides inside the nri zip, so a scene whose ancillary was never synced to the archive
-    # still has one under STAGE once build_l1 has extracted it.
-    if fspm is None:
-        fspm = next(STAGE.glob(f"miscellaneous/raw/{SID[:8]}/*{SID}*.spm"), None)
+    fspm = ck.spm(SID, STAGE)
     if fgeom is None or fspm is None:
         sys.exit(f"missing ancillary for {SID}: geometry={fgeom} spm={fspm}")
 

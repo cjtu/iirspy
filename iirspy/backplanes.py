@@ -313,7 +313,15 @@ def _local_az_zenith(
     return az, zen
 
 
-def _row_geometry(sid: str, lon: np.ndarray, lat: np.ndarray, radius: np.ndarray, scan0: int, kernels: list[Path]):
+def _row_geometry(
+    sid: str,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    radius: np.ndarray,
+    scan0: int,
+    kernels: list[Path],
+    stage: Path | None = None,
+):
     """Per-pixel M3 OBS bands 1-7 (to-sun/to-sensor azimuth/zenith/phase/path length) for one
     row block, from SPICE plus this block's own loc (lon, lat, radius).
 
@@ -333,7 +341,7 @@ def _row_geometry(sid: str, lon: np.ndarray, lat: np.ndarray, radius: np.ndarray
         sp.furnsh(str(k))
 
     ny, nx = lon.shape
-    fspm = ck.ancillary(sid)["miscellaneous/raw"]
+    fspm = ck.spm(sid, stage)
     if fspm is None:
         raise FileNotFoundError(f"{sid}: no .spm for row timing")
     spm = utils.load_iirs_spm(fspm)
@@ -448,9 +456,8 @@ def _pan_saturation_mask(sid: str, group: str, stage_dir: Path) -> np.ndarray | 
     empirical correction's own dark/flat/smile terms are near-unity broadband scaling, so the
     per-element LUT path used here is the same threshold, not a materially different one).
 
-    Needs the nri raw cube, staged here (ancillary is already staged for other products; the cube
-    itself is not) via the same ranged `issdc-iirs --bands` path `iirspy.solve._stage_inputs` uses,
-    restricted to `PAN_BANDS`. `None` if the nri bundle is not archived for `sid`.
+    Needs the nri raw cube, extracted here restricted to `PAN_BANDS` (a cube already staged with a
+    superset, e.g. a solve's, is reused). `None` if the nri bundle is not archived for `sid`.
     """
     fzip = ck.nri_zip(sid)
     fgeom = ck.ancillary(sid)["geometry/calibrated"]
@@ -460,8 +467,8 @@ def _pan_saturation_mask(sid: str, group: str, stage_dir: Path) -> np.ndarray | 
 
     day = sid[:8]
     stage_dir = Path(stage_dir)
-    solve.SID, solve.GROUP, solve.ZIP, solve.STAGE = sid, group, fzip, stage_dir
-    solve._stage_inputs(day, PAN_BANDS)
+    if not (stage_dir / f"data/raw/{day}/{fzip.stem}.qub").exists():
+        utils.extract(fzip, stage_dir, bands=PAN_BANDS)
     lat_range = ck.l1_lat_range(group)
     scan0 = solve._scene_scan0(fgeom, lat_range)
     gi = group_info(sid, group)
@@ -512,7 +519,7 @@ def build_obs(sid: str, loc: dict, stage_dir: Path | None = None) -> dict:
 
         lon_g, lat_g, rad_g = loc["lon"][r0:r1], loc["lat"][r0:r1], loc["radius"][r0:r1]
         s_az, s_zen, s_dist, e_az, e_zen, e_dist, sc_ok, sc_xyz_km = _row_geometry(
-            sid, lon_g, lat_g, rad_g, r0, ck.kernels(sid[:8])
+            sid, lon_g, lat_g, rad_g, r0, ck.kernels(sid[:8]), stage_dir
         )
         sc_ok_any = sc_ok_any or sc_ok
         sc_xyz_km_full[:, r0:r1] = np.where(write[None, :], sc_xyz_km, sc_xyz_km_full[:, r0:r1])

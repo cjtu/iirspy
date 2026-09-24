@@ -908,7 +908,7 @@ wheels = [
 [[package]]
 name = "issdc"
 version = "0.4.3"
-source = { git = "https://github.com/cjtu/issdc-requester#b0acea0f2661e6ba6e487926b861016c61833065" }
+source = { git = "https://github.com/cjtu/issdc-requester#da48bb0b10a5e0d7c29175c4ab717ddee4361805" }
 dependencies = [
     { name = "requests" },
     { name = "tqdm" },

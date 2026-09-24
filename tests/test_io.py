@@ -13,7 +13,7 @@ from iirspy.iirs import _apply_envi_start, _band_numbers, _row_block
 
 BASENAME = "20201202T1527488942"
 FULL = [1, 2, 3]
-SUBSET = [10, 18, 54]  # as fetch_nci_ancillary.py streams them
+SUBSET = [10, 18, 54]
 
 
 Y0 = 12000  # absolute first line, as a polar crop has: keeps the transform off Affine.identity

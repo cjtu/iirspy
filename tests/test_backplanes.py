@@ -365,3 +365,22 @@ def test_write_qa_tags_name_every_bit(tmp_path):
         for bit in range(8):
             assert f"QA_BIT_{bit}" in tags
         assert tags["GEOM_SHADOW_LIT"] == str(bp.GEOM_SHADOW_LIT)
+
+
+def test_spm_archive_then_stage_then_zip(tmp_path, monkeypatch):
+    import zipfile
+
+    sid, rel = "20231203T0022175440", "miscellaneous/raw/20231203/ch2_iir_nri_20231203T0022175440_d_img_d18.spm"
+    archive, stage = tmp_path / "archive", tmp_path / "stage"
+    (archive / "zips").mkdir(parents=True)
+    with zipfile.ZipFile(archive / "zips" / f"ch2_iir_nri_{sid}_d_img_d18.zip", "w") as zf:
+        zf.writestr(rel, "spm")
+    monkeypatch.setattr(ck, "ARCHIVE", archive)
+    monkeypatch.setattr(ck, "ANC_ROOTS", [archive])
+
+    assert ck.spm(sid) is None  # no stage: never extracts
+    assert ck.spm(sid, stage) == stage / rel  # extracted from the zip
+    assert (stage / rel).read_text() == "spm"
+    (archive / rel).parent.mkdir(parents=True)
+    (archive / rel).write_text("archived")
+    assert ck.spm(sid, stage) == archive / rel  # archive wins

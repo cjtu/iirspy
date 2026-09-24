@@ -1,7 +1,6 @@
 import hashlib
 import re
 import warnings
-import zipfile
 from importlib import metadata
 from importlib.resources import files
 from pathlib import Path
@@ -16,6 +15,7 @@ import rasterio
 
 # import xarray_regrid
 import xarray as xr
+from issdc_iirs import fetch
 
 # import xesmf as xe
 from pyproj import CRS
@@ -689,24 +689,27 @@ def read_gcps(fgcps):
     return gcps, crs
 
 
-def unzip_iirs(ddir, basename, level, md5checksum=True):
-    """Find zipped IIRS image from PRADAN ISSDC, unzip and run checksum."""
+def extract(fzip, out_dir, **kw):
+    """`issdc_iirs.fetch` on one local bundle (`kw`: include/exclude/bands), md5-verified against its
+    PDS4 labels. Raises on failure, where `fetch` itself only prints and returns an empty list."""
+    paths = fetch([str(fzip)], str(out_dir), **kw)[str(fzip)]
+    if not paths:
+        raise RuntimeError(f"issdc_iirs extracted nothing from {fzip} (see its output above)")
+    return paths
+
+
+def unzip_iirs(ddir, basename, level):
+    """Find a PRADAN bundle for `basename` under `ddir` and extract all of it, qub included, beside itself."""
     mtc = LVL2MTC[level]
     f = next((f for f in Path(ddir).glob(f"**/*{mtc}*.zip") if basename in f.stem), None)
     if f is None:
         raise FileNotFoundError(
             f"Image {basename} not found in {ddir}. Please download from PRADAN or check file path."
         )
-    with zipfile.ZipFile(f, "r") as zipf:
-        print(f"Extracting {basename} to {f.parent}")
-        zipf.extractall(f.parent)
+    extract(f, f.parent, exclude=())
     paths = get_iirs_paths(f.parent, level=level, basenames=[basename])
     if "qub" not in paths:
         raise RuntimeError("Unzip failed.")
-    if md5checksum:
-        print("Verifying unzipped image...", end=" ")
-        checksum(paths["qub"][basename].as_posix())
-        print("Success!")
     return paths
 
 

@@ -121,7 +121,7 @@ def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeyp
 
     # Ancillary re-stage runs unconditionally even on a cache hit -- stub it out, and instead
     # detect a rebuild by the next real step past the cache check, `_stage_inputs`.
-    monkeypatch.setattr(solve.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(solve.utils, "extract", lambda *a, **k: [])
     monkeypatch.setattr(solve, "_stage_inputs", boom)
 
     ftif = tmp_path / "l1.tif"
