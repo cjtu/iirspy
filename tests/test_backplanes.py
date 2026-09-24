@@ -306,7 +306,7 @@ def test_write_obs_tags_include_bands_pan_bands_and_shadow_snr(tmp_path):
         )
     }
     bands["sky_view"][:] = np.nan
-    obs = {"bands": bands, "groups": {"south": (0, ny - 1)}, "sun_distance_mean_au": 1.234, "sensor_available": True}
+    obs = {"bands": bands, "groups": {"south": (0, ny - 1)}, "sensor_source": "spm"}
     f = bp.write_obs(tmp_path / "sid_obs.tif", obs, "20210101T0000000000")
     with rasterio.open(f) as src:
         assert src.count == 14
@@ -347,3 +347,19 @@ def test_spm_archive_then_stage_then_zip(tmp_path, monkeypatch):
     (archive / rel).parent.mkdir(parents=True)
     (archive / rel).write_text("archived")
     assert ck.spm(sid, stage) == archive / rel  # archive wins
+
+
+def test_label_comes_from_the_nri_zip_like_the_spm(tmp_path, monkeypatch):
+    import zipfile
+
+    sid, rel = "20231203T0022175440", "data/raw/20231203/ch2_iir_nri_20231203T0022175440_d_img_d18.xml"
+    archive, stage = tmp_path / "archive", tmp_path / "stage"
+    (archive / "zips").mkdir(parents=True)
+    with zipfile.ZipFile(archive / "zips" / f"ch2_iir_nri_{sid}_d_img_d18.zip", "w") as zf:
+        zf.writestr(rel, "<label/>")
+        zf.writestr("data/raw/20231203/x.qub", "cube")
+    monkeypatch.setattr(ck, "ARCHIVE", archive)
+    monkeypatch.setattr(ck, "ANC_ROOTS", [archive])
+
+    assert ck.label(sid, stage) == stage / rel
+    assert not (stage / "data/raw/20231203/x.qub").exists()  # the label only, never the cube

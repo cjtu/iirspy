@@ -1,3 +1,6 @@
+import pytest
+
+
 def test_import_classes():
     pass
 
@@ -170,22 +173,43 @@ def test_clip_aoi_warps_onto_the_map_grid_and_matches_a_polygon_masked_apply_glt
     assert out.rio.transform() == tr
 
 
-def test_loc_extent_crops_rows_by_latitude_from_the_ndi_loc_backplane(tmp_path):
+def test_loc_extent_crops_rows_by_latitude_from_the_ndi_loc_backplane():
     import numpy as np
     import pytest
-    import rasterio
+    import xarray as xr
 
     from iirspy.iirs import _loc_extent
 
     ny, nx = 20, 5
-    lat = np.repeat(np.linspace(-10, 9, ny)[:, None], nx, axis=1).astype("float32")  # 1 deg per row
-    lon = np.full((ny, nx), 300.0, "float32")  # 0-360 east, i.e. -60
-    floc = tmp_path / "ch2_iir_ndi_X_d_loc_hw1_ard.img"
-    with rasterio.open(floc, "w", driver="ENVI", height=ny, width=nx, count=4, dtype="float32") as dst:
-        dst.write(np.stack([lon, lat, lat, lat]))
-    fqub = tmp_path / "ch2_iir_ndi_X_d_rfl_hw1_srd.qub"
+    lat = np.repeat(np.linspace(-10, 9, ny)[:, None], nx, axis=1)  # 1 deg per row
+    lon = np.full((ny, nx), 300.0)  # 0-360 east, i.e. -60
+    loc = xr.Dataset({"lon": (("y", "x"), lon), "lat": (("y", "x"), lat)})
 
-    assert _loc_extent(fqub, (-180, 180, -2, 3)) == (0, nx - 1, 8, 14)  # rows at lat -2..3
-    assert _loc_extent(fqub, (-61, -59, None, None)) == (0, nx - 1, 0, ny)
+    assert _loc_extent(loc, (-180, 180, -2, 3)) == (0, nx - 1, 8, 14)  # rows at lat -2..3
+    assert _loc_extent(loc, (-61, -59, None, None)) == (0, nx - 1, 0, ny)
     with pytest.raises(ValueError):
-        _loc_extent(fqub, (0, 10, None, None))
+        _loc_extent(loc, (0, 10, None, None))
+
+
+@pytest.mark.parametrize(("ul", "flip"), [((0, 0), (False, False)), ((-1, 0), (True, False)), ((0, -1), (False, True))])
+def test_read_issdc_loc_puts_the_labels_refined_upper_left_at_scan0_pixel0(tmp_path, monkeypatch, ul, flip):
+    """ndi is stored north-up/west-left; the label's Refined upper-left is the nci (Scan 0, Pixel 0)."""
+    import numpy as np
+    import rasterio
+
+    from iirspy import iirs
+
+    ny, nx = 6, 4
+    lat, lon = np.meshgrid(np.linspace(5, 0, ny), np.linspace(300, 301, nx), indexing="ij")  # north-up, west-left
+    floc = tmp_path / "ch2_iir_ndi_X_d_loc_hw1_ard.img"
+    with rasterio.open(floc, "w", driver="ENVI", height=ny, width=nx, count=2, dtype="float64") as dst:
+        dst.write(np.stack([lon, lat]))
+        dst.set_band_description(1, "Longitude")
+        dst.set_band_description(2, "Latitude")
+    label = {"isda:upper_left_longitude": lon[ul], "isda:upper_left_latitude": lat[ul]}
+    monkeypatch.setattr(iirs.pdr, "open", lambda f: type("L", (), {"metaget": lambda self, k: label})())
+
+    loc, got = iirs.read_issdc_loc(tmp_path / "ch2_iir_ndi_X_d_rfl_hw1_srd.qub")
+    assert got == flip
+    assert (float(loc.lon[0, 0]), float(loc.lat[0, 0])) == (lon[ul], lat[ul])
+    assert np.array_equal(loc.y.values, np.sort(loc.y.values))  # coords stay ascending scan/pixel

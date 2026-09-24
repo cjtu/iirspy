@@ -1,7 +1,7 @@
 """Raw -> L1 radiance -> L2 reflectance, warped onto an already-solved scene's GCPs.
 
 Takes the merged GCPs an `iirs-solve-scene` run produced and turns them into science products:
-full-band L1 radiance and L2 reflectance in camera space, plus the GLT that projects them into the
+full-band L1 radiance, L2 reflectance and the OBS backplane in camera space, plus the GLT that projects them into the
 group's CRS. No re-registration -- if the scene isn't solved yet, this refuses to run.
 
     iirs-compute-refl <sid> --group south|north|equatorial [--out WORKDIR] [--keep DIR]
@@ -206,11 +206,11 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
     solve.log(f"L1 built: {ftif} ({len(bands)} bands), scan0={scan0}")
 
     anc = ck.ancillary(sid)
-    fgeom, fspm = anc["geometry/calibrated"], ck.spm(sid, solve.STAGE)
-    if fgeom is None or fspm is None:
-        sys.exit(f"missing ancillary for {sid}: geometry={fgeom} spm={fspm}")
+    fgeom, flabel = anc["geometry/calibrated"], ck.label(sid, solve.STAGE)
+    if fgeom is None or flabel is None:
+        sys.exit(f"missing ancillary for {sid}: geometry={fgeom} label={flabel}")
     kernels = ck.kernels(sid[:8])
-    az, elev, r_sun = georef.sun_geometry(fgeom, fspm, cfg, kernels)
+    az, elev, r_sun = georef.sun_geometry(fgeom, flabel, cfg, kernels)
     solve.log(f"sun (grid frame): az={az:.1f} elev={elev:.2f} r_sun={r_sun:.4f} deg")
 
     l1 = L1.from_file(ftif, sid, str(solve.STAGE))
@@ -220,7 +220,7 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
         None
         if args.no_topo
         else georef.scene_topo(
-            sid, group, gcps, l1.img.shape[-2:], fgeom, fspm, cfg, kernels, fgcps.parent, scan0=scan0
+            sid, group, gcps, l1.img.shape[-2:], fgeom, flabel, cfg, kernels, fgcps.parent, scan0=scan0
         )
     )
     solve.log(f"topo: {ftopo or 'skipped (--no-topo)'}")
@@ -244,6 +244,14 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
     solve.log(f"L2 saved: {fl2}")
     for f in (Path(ftif), fl2):
         solve.log(f"gcp vrt -> {georef.save_gcp_vrt(f, gcps, georef.stereo_crs(group))}")
+
+    # OBS from the same GCPs/topo/L1 already in hand; no LOC product (see backplanes.scene_obs)
+    from iirspy import backplanes
+
+    fobs = solve.OUT / f"{sid}_{group}_obs.tif"
+    obs = backplanes.scene_obs(sid, group, gcps, l1.img.shape[-2:], scan0, ftopo, ftif, solve.STAGE)
+    backplanes.write_obs(fobs, obs, sid, row0=scan0)
+    solve.log(f"OBS saved: {fobs} (sensor geometry from {obs['sensor_source']})")
 
     fglt = fgcps.parent / f"{sid}_{group}_glt.tif"
     if not fglt.is_file():
@@ -270,6 +278,8 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
         "scan0": scan0,
         "l1": ftif.name,
         "l2": fl2.name,
+        "obs": fobs.name,
+        "obs_sensor_source": obs["sensor_source"],
         "glt": str(fglt),
         "sun_az_grid_deg": az,
         "sun_elev_deg": elev,
@@ -284,7 +294,7 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
     solve.log(f"\ndone in {summary['total_s']}s.")
 
     _keep(args.keep_l1, ftif, ftif.with_suffix(".vrt"))
-    _keep(args.keep, fl2, fl2.with_suffix(".vrt"), solve.OUT / "summary.json", solve.LOG)
+    _keep(args.keep, fl2, fl2.with_suffix(".vrt"), fobs, solve.OUT / "summary.json", solve.LOG)
 
     if args.clean:
         shutil.rmtree(solve.OUT, ignore_errors=True)

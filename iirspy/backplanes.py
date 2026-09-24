@@ -6,7 +6,6 @@ from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import rasterio
 import xarray as xr
 from rasterio.control import GroundControlPoint
@@ -268,12 +267,13 @@ def read_loc(path: Path) -> xr.Dataset:
     """`<sid>_loc.tif`/`.img` back as an `xr.Dataset` (lon, lat, radius), dims `("y", "x")` matching
     how `IIRSData`/`L1` name a camera-space cube's own dims (`iirs.py`'s `y`=scan row, `x`=camera
     col). `y`/`x` coords are the absolute scan row and camera column, not a pixel index restarting
-    at 0 -- via `iirs._apply_envi_start`, the same convention `L1.from_file` uses.
+    at 0 -- via `iirs._apply_envi_start`, the same convention `L1.from_file` uses. Also reads ISSDC's
+    ndi `_d_loc_` backplane (Longitude/Latitude/Radius/Height).
     """
     da, names, tags = _read_backplane(path)
-    name_map = {"longitude": "lon", "latitude": "lat", "radius": "radius"}
+    name_map = {"longitude": "lon", "latitude": "lat"}
     return xr.Dataset(
-        {name_map[n]: (("y", "x"), da.values[i]) for i, n in enumerate(names)},
+        {name_map.get(n.lower(), n.lower()): (("y", "x"), da.values[i]) for i, n in enumerate(names)},
         coords={"y": da.y.values, "x": da.x.values},
         attrs=dict(tags),
     )
@@ -292,7 +292,7 @@ def read_obs(path: Path) -> xr.Dataset:
 
 
 # ------------------------------------------------------------------------------------------
-# OBS: M3 sun/sensor/facet angles + IIRS extras, at every camera pixel
+# OBS: ISSDC ndi _d_obs_ bands (the values they promise) + extras, at every camera pixel
 # ------------------------------------------------------------------------------------------
 def _local_az_zenith(
     u: np.ndarray, east: np.ndarray, north: np.ndarray, up: np.ndarray
@@ -313,6 +313,28 @@ def _local_az_zenith(
     return az, zen
 
 
+def _sc_positions_km(sid: str, ets: list[float], scans: np.ndarray, stage: Path | None) -> tuple[np.ndarray, str]:
+    """(3, n) spacecraft position [km, IAU_MOON] at each ET, and where it came from.
+
+    The CH2 SPK when the loaded kernels cover the epoch, else the nri .spm's own state vector: it *is*
+    the SPK state in Moon-centred J2000 (0.000 km apart wherever both exist), so it needs only the
+    generic kernels to rotate into IAU_MOON. NaN (source "none") with neither.
+    """
+    import spiceypy as sp
+
+    try:
+        return np.stack([sp.spkpos("CHANDRAYAAN-2", et, "IAU_MOON", "NONE", "MOON")[0] for et in ets], 1), "spk"
+    except sp.stypes.SpiceyError:
+        pass
+    fspm, flabel = ck.spm(sid, stage), ck.label(sid, stage)
+    if fspm is None or flabel is None:
+        return np.full((3, len(ets)), np.nan), "none"
+    spm = utils.load_iirs_spm(fspm)
+    t = utils.get_line_times(flabel)[scans]
+    j2k = np.stack([np.interp(t, spm.timestamp, spm[k]) for k in ("scx", "scy", "scz")])
+    return np.stack([np.asarray(sp.pxform("J2000", "IAU_MOON", et)) @ j2k[:, i] for i, et in enumerate(ets)], 1), "spm"
+
+
 def _row_geometry(
     sid: str,
     lon: np.ndarray,
@@ -322,74 +344,51 @@ def _row_geometry(
     kernels: list[Path],
     stage: Path | None = None,
 ):
-    """Per-pixel M3 OBS bands 1-7 (to-sun/to-sensor azimuth/zenith/phase/path length) for one
-    row block, from SPICE plus this block's own loc (lon, lat, radius).
+    """Per-pixel sun/sensor terms (IIRS OBS bands 1-7) for one row block, from its own loc (lon, lat,
+    radius): sun and sensor azimuth/zenith [deg], sun distance [AU], sensor range [m].
 
-    Azimuth/zenith come straight from the local topocentric (east, north, up) frame at each pixel
-    (`georef._enu`), which is already what M3's "local north" convention means — unlike
-    `georef.sun_geometry_rows`, no grid-north correction is needed here, since that correction only
-    exists to feed the hillshade renderer, which works in map-projection space.
+    Row times come from the nri label (`utils.scan_utc`), never from .spm row numbers. The sun needs only
+    the generic kernels; the spacecraft comes from `_sc_positions_km` (CH2 SPK, else the .spm). Whatever
+    cannot be computed -- no label, no kernels, no spacecraft state -- is left NaN.
 
-    Path length is the true per-pixel distance (Sun/spacecraft position minus this pixel's body-fixed
-    XYZ), not a scene-constant range, so it carries the same small topocentric parallax the M3 SIS
-    describes as "deviations from the scene mean". Sensor terms are NaN (and `sc_ok=False`) if the
-    kernel set has no Chandrayaan-2 orbit SPK for this epoch.
+    Azimuth/zenith are in the local topocentric (east, north, up) frame at each pixel (`georef._enu`),
+    azimuth clockwise from local north. Distances are true per-pixel (Sun/spacecraft minus this pixel's
+    body-fixed XYZ), so they carry the small topocentric parallax across the scene.
     """
     import spiceypy as sp
 
+    ny, nx = lon.shape
+    sun_az, sun_zen, sun_dist_au, sens_az, sens_zen, sens_dist_m = (np.full((ny, nx), np.nan) for _ in range(6))
+    sc_xyz_km = np.full((3, ny), np.nan)
+    flabel = ck.label(sid, stage)
+    if flabel is None or not kernels:
+        return sun_az, sun_zen, sun_dist_au, sens_az, sens_zen, sens_dist_m, "none", sc_xyz_km
+
     for k in kernels:
         sp.furnsh(str(k))
-
-    ny, nx = lon.shape
-    fspm = ck.spm(sid, stage)
-    if fspm is None:
-        raise FileNotFoundError(f"{sid}: no .spm for row timing")
-    spm = utils.load_iirs_spm(fspm)
-    spm_row = spm.row.to_numpy()
-    spm_ns = spm.datetime.to_numpy().astype("datetime64[ns]").astype("int64")
-    row_ns = np.interp(scan0 + np.arange(ny), spm_row, spm_ns).astype("int64")
-
+    scans = scan0 + np.arange(ny)
+    ets = [sp.str2et(u) for u in utils.scan_utc(flabel, scans)]
+    sc_xyz_km, sc_source = _sc_positions_km(sid, ets, scans, stage)
     xyz_km = np.stack(lonlat_to_xyz(lon, lat, radius)) / 1000.0  # (3, ny, nx)
-    sun_az = np.full((ny, nx), np.nan)
-    sun_zen = np.full((ny, nx), np.nan)
-    sun_dist_au = np.full((ny, nx), np.nan)
-    sens_az = np.full((ny, nx), np.nan)
-    sens_zen = np.full((ny, nx), np.nan)
-    sens_dist_m = np.full((ny, nx), np.nan)
-    sc_xyz_km = np.full((3, ny), np.nan)
-
-    sc_ok = True
-    for r in range(ny):
+    for r, et in enumerate(ets):
         if not np.isfinite(lon[r]).any():
             continue
-        et = sp.str2et(pd.Timestamp(row_ns[r]).strftime("%Y-%m-%dT%H:%M:%S.%f"))
         east, north, up = _enu(lon[r], lat[r])  # each (3, nx)
         p = xyz_km[:, r, :]
-
-        v_sun, _ = sp.spkpos("SUN", et, "IAU_MOON", "LT+S", "MOON")
-        d_sun = np.asarray(v_sun)[:, None] - p
+        d_sun = np.asarray(sp.spkpos("SUN", et, "IAU_MOON", "LT+S", "MOON")[0])[:, None] - p
         dist_sun = np.linalg.norm(d_sun, axis=0)
         sun_az[r], sun_zen[r] = _local_az_zenith(d_sun / dist_sun, east, north, up)
         sun_dist_au[r] = dist_sun * 1000.0 / AU_M
-
-        if sc_ok:
-            try:
-                v_sc, _ = sp.spkpos("CHANDRAYAAN-2", et, "IAU_MOON", "LT+S", "MOON")
-            except Exception:
-                sc_ok = False
-                continue
-            d_sc = np.asarray(v_sc)[:, None] - p
-            dist_sc = np.linalg.norm(d_sc, axis=0)
-            sens_az[r], sens_zen[r] = _local_az_zenith(d_sc / dist_sc, east, north, up)
-            sens_dist_m[r] = dist_sc * 1000.0
-            sc_xyz_km[:, r] = np.asarray(v_sc)
-
-    return sun_az, sun_zen, sun_dist_au, sens_az, sens_zen, sens_dist_m, sc_ok, sc_xyz_km
+        d_sc = sc_xyz_km[:, r, None] - p
+        dist_sc = np.linalg.norm(d_sc, axis=0)
+        sens_az[r], sens_zen[r] = _local_az_zenith(d_sc / dist_sc, east, north, up)
+        sens_dist_m[r] = dist_sc * 1000.0
+    return sun_az, sun_zen, sun_dist_au, sens_az, sens_zen, sens_dist_m, sc_source, sc_xyz_km
 
 
 def _phase_angle(sun_zen, sens_zen, sun_az, sens_az):
     """Phase angle [deg] between the to-sun and to-sensor rays, from the spherical law of cosines
-    on their zenith/azimuth pair (M3 OBS band 5)."""
+    on their zenith/azimuth pair (OBS band 5); acute where ISSDC's own band 5 is 180 minus this."""
     z1, z2 = np.radians(sun_zen), np.radians(sens_zen)
     daz = np.radians(sun_az - sens_az)
     c = np.cos(z1) * np.cos(z2) + np.sin(z1) * np.sin(z2) * np.cos(daz)
@@ -411,12 +410,15 @@ def _read_group_topo(sid: str, group: str) -> dict | None:
     local-true-north the M3 OBS convention needs — `build_obs` corrects it with the same
     grid/true-north offset `georef.sun_geometry` derives for the hillshade renderer.
     """
-    f = ck.recal_dir(sid, group) / f"{sid}_{group}_topo.tif"
-    if not f.exists():
+    return _read_topo(ck.recal_dir(sid, group) / f"{sid}_{group}_topo.tif")
+
+
+def _read_topo(f: Path) -> dict | None:
+    """A `georef.save_topo` product's bands by name, or `None` if `f` is not on disk."""
+    if not Path(f).exists():
         return None
     with rasterio.open(f) as src:
-        bands = {src.descriptions[i]: src.read(i + 1) for i in range(src.count)}
-    return bands
+        return {src.descriptions[i]: src.read(i + 1) for i in range(src.count)}
 
 
 def _l1_rad_path(sid: str, group: str) -> Path:
@@ -426,8 +428,12 @@ def _l1_rad_path(sid: str, group: str) -> Path:
 def _group_snr(sid: str, group: str) -> np.ndarray | None:
     """Broadband SNR over `empirical.PAN_BANDS`, from the group's own recalibrated L1 cube, or
     `None` if that cube is not on disk (a group processed only through geometry)."""
-    f = _l1_rad_path(sid, group)
-    if not f.exists():
+    return _l1_snr(_l1_rad_path(sid, group))
+
+
+def _l1_snr(f: Path) -> np.ndarray | None:
+    """Broadband SNR over `empirical.PAN_BANDS` of the L1 cube `f`, or `None` if it is not on disk."""
+    if not Path(f).exists():
         return None
     bands = [read_band(f, b) for b in PAN_BANDS]
     P = xr.DataArray(np.stack(bands), dims=("band", "y", "x"), coords={"band": PAN_BANDS}).mean("band")
@@ -481,32 +487,77 @@ def _pan_saturation_mask(sid: str, group: str, stage_dir: Path) -> np.ndarray | 
     return np.asarray((rad >= sat.sel(band=PAN_BANDS)).any("band").compute().values)
 
 
+def _kernels_or_none(day: str) -> list[Path]:
+    """`ck.kernels(day)`, or [] when there is no SPICE tree: `_row_geometry` then leaves sun/sensor NaN."""
+    try:
+        return ck.kernels(day)
+    except FileNotFoundError:
+        return []
+
+
+OBS_NAMES = [
+    "sun_azimuth",
+    "sun_zenith",
+    "sensor_azimuth",
+    "sensor_zenith",
+    "phase",
+    "sun_distance",
+    "sensor_distance",
+    "facet_slope",
+    "facet_aspect",
+    "facet_cos_i",
+    "lit_frac",
+    "sky_view",
+    "snr",
+    "tie_dist",
+]
+
+
+def _group_obs(sid, group, lon, lat, radius, scan0, topo, snr, stage_dir) -> tuple[dict, str, np.ndarray]:
+    """One group's OBS bands (all but `tie_dist`) over its own rows, which start at absolute Scan `scan0`:
+    ({name: (ny, nx)}, spacecraft source, (3, ny) spacecraft km). `topo`/`snr` may be `None` (-> NaN)."""
+    ny, nx = lon.shape
+    s_az, s_zen, s_dist, e_az, e_zen, e_dist, sc_source, sc_xyz_km = _row_geometry(
+        sid, lon, lat, radius, scan0, _kernels_or_none(sid[:8]), stage_dir
+    )
+    nan = np.full((ny, nx), np.nan, "float32")
+    slope = aspect = lit_frac = cos_i = nan
+    if topo is not None:
+        m = min(ny, topo["slope"].shape[0])
+        slope, aspect, lit_frac = nan.copy(), nan.copy(), nan.copy()
+        slope[:m], lit_frac[:m] = topo["slope"][:m], topo["lit_frac"][:m]
+        # the topo's aspect is map-grid referenced; OBS wants local true north
+        lon0 = stereo_crs(group).to_dict().get("lon_0", 0.0)
+        grid_sign = 0.0 if group == "equatorial" else (-1.0 if group == "north" else 1.0)
+        aspect[:m] = (topo["aspect"][:m] - grid_sign * (lon[:m] - lon0)) % 360.0
+        cos_i = _facet_cos_i(s_zen, s_az, slope, aspect)
+    bands = {
+        "sun_azimuth": s_az,
+        "sun_zenith": s_zen,
+        "sensor_azimuth": e_az,
+        "sensor_zenith": e_zen,
+        "phase": _phase_angle(s_zen, e_zen, s_az, e_az),
+        "sun_distance": s_dist,
+        "sensor_distance": e_dist,
+        "facet_slope": slope,
+        "facet_aspect": aspect,
+        "facet_cos_i": cos_i,
+        "lit_frac": lit_frac,
+        "sky_view": nan,
+        "snr": nan if snr is None else snr[:ny],
+    }
+    return bands, sc_source, sc_xyz_km
+
+
 def build_obs(sid: str, loc: dict, stage_dir: Path | None = None) -> dict:
     """Every OBS band, assembled group by group over `loc` (`lon`/`lat`/`radius`/`groups`).
     Overlap rows between two groups take the earlier group's own value (first-owner-wins).
     """
     groups = list(loc["groups"])
     ny, nx = loc["lon"].shape
-    names = [
-        "sun_azimuth",
-        "sun_zenith",
-        "sensor_azimuth",
-        "sensor_zenith",
-        "phase",
-        "sun_distance",
-        "sensor_distance",
-        "facet_slope",
-        "facet_aspect",
-        "facet_cos_i",
-        "lit_frac",
-        "sky_view",
-        "snr",
-        "tie_dist",
-    ]
-    out = {n: np.full((ny, nx), np.nan, "float32") for n in names}
+    out = {n: np.full((ny, nx), np.nan, "float32") for n in OBS_NAMES}
     owner = np.full(ny, "", dtype=object)
-    sc_ok_any = False
-    sun_dist_all = []
+    sources = set()
     sc_xyz_km_full = np.full((3, ny), np.nan)
 
     for g in groups:
@@ -516,62 +567,65 @@ def build_obs(sid: str, loc: dict, stage_dir: Path | None = None) -> dict:
         owner[r0:r1] = np.where(write, g, owner[r0:r1])
         if not write.any():
             continue
-
-        lon_g, lat_g, rad_g = loc["lon"][r0:r1], loc["lat"][r0:r1], loc["radius"][r0:r1]
-        s_az, s_zen, s_dist, e_az, e_zen, e_dist, sc_ok, sc_xyz_km = _row_geometry(
-            sid, lon_g, lat_g, rad_g, r0, ck.kernels(sid[:8]), stage_dir
+        bands, sc_source, sc_xyz_km = _group_obs(
+            sid,
+            g,
+            loc["lon"][r0:r1],
+            loc["lat"][r0:r1],
+            loc["radius"][r0:r1],
+            r0,
+            _read_group_topo(sid, g),
+            _group_snr(sid, g),
+            stage_dir,
         )
-        sc_ok_any = sc_ok_any or sc_ok
+        sources.add(sc_source)
         sc_xyz_km_full[:, r0:r1] = np.where(write[None, :], sc_xyz_km, sc_xyz_km_full[:, r0:r1])
-        phase = _phase_angle(s_zen, e_zen, s_az, e_az)
+        for name, full in bands.items():
+            out[name][r0:r1] = np.where(write[:, None], full, out[name][r0:r1])
 
-        topo = _read_group_topo(sid, g)
-        lon0_val = stereo_crs(g).to_dict().get("lon_0", 0.0)
-        grid_sign = 0.0 if g == "equatorial" else (-1.0 if g == "north" else 1.0)
-        nblk = r1 - r0
-        if topo is not None:
-            m = min(nblk, topo["slope"].shape[0])
-            slope = np.full((nblk, nx), np.nan, "float32")
-            aspect = np.full((nblk, nx), np.nan, "float32")
-            lit_frac = np.full((nblk, nx), np.nan, "float32")
-            slope[:m] = topo["slope"][:m]
-            aspect_grid = topo["aspect"][:m]
-            lit_frac[:m] = topo["lit_frac"][:m]
-            aspect[:m] = (aspect_grid - grid_sign * (lon_g[:m] - lon0_val)) % 360.0
-            cos_i = _facet_cos_i(s_zen, s_az, slope, aspect)
-        else:
-            slope = aspect = lit_frac = cos_i = np.full((nblk, nx), np.nan, "float32")
-
-        snr = _group_snr(sid, g)
-        n = r1 - r0
-        for name, full in (
-            ("sun_azimuth", s_az),
-            ("sun_zenith", s_zen),
-            ("sensor_azimuth", e_az),
-            ("sensor_zenith", e_zen),
-            ("phase", phase),
-            ("sun_distance", s_dist),
-            ("sensor_distance", e_dist),
-            ("facet_slope", slope),
-            ("facet_aspect", aspect),
-            ("facet_cos_i", cos_i),
-            ("lit_frac", lit_frac),
-        ):
-            out[name][r0:r1] = np.where(write[:, None], full[:n], out[name][r0:r1])
-        if snr is not None:
-            out["snr"][r0:r1] = np.where(write[:, None], snr[:n], out["snr"][r0:r1])
-        sun_dist_all.append(s_dist[np.isfinite(s_dist)])
-
-    sun_mean_au = float(np.concatenate(sun_dist_all).mean()) if sun_dist_all else float("nan")
-    out["sun_distance"] = out["sun_distance"] - sun_mean_au
     out["tie_dist"] = _tie_dist(sid, groups, ny, nx)
-
     return {
         "bands": out,
         "groups": loc["groups"],
-        "sun_distance_mean_au": sun_mean_au,
-        "sensor_available": sc_ok_any,
+        "sensor_source": ",".join(sorted(sources)) or "none",
         "sc_xyz_m": sc_xyz_km_full * 1000.0,
+    }
+
+
+def scene_obs(sid, group, gcps, shape, scan0, ftopo=None, fl1=None, stage_dir=None) -> dict:
+    """`build_obs` for one solved group straight from refl's own inputs, with no LOC product: pixel
+    positions from the GCP lattice (`georef.camera_xy`, the same positions the topo samples) plus the
+    LOLA radius, topo from `ftopo`, SNR from the L1 cube `fl1`. `gcps` rows are relative to `scan0`."""
+    from iirspy.georef import camera_xy
+
+    ny, nx = shape
+    x, y = camera_xy(gcps, shape)
+    lon, lat = xy_to_lonlat(x, y, pole=group)
+    radius = np.empty((ny, nx))
+    for r0 in range(0, ny, 500):
+        sl = slice(r0, r0 + 500)
+        radius[sl] = _sample_radius(x[sl], y[sl], lat[sl], group)
+    bands, sc_source, sc_xyz_km = _group_obs(
+        sid,
+        group,
+        lon,
+        lat,
+        radius,
+        scan0,
+        _read_topo(ftopo) if ftopo else None,
+        _l1_snr(fl1) if fl1 else None,
+        stage_dir,
+    )
+    bands = {n: np.asarray(a, "float32") for n, a in bands.items()}
+    tree = cKDTree(np.array([(g.row, g.col) for g in gcps], dtype="float64"))
+    rr, cc = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
+    d, _ = tree.query(np.stack([rr.ravel(), cc.ravel()], axis=1))
+    bands["tie_dist"] = (d * IIRS_GSD_M).reshape(ny, nx).astype("float32")
+    return {
+        "bands": bands,
+        "groups": {group: (scan0, scan0 + ny - 1)},
+        "sensor_source": sc_source,
+        "sc_xyz_m": sc_xyz_km * 1000.0,
     }
 
 
@@ -596,9 +650,21 @@ def _tie_dist(sid: str, groups: list[str], ny: int, nx: int) -> np.ndarray:
     return out
 
 
+ISSDC_OBS_FIXES = (
+    "vs ISSDC ndi _d_obs_: band 5 is the phase angle (ISSDC writes 180 - phase); band 6 is the absolute "
+    "Sun-pixel distance in AU (ISSDC: km, but labelled au minus a constant); band 7 "
+    "is the true pixel-IIRS range in m (ISSDC: near-constant ~1735.6 km); bands 8-9 are real facet "
+    "slope/aspect in deg (ISSDC: ~89.9 deg slope): slope is the tilt of the LOLA facet normal from the local "
+    "vertical, i.e. of the facet from the local horizontal (tangent) plane; aspect is the facet's downhill "
+    "direction projected onto that tangent plane, clockwise from local true north, 0-360; both from the DEM "
+    "gradient smoothed to the IIRS ground sample"
+)
+
+
 def write_obs(fout: Path, obs: dict, sid: str, compress: str = "ZSTD", predictor: int = 3, row0: int = 0) -> Path:
-    """Write `<sid>_obs.tif`/`.img`: 14-band f32, camera space (no CRS), bands 1-10 in M3 order/
-    units, bands 11-14 IIRS extras. Lossless, tiled, `INTERLEAVE=BAND`."""
+    """Write `<sid>_obs.tif`/`.img`: 14-band f32, camera space (no CRS). Bands 1-9 are ISSDC's ndi `_d_obs_`
+    layout, with the values it promises (see `ISSDC_OBS_FIXES`); bands 10-14 are extras. Lossless, tiled,
+    `INTERLEAVE=BAND`."""
     fout = Path(fout)
     fout.parent.mkdir(parents=True, exist_ok=True)
     names_units = [
@@ -622,22 +688,25 @@ def write_obs(fout: Path, obs: dict, sid: str, compress: str = "ZSTD", predictor
         "IIRS_PRODUCT": "OBS",
         "IIRS_FORMAT_VERSION": "1",
         "IIRS_SID": sid,
-        "CONVENTION": "Bands 1-10 follow the Chandrayaan-1 M3 L1B OBS layout and units; bands 11+ are IIRS extensions",
+        "CONVENTION": "Bands 1-9 follow the ISSDC ndi _d_obs_ band order; bands 10+ are extensions",
+        "ISSDC_OBS_FIXES": ISSDC_OBS_FIXES,
         "GEOMETRY_BASIS": (
-            "Registration-derived: sun/sensor terms from SPICE at the loc's TPS-registered XYZ; "
-            "facet terms from the LOLA DEM normal, not a sensor-model ray/DEM intersection."
+            "Registration-derived: sun/sensor terms at the loc's TPS-registered XYZ, row times from the nri "
+            "label; facet terms from the LOLA DEM normal, not a sensor-model ray/DEM intersection."
+        ),
+        "SENSOR_GEOMETRY_SOURCE": (
+            f"{obs['sensor_source']} (spk: CH2 SPK; spm: the nri .spm state vector, identical to the SPK; "
+            "none: bands 3-5 and 7 NaN)"
         ),
         "BANDS": "; ".join(f"{i} {n} [{u}]" for i, (n, u) in enumerate(names_units, start=1)),
         "ANGLE_CONVENTION": (
             "Azimuth clockwise from local topocentric north, 0-360 deg. Zenith from the local "
             "vertical (sphere normal for sun/sensor bands, DEM facet normal for facet_cos_i). "
-            "Facet aspect clockwise from local north (M3 DPSIS Sec 2.5.3.3/3.2.1.7-8)."
+            "Facet aspect clockwise from local north."
         ),
         "FACET_SCALE_M": str(IIRS_GSD_M),
         "PAN_BANDS": ",".join(str(b) for b in PAN_BANDS),
         "SHADOW_SNR": str(SHADOW_SNR),
-        "SUN_DISTANCE_MEAN_AU": str(obs["sun_distance_mean_au"]),
-        "SENSOR_GEOMETRY_AVAILABLE": str(obs["sensor_available"]),
         "QA_FILE": f"{sid}_qa.tif",
         "SKY_VIEW_STATUS": "reserved, NaN: the lit_frac horizon sweep only samples toward the sun's own azimuth",
         "TIE_DIST_DEFINITION": "distance to the nearest solved GCP lattice node, not the raw tie-point detection",

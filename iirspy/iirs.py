@@ -47,20 +47,46 @@ def _try_load_next_level_metadata(basename, target_level, directory, xyextent):
     return result
 
 
-def _loc_extent(fqub, lonlatextent):
-    """(minx, maxx, miny, maxy) of the rows whose pixels fall in `lonlatextent`, from the `_d_loc_`
-    ENVI backplane an ndi bundle ships beside its cube (it has no geometry csv). Same convention as
-    `utils.parse_geom`: x inclusive, y half-open."""
+def _flip(da, flip):
+    """`da` reversed along y and/or x per `flip` = (flip_y, flip_x), keeping its ascending coords."""
+    sl = {d: slice(None, None, -1) for d, f in zip(("y", "x"), flip, strict=True) if f}
+    return da.isel(sl).assign_coords({d: da[d].values for d in sl})
+
+
+def read_issdc_loc(fqub):
+    """ISSDC's ndi `_d_loc_` beside `fqub` as a `backplanes.read_loc` dataset in the nci camera frame
+    (y = Scan, x = Pixel, as the geometry csv and our GLTs index it), and the (flip_y, flip_x) that
+    takes the ndi cube to the same frame, or None if there is no `_d_loc_`.
+
+    ndi products are stored north-up/west-left, not in acquisition order: a descending pass comes
+    column-mirrored, an ascending one row-reversed. The label's Refined upper-left corner is nci
+    Scan 0/Pixel 0, so whichever loc corner sits on it is the origin.
+    """
+    from iirspy.backplanes import read_loc
+
     floc = next(Path(fqub).parent.glob(f"{Path(fqub).name.split('_d_')[0]}_d_loc_*.img"), None)
     if floc is None:
-        raise FileNotFoundError(f"no geometry csv or _d_loc_ backplane beside {fqub} to crop by lon/lat")
-    with rasterio.open(floc) as src:
-        lon, lat = src.read(1), src.read(2)
-    lon = (lon + 180) % 360 - 180
+        return None
+    loc = read_loc(floc)
+    ul = pdr.open(fqub).metaget("isda:Refined_Corner_Coordinates")
+    lon0, lat0 = float(ul["isda:upper_left_longitude"]), float(ul["isda:upper_left_latitude"])
+    lon, lat = loc.lon.values[:: -1 or None], loc.lat.values
+    corners = [(i, j) for i in (0, -1) for j in (0, -1)]
+    dlon = [((lon[c] - lon0 + 180) % 360 - 180) * np.cos(np.radians(lat0)) for c in corners]
+    d = np.hypot(dlon, [lat[c] - lat0 for c in corners])
+    flip = tuple(bool(k) for k in corners[int(np.argmin(d))])
+    return _flip(loc, flip), flip
+
+
+def _loc_extent(loc, lonlatextent):
+    """(minx, maxx, miny, maxy) of the rows whose pixels fall in `lonlatextent`, from an ndi bundle's
+    `read_issdc_loc` (it has no geometry csv). Same convention as `utils.parse_geom`: x inclusive,
+    y half-open."""
+    lon, lat = (loc.lon.values + 180) % 360 - 180, loc.lat.values
     lon0, lon1, lat0, lat1 = (d if e is None else e for e, d in zip(lonlatextent, (-180, 180, -90, 90), strict=True))
     rows = np.flatnonzero(((lon >= lon0) & (lon <= lon1) & (lat >= lat0) & (lat <= lat1)).any(axis=1))
     if not rows.size:
-        raise ValueError(f"no pixels of {floc.name} inside {lonlatextent}")
+        raise ValueError(f"no pixels of the _d_loc_ inside {lonlatextent}")
     return (0, lon.shape[1] - 1, int(rows[0]), int(rows[-1]) + 1)
 
 
@@ -1374,11 +1400,16 @@ class L2(IIRSData):
         self.geomdf = metadata["geometry_df"]
         self.spm = metadata["spm"]
 
+        issdc = None if self.geomdf is not None else read_issdc_loc(self.qub)
+        if issdc is not None:
+            self.img = _flip(self.img, issdc[1])  # into the nci camera frame, like the loc
         if self.geomdf is not None:
             self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, center=False)
             self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent, strict=False))
         elif any(e is not None for e in lonlatextent):
-            self.extent = _loc_extent(self.qub, lonlatextent)
+            if issdc is None:
+                raise FileNotFoundError(f"no geometry csv or _d_loc_ backplane beside {self.qub} to crop by lon/lat")
+            self.extent = _loc_extent(issdc[0], lonlatextent)
 
         # x extent is an inclusive last-pixel index (249 on a 250-wide cube) against pixel-centre
         # coords, so +1 keeps that last column; y stays half-open to match `solve.build_l1`'s crop.
@@ -1389,6 +1420,7 @@ class L2(IIRSData):
             raise ValueError(f"No data found within extent {self.extent} for {self.basename}.") from e
 
         self.shape = self.img.shape
+        self.img = self.img.where(self.img != 0)  # ISSDC ndi fill is exact 0, not a declared nodata
 
         if self.geomdf is not None:
             lon, lat = utils.geom2latlon_coords(self.geomdf, self.extent, self.shape[2], self.shape[1])

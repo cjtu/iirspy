@@ -12,7 +12,7 @@ a GLT so the strip can be projected into north/south polar stereographic or equa
 
 Typical use:
 
-    reg = register("ch2_iir_<sid>_l1_polar.tif", fgeom, fspm, cfg)
+    reg = register("ch2_iir_<sid>_l1_polar.tif", fgeom, flabel, cfg)
     scene_glt(sid, group, reg.gcps, cfg, scan0, glt_dir)   # project products by indexing
 
 The matcher needs `arosics`, which needs `osgeo.gdal`, which needs conda. `register` handles
@@ -384,11 +384,11 @@ def _enu(lon, lat):
     return east, north, up
 
 
-def sun_geometry(fgeom, fspm, cfg, kernels=None):
+def sun_geometry(fgeom, flabel, cfg, kernels=None):
     """
     (az_grid, elev, solar_radius_deg) for the epoch this strip crosses the AOI, from SPICE.
 
-    Three corrections a mean-spm hillshade misses, worth +0.4 to +0.9 correlation together:
+    Three corrections a mean-spm-angle hillshade misses, worth +0.4 to +0.9 correlation together:
     the sun azimuth is measured from *local* north but the grid's north differs by lon - lon_0
     (-5 to -50 deg along these strips); the tangent-plane elevation is not the spm's local one;
     and the solar angular radius is 0.2616-0.2700 deg here, not the hardcoded 0.25.
@@ -402,10 +402,8 @@ def sun_geometry(fgeom, fspm, cfg, kernels=None):
     lon = np.where(df.Longitude > 180, df.Longitude - 360, df.Longitude)
     gx, gy = to_stereo(cfg.pole).transform(lon, df.Latitude.values)
     ins = (gx > cfg.aoi[0]) & (gx < cfg.aoi[2]) & (gy > cfg.aoi[1]) & (gy < cfg.aoi[3])
-    spm = utils.load_iirs_spm(fspm)
-    sub = spm[(spm.row >= df.Scan.values[ins].min()) & (spm.row <= df.Scan.values[ins].max())] if ins.any() else spm
-    t = pd.Timestamp(sub.datetime.iloc[len(sub) // 2] if len(sub) else spm.datetime.iloc[0])
-    et = sp.str2et(t.strftime("%Y-%m-%dT%H:%M:%S.%f"))
+    scans = df.Scan.values[ins] if ins.any() else df.Scan.values
+    et = sp.str2et(utils.scan_utc(flabel, [int(np.median(scans))])[0])
 
     v, _ = sp.spkpos("SUN", et, "IAU_MOON", "LT+S", "MOON")
     u = np.asarray(v) / np.linalg.norm(v)
@@ -427,13 +425,13 @@ def sun_geometry(fgeom, fspm, cfg, kernels=None):
     return float(az_grid), float(el), float(r_sun)
 
 
-def sun_geometry_rows(gcps, shape, fspm, cfg, scan0, kernels=None):
+def sun_geometry_rows(gcps, shape, flabel, cfg, scan0, kernels=None):
     """(az_grid, elev) at every camera *pixel*. Exact sun angle on the solved geometry.
 
     Ground position comes from `camera_xy` (the solved GCP lattice).
 
-    `scan0` is the crop's first absolute Scan (`solve.build_l1`'s own return): `fspm` is indexed
-    by absolute Scan, not this crop's own 0-based row numbering.
+    `scan0` is the crop's first absolute Scan (`solve.build_l1`'s own return): `flabel` (the nri label) times
+    absolute Scans, not this crop's own 0-based row numbering.
     """
     import spiceypy as sp
 
@@ -445,10 +443,7 @@ def sun_geometry_rows(gcps, shape, fspm, cfg, scan0, kernels=None):
     lon, lat = to_lonlat(cfg.pole).transform(x, y)
     lon = np.where(lon > 180, lon - 360, lon)
 
-    spm = utils.load_iirs_spm(fspm)
-    spm_row = spm.row.to_numpy()
-    spm_ns = spm.datetime.to_numpy().astype("datetime64[ns]").astype("int64")
-    row_ns = np.interp(scan0 + np.arange(ny), spm_row, spm_ns).astype("int64")
+    utc = utils.scan_utc(flabel, scan0 + np.arange(ny))
 
     lon0 = stereo_crs(cfg.pole).to_dict().get("lon_0", 0.0)
     grid_sign = 0.0 if cfg.pole == "equatorial" else (-1.0 if cfg.pole == "north" else 1.0)
@@ -456,8 +451,7 @@ def sun_geometry_rows(gcps, shape, fspm, cfg, scan0, kernels=None):
     az = np.empty((ny, nx))
     el = np.empty((ny, nx))
     for r in range(ny):
-        et = sp.str2et(pd.Timestamp(row_ns[r]).strftime("%Y-%m-%dT%H:%M:%S.%f"))
-        v, _ = sp.spkpos("SUN", et, "IAU_MOON", "LT+S", "MOON")
+        v, _ = sp.spkpos("SUN", sp.str2et(utc[r]), "IAU_MOON", "LT+S", "MOON")
         u = np.asarray(v) / np.linalg.norm(v)
         east, north, up = _enu(lon[r], lat[r])  # each (3, nx): this row's local frame per column
         az[r] = (np.degrees(np.arctan2(u @ east, u @ north)) + grid_sign * (lon[r] - lon0)) % 360
@@ -547,7 +541,7 @@ def _to_gsd(a, ps_src, cfg):
     return gaussian_filter(a, (cfg.iirs_gsd_m / 2.355) / ps_src)
 
 
-def render_reference(fgeom, fspm, cfg, kernels=None):
+def render_reference(fgeom, flabel, cfg, kernels=None):
     """
     Two-tier hillshade on the AOI grid: near field at native 20 m, far field at 240 m.
 
@@ -555,7 +549,7 @@ def render_reference(fgeom, fspm, cfg, kernels=None):
     d^2/2R, so at 1-4 deg the horizon is set 100-160 km up-sun and a single 60 km window is blind
     to it -- always toward too much light. Returns (shade, info).
     """
-    az, el, r_sun = sun_geometry(fgeom, fspm, cfg, kernels)
+    az, el, r_sun = sun_geometry(fgeom, flabel, cfg, kernels)
     lit_n, tr_n, ps_n, z_n, _ = _tier(cfg.dem_near, cfg, az, el, r_sun, cfg.near_m, 0.0)
     lit = lit_n
     if cfg.dem_far:
@@ -580,10 +574,10 @@ def use_wac(elev_deg, cfg) -> bool:
     return bool(cfg.wac_mosaic) and elev_deg >= WAC_MIN_ELEV_DEG
 
 
-def render_wac(fgeom, fspm, cfg, kernels=None):
+def render_wac(fgeom, flabel, cfg, kernels=None):
     from rasterio.vrt import WarpedVRT
 
-    az, el, r_sun = sun_geometry(fgeom, fspm, cfg, kernels)
+    az, el, r_sun = sun_geometry(fgeom, flabel, cfg, kernels)
     if not cfg.wac_mosaic:
         raise ValueError("cfg.wac_mosaic is unset; no WAC mosaic to render from")
     _, _, tr, prof = grid_of(cfg)
@@ -617,7 +611,7 @@ def slope_aspect(gx, gy):
     return np.degrees(np.arctan(np.hypot(gx, gy))), np.degrees(np.arctan2(-gx, -gy)) % 360.0
 
 
-def render_topo(fgeom, fspm, cfg, kernels=None):
+def render_topo(fgeom, flabel, cfg, kernels=None):
     """
     The hillshade taken apart into the terms a photometric model needs, on the near DEM grid.
 
@@ -635,7 +629,7 @@ def render_topo(fgeom, fspm, cfg, kernels=None):
     Returns (gx, gy, lit, transform, info) on the near tier's own grid; feed it to
     :func:`camera_topo` to land in camera space.
     """
-    az, el, r_sun = sun_geometry(fgeom, fspm, cfg, kernels)
+    az, el, r_sun = sun_geometry(fgeom, flabel, cfg, kernels)
     lit, tr_n, ps_n, _, z_raw = _tier(cfg.dem_near, cfg, az, el, r_sun, cfg.near_m, 0.0)
     if cfg.dem_far:
         lit_f, tr_f, _, _, _ = _tier(cfg.dem_far, cfg, az, el, r_sun, _far_reach(cfg, el), cfg.near_m, dec=cfg.far_dec)
@@ -666,7 +660,7 @@ def camera_xy(gcps, shape):
     return tuple(RectBivariateSpline(rows, cols, a, kx=kx, ky=ky)(ys, xs) for a in xy)
 
 
-def camera_gradients(gcps, shape, fgeom, fspm, cfg, kernels=None):
+def camera_gradients(gcps, shape, fgeom, flabel, cfg, kernels=None):
     """(sx, sy, lit, info) sampled into (y, x) camera space east/north gradients, not yet slope/aspect.
 
     Each camera pixel is sampled bilinearly at its map position - consistency with hillshade.
@@ -675,7 +669,7 @@ def camera_gradients(gcps, shape, fgeom, fspm, cfg, kernels=None):
     rather than extrapolated. On a strip several times longer than the AOI that is most of the
     scene.
     """
-    gx, gy, lit, tr, info = render_topo(fgeom, fspm, cfg, kernels)
+    gx, gy, lit, tr, info = render_topo(fgeom, flabel, cfg, kernels)
     x, y = camera_xy(gcps, shape)
     rc = [(y - tr.f) / tr.e, (x - tr.c) / tr.a]
     # Sample the gradients, then convert: aspect is circular, so interpolating the angle would
@@ -686,12 +680,12 @@ def camera_gradients(gcps, shape, fgeom, fspm, cfg, kernels=None):
     return sx.astype("float32"), sy.astype("float32"), slit.astype("float32"), info
 
 
-def camera_topo(gcps, shape, fgeom, fspm, cfg, kernels=None):
+def camera_topo(gcps, shape, fgeom, flabel, cfg, kernels=None):
     """(slope, aspect, lit) as (y, x) camera-space arrays, for the L2 photometric correction.
 
     See :func:`camera_gradients` for the sampling; this just converts its gradients to slope/aspect.
     """
-    sx, sy, lit, info = camera_gradients(gcps, shape, fgeom, fspm, cfg, kernels)
+    sx, sy, lit, info = camera_gradients(gcps, shape, fgeom, flabel, cfg, kernels)
     slope, aspect = slope_aspect(sx, sy)
     return slope.astype("float32"), aspect.astype("float32"), lit, info
 
@@ -780,7 +774,7 @@ def _split_run(r0, r1, max_rows=2000):
     return list(zip(edges[:-1].tolist(), edges[1:].tolist(), strict=True))
 
 
-def scene_topo(sid, group, gcps, shape, fgeom, fspm, cfg, kernels, topo_dir, scan0=0, overwrite=False) -> Path:
+def scene_topo(sid, group, gcps, shape, fgeom, flabel, cfg, kernels, topo_dir, scan0=0, overwrite=False) -> Path:
     """The scene's camera-space topo product (slope/aspect/lit + per-pixel sun), built if not there.
 
     Splits the strip into `_split_run`-sized pieces, each its own band (see `_row_bands`), its own
@@ -827,12 +821,12 @@ def scene_topo(sid, group, gcps, shape, fgeom, fspm, cfg, kernels, topo_dir, sca
         )
         pcfg = replace(cfg, aoi=aoi, dem_near=b["dem_near"], dem_far=b["dem_far"])
         shifted = [GroundControlPoint(row=g.row - a, col=g.col, x=g.x, y=g.y) for g in gcps]
-        psx, psy, plit, _ = camera_gradients(shifted, (z - a, nx), fgeom, fspm, pcfg, kernels)
+        psx, psy, plit, _ = camera_gradients(shifted, (z - a, nx), fgeom, flabel, pcfg, kernels)
         sx[a:z], sy[a:z], lit[a:z] = psx, psy, plit
         used_bands.append(name)
 
     slope, aspect = slope_aspect(sx, sy)
-    sun_az, sun_elev = sun_geometry_rows(gcps, shape, fspm, cfg, scan0, kernels)
+    sun_az, sun_elev = sun_geometry_rows(gcps, shape, flabel, cfg, scan0, kernels)
     mid = ny // 2
     tags = {
         "az_grid": float(sun_az[mid, nx // 2]),
@@ -1309,6 +1303,14 @@ def gcp_lattice(fgeom, ny, nx, cfg):
     return jj, ii, x, y
 
 
+def geom_csv_gcps(fgeom, cfg):
+    """(gcps, scan0, camera_shape) of the supplied geometry csv alone over `cfg.lat_band`'s scans:
+    the uncorrected ISSDC geolocation, ready for `make_glt(gcps, cfg, camera_shape, scan0)`."""
+    _, (_, x1, y0, y1) = utils.parse_geom(fgeom, (-180, 180, *cfg.lat_band))
+    shape = (y1 - y0 + 1, x1 + 1)  # both ends are geometry scans, so both are in
+    return _to_gcps(*gcp_lattice(fgeom, *shape, cfg)), y0, shape
+
+
 def _to_gcps(jj, ii, x, y):
     return [
         GroundControlPoint(row=float(jj[a, b]), col=float(ii[a, b]), x=float(x[a, b]), y=float(y[a, b]))
@@ -1439,7 +1441,7 @@ def arosics_python():
     )
 
 
-def _register_subprocess(ftif, fgeom, fspm, cfg, kernels, reference, verbose):
+def _register_subprocess(ftif, fgeom, flabel, cfg, kernels, reference, verbose):
     """Run the solve through iirspy.coreg in the arosics environment; rebuild it from the json."""
     py = arosics_python()
     root = Path(__file__).resolve().parents[1]
@@ -1453,7 +1455,7 @@ def _register_subprocess(ftif, fgeom, fspm, cfg, kernels, reference, verbose):
             json.dumps({
                 "ftif": str(ftif),
                 "fgeom": str(fgeom),
-                "fspm": str(fspm),
+                "flabel": str(flabel),
                 "cfg": asdict(cfg),
                 "kernels": [str(k) for k in kernels or []],
                 "reference": None if ref is None else str(ref),
@@ -1567,7 +1569,7 @@ def _best_iterate(best_p95, best_xy, last_p95, x, y):
     return x, y, None
 
 
-def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False):
+def register(ftif, fgeom, flabel, cfg, kernels=None, reference=None, verbose=False):
     """
     Solve a scene's registration against LOLA. Returns a :class:`Registration`.
 
@@ -1580,7 +1582,7 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
     environment through :mod:`iirspy.coreg`.
     """
     if not _has_arosics():
-        return _register_subprocess(ftif, fgeom, fspm, cfg, kernels, reference, verbose)
+        return _register_subprocess(ftif, fgeom, flabel, cfg, kernels, reference, verbose)
 
     ref = reference
     info = {}
@@ -1589,7 +1591,7 @@ def register(ftif, fgeom, fspm, cfg, kernels=None, reference=None, verbose=False
             a = src.read(1, masked=True).filled(np.nan).astype("float32")
         ref = np.where(a == -9999.0, np.nan, a)
     if ref is None:
-        ref, hs_info = render_reference(fgeom, fspm, cfg, kernels)
+        ref, hs_info = render_reference(fgeom, flabel, cfg, kernels)
         info["reference"] = hs_info
 
     t0 = time.time()

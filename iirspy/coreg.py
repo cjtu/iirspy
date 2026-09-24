@@ -32,7 +32,7 @@ def run_job(fjob):
     reg = register(
         job["ftif"],
         job["fgeom"],
-        job["fspm"],
+        job["flabel"],
         cfg,
         kernels=job.get("kernels"),
         reference=job.get("reference"),

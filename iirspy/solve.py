@@ -658,7 +658,7 @@ def _chunk_grade(r) -> str:
     return "suspect" if r["fit"].get("stats", {}).get("coarse", {}).get("accepted") else "fallback"
 
 
-def _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks, pin_coarse=False):
+def _solve_one(c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=False):
     """Solve chunk `c` seeded from `seed` (a prior coarse shift in metres), or reuse its cache.
 
     `pin_coarse` holds the chunk at `seed` exactly: `coarse_max_m=0` leaves the coarse search one
@@ -718,16 +718,16 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks, pin_coarse=Fal
     # Which reference is decided by the sun, not by trying one and detecting failure: above
     # `georef.WAC_MIN_ELEV_DEG` there is no shadow contrast for a hillshade to carry (0 of 16 chunks
     # above 70 deg ever matched one) and the scene reads as albedo, which is what WAC shows.
-    _, elev, _ = sun_geometry(fgeom, fspm, cfg, kernels)
+    _, elev, _ = sun_geometry(fgeom, flabel, cfg, kernels)
     wac = use_wac(elev, cfg)
-    ref, hs_info = (render_wac if wac else render_reference)(fgeom, fspm, cfg, kernels)
+    ref, hs_info = (render_wac if wac else render_reference)(fgeom, flabel, cfg, kernels)
     hs_s = time.time() - t0
     save_grid(OUT / f"chunk{i}_hs.tif", ref, cfg)
     log(f"chunk {i}: {'wac' if wac else 'hillshade'} ref {hs_s:.1f}s, shape {ref.shape}")
 
     with phase(f"chunk {i} register") as ph:
         try:
-            reg = register(ftif, fgeom, fspm, cfg, reference=ref, verbose=True)
+            reg = register(ftif, fgeom, flabel, cfg, reference=ref, verbose=True)
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             log(f"chunk {i}: FAILED -- {err}")
@@ -783,14 +783,14 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks, pin_coarse=Fal
     return {"chunk": c, "gcps": gcps_by_rc, "fit": fit}
 
 
-def _solve_chunks_hillshade(chunks, cfg0, fgeom, fspm):
+def _solve_chunks_hillshade(chunks, cfg0, fgeom, flabel):
     """Render and save each chunk's reference hillshade only, no registration."""
     from iirspy.georef import render_reference, save_grid
 
     for c in chunks:
         cfg = replace(cfg0, aoi=c["aoi"], dem_near=c["dem_near"], dem_far=c["dem_far"])
         t0 = time.time()
-        ref, hs_info = render_reference(fgeom, fspm, cfg, ck.kernels(SID[:8]))
+        ref, hs_info = render_reference(fgeom, flabel, cfg, ck.kernels(SID[:8]))
         save_grid(OUT / f"chunk{c['i']}_hs.tif", ref, cfg)
         log(
             f"chunk {c['i']} [{c['band']}] hillshade {time.time() - t0:.1f}s shape={ref.shape} "
@@ -799,7 +799,7 @@ def _solve_chunks_hillshade(chunks, cfg0, fgeom, fspm):
         )
 
 
-def _consensus_pass(chunks, results, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
+def _consensus_pass(chunks, results, cfg0, ftif, fgeom, flabel, decay_m, tweaks):
     """Re-solve every chunk that disagrees with the strip's consensus coarse shift, seeded from it.
 
     The coarse search estimates a quantity that is near-constant along a strip, so running it
@@ -831,13 +831,13 @@ def _consensus_pass(chunks, results, cfg0, ftif, fgeom, fspm, decay_m, tweaks):
         log(f"  chunk {c['i']}: shift={_shift_of(results[idx])} dev={dev:.0f}m {'RESEED' if off else 'keep'}")
         if not (off and enforce):
             continue
-        results[idx] = _solve_one(c, consensus, cfg0, ftif, fgeom, fspm, decay_m, tweaks, pin_coarse=True)
+        results[idx] = _solve_one(c, consensus, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=True)
         if results[idx] is not None:
             results[idx]["fit"]["reseeded"] = True
     return results, {"coarse_consensus_m": list(consensus), "consensus_enforced": enforce, "uncorrected": False}
 
 
-def _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, hillshade_only):
+def _solve_chunks(chunks, cfg0, ftif, fgeom, flabel, decay_m, tweaks, hillshade_only):
     """Solve each chunk against its own hillshade, reusing any prior good solve of the same shape.
 
     A forward pass seeds each chunk with the last accepted chunk's coarse shift, then
@@ -847,17 +847,17 @@ def _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, hillshade_on
     decision, both empty when `hillshade_only`.
     """
     if hillshade_only:
-        _solve_chunks_hillshade(chunks, cfg0, fgeom, fspm)
+        _solve_chunks_hillshade(chunks, cfg0, fgeom, flabel)
         return [], {}
 
     results: list[dict | None] = [None] * len(chunks)
     seed = (0.0, 0.0)
     for idx, c in enumerate(chunks):
-        results[idx] = _solve_one(c, seed, cfg0, ftif, fgeom, fspm, decay_m, tweaks)
+        results[idx] = _solve_one(c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks)
         if _accepted(results[idx]):
             seed = _shift_of(results[idx])
 
-    results, info = _consensus_pass(chunks, results, cfg0, ftif, fgeom, fspm, decay_m, tweaks)
+    results, info = _consensus_pass(chunks, results, cfg0, ftif, fgeom, flabel, decay_m, tweaks)
     solved = [r for r in results if r is not None]
     consensus = info.get("coarse_consensus_m")
     for r in solved:
@@ -1156,9 +1156,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     cfg0 = replace(cfg0, lat_band=lat_range)
 
-    fspm = ck.spm(SID, STAGE)
-    if fgeom is None or fspm is None:
-        sys.exit(f"missing ancillary for {SID}: geometry={fgeom} spm={fspm}")
+    flabel = ck.label(SID, STAGE)
+    if fgeom is None or flabel is None:
+        sys.exit(f"missing ancillary for {SID}: geometry={fgeom} label={flabel}")
 
     band = read_band(ftif, cfg0.band)
     ny, nx = band.shape
@@ -1178,7 +1178,7 @@ def main(argv: list[str] | None = None) -> None:
         "gcp_row_margin": args.gcp_row_margin,
     }
 
-    results, consensus_info = _solve_chunks(chunks, cfg0, ftif, fgeom, fspm, decay_m, tweaks, args.hillshade_only)
+    results, consensus_info = _solve_chunks(chunks, cfg0, ftif, fgeom, flabel, decay_m, tweaks, args.hillshade_only)
 
     if args.hillshade_only:
         log(f"\n--hillshade-only: wrote {len(chunks)} hillshade(s), no solve.")

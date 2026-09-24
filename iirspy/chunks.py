@@ -305,17 +305,26 @@ def nri_zip(sid: str) -> Path | None:
     return hits[0] if hits else None
 
 
-def spm(sid: str, stage: Path | None = None) -> Path | None:
-    """`sid`'s nri .spm: first `ANC_ROOTS`, then `stage`, else extracted from the nri zip into `stage`.
+def _nri_file(pat: str, sid: str, stage: Path | None) -> Path | None:
+    """`pat` under `ANC_ROOTS`, then `stage`, else extracted (that file type only) from the nri zip into `stage`.
 
-    The spm rides inside the nri zip, so an archive copy is a shortcut, not a requirement.
+    It rides inside the nri zip, so an archive copy is a shortcut, not a requirement.
     """
-    pat = f"miscellaneous/raw/{sid[:8]}/ch2_iir_nri_{sid}_d_img_*.spm"
     roots = [*ANC_ROOTS, Path(stage)] if stage else ANC_ROOTS
     if (found := _one(pat, roots)) or stage is None or (fzip := nri_zip(sid)) is None:
         return found
-    utils.extract(fzip, stage, include=("*.spm",))
+    utils.extract(fzip, stage, include=("*" + Path(pat).suffix,))
     return _one(pat, [Path(stage)])
+
+
+def spm(sid: str, stage: Path | None = None) -> Path | None:
+    """`sid`'s nri .spm (spacecraft state, Moon-centred J2000, ~40 ms records). See `_nri_file`."""
+    return _nri_file(f"miscellaneous/raw/{sid[:8]}/ch2_iir_nri_{sid}_d_img_*.spm", sid, stage)
+
+
+def label(sid: str, stage: Path | None = None) -> Path | None:
+    """`sid`'s nri PDS4 label, the only scan-line clock (`utils.scan_utc`). See `_nri_file`."""
+    return _nri_file(f"data/raw/{sid[:8]}/ch2_iir_nri_{sid}_d_img_*.xml", sid, stage)
 
 
 def strip_backbone(fgeom: Path, lat_min: float = -90.0, lat_max: float = 90.0):

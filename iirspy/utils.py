@@ -1101,6 +1101,16 @@ def get_line_times(fimg):
     return line_times
 
 
+def scan_utc(flabel, scans):
+    """UTC (ISO, SPICE-ready) of each absolute Scan in `scans`, from `flabel`'s start time + line exposure.
+
+    The one scan -> time mapping: the .spm is ~40 ms ancillary records, not one per ~53 ms scan line, so
+    its row number is not a Scan.
+    """
+    t = get_line_times(flabel)[np.asarray(scans, dtype=int)]
+    return [pd.Timestamp(v, unit="s").strftime("%Y-%m-%dT%H:%M:%S.%f") for v in np.atleast_1d(t)]
+
+
 def get_iirs_shape_meta(fimg):
     """Return the shape of fimg from metadata (bands, lines, samples)."""
     axs = pdr.open(fimg).metaget("Array_3D_Spectrum").getall("Axis_Array")

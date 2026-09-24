@@ -161,7 +161,7 @@ def test_camera_topo_is_camera_gradients_then_slope_aspect(monkeypatch):
     """camera_topo must be exactly the split: camera_gradients's (sx, sy) fed through slope_aspect."""
     from dataclasses import replace
 
-    def fake_render_topo(fgeom, fspm, cfg, kernels=None):
+    def fake_render_topo(fgeom, flabel, cfg, kernels=None):
         tr = from_origin(0.0, 40.0, 40.0, 40.0)
         gx = np.linspace(-1.0, 1.0, 4 * 4).reshape(4, 4)
         gy = np.linspace(1.0, -1.0, 4 * 4).reshape(4, 4)
@@ -177,8 +177,8 @@ def test_camera_topo_is_camera_gradients_then_slope_aspect(monkeypatch):
     ]
     shape = (4, 4)
 
-    slope, aspect, lit, info = georef.camera_topo(gcps, shape, "fgeom", "fspm", cfg)
-    sx, sy, lit2, info2 = georef.camera_gradients(gcps, shape, "fgeom", "fspm", cfg)
+    slope, aspect, lit, info = georef.camera_topo(gcps, shape, "fgeom", "flabel", cfg)
+    sx, sy, lit2, info2 = georef.camera_gradients(gcps, shape, "fgeom", "flabel", cfg)
     want_slope, want_aspect = georef.slope_aspect(sx, sy)
 
     np.testing.assert_allclose(slope, want_slope)
@@ -237,7 +237,7 @@ def test_scene_topo_assembles_pieces_with_no_blending_and_exact_per_row_sun(tmp_
 
     calls = []
 
-    def fake_render_topo(fgeom, fspm, cfg, kernels=None):
+    def fake_render_topo(fgeom, flabel, cfg, kernels=None):
         xs, ys, tr, _ = georef.grid_of(cfg)
         val = float(cfg.aoi[1])  # unique per piece: pieces don't overlap in y
         gx = np.full((len(ys), len(xs)), val, "float32")
@@ -255,13 +255,13 @@ def test_scene_topo_assembles_pieces_with_no_blending_and_exact_per_row_sun(tmp_
     monkeypatch.setattr(
         georef,
         "sun_geometry_rows",
-        lambda gcps, shape, fspm, cfg, scan0, kernels=None: (
+        lambda gcps, shape, flabel, cfg, scan0, kernels=None: (
             np.full(shape, 20.0),
             want_elev,
         ),
     )
 
-    f = georef.scene_topo("sid", "equatorial", gcps, (ny, nx), "fgeom", "fspm", cfg, [], tmp_path)
+    f = georef.scene_topo("sid", "equatorial", gcps, (ny, nx), "fgeom", "flabel", cfg, [], tmp_path)
 
     assert len(calls) >= 2  # the strip really did split into multiple pieces
 
@@ -362,3 +362,7 @@ def test_gcp_lattice_samples_the_geometry_spline_at_the_right_rows(tmp_path):
     # No default crop to fall back on: guessing one mis-indexes every GCP by thousands of rows.
     with pytest.raises(ValueError, match="lat_band"):
         georef.gcp_lattice(fgeom, ny, nx, replace(cfg, lat_band=None))
+
+    gcps, s0, cam = georef.geom_csv_gcps(fgeom, cfg)  # the whole csv: crop-relative rows, scan0 back out
+    assert (s0, cam) == (scan0, (ny, nx))
+    assert min(g.row for g in gcps) == 0 and max(g.row for g in gcps) == ny - 1
