@@ -115,6 +115,7 @@ def test_a_registered_chunk_anchors_even_when_its_coarse_peak_was_refused(monkey
 
 def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeypatch):
     monkeypatch.setattr(solve, "log", lambda msg: None)
+    monkeypatch.setattr(solve, "SID", "20201202T2319552644")  # "" -> glob "**.spm", ValueError on py3.12
 
     def boom(*args, **kwargs):
         raise RuntimeError("rebuild-attempted")
