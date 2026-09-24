@@ -25,6 +25,7 @@ def _bound_inst(img, loc):
     inst.to_geotiff = MethodType(IIRSData.to_geotiff, inst)
     inst._cube_scan0 = MethodType(IIRSData._cube_scan0, inst)
     inst._read_loc = MethodType(IIRSData._read_loc, inst)
+    inst._render = MethodType(IIRSData._render, inst)
     return inst
 
 
@@ -63,6 +64,33 @@ def test_to_geotiff_places_pixel_values_at_the_expected_map_cell(tmp_path):
     gx = int((x[r, c] - tr.c) / tr.a)
     gy = int((y[r, c] - tr.f) / tr.e)
     assert data[gy, gx] == cube[0, r, c]
+
+
+def test_to_geotiff_from_a_saved_glt_renders_only_the_cropped_cubes_scans(tmp_path):
+    ny, nx = 6, 5
+    loc, x, y = _synthetic_loc(ny, nx, dx=2000.0, dy=-2000.0)
+    crs = georef.stereo_crs("south")
+    table, tr = _bound_inst(xr.DataArray(np.zeros((1, ny, nx), "float32"), dims=("band", "y", "x")), loc).glt(
+        crs, res=2000.0
+    )
+    fglt = tmp_path / "glt.tif"
+    with rasterio.open(
+        fglt, "w", driver="GTiff", height=ny, width=nx, count=2, dtype="int32", crs=crs, transform=tr
+    ) as dst:
+        dst.write(table)
+
+    cube = np.arange(ny * nx, dtype="float32").reshape(1, ny, nx)
+    full = xr.DataArray(cube, dims=("band", "y", "x"), coords={"band": [1], "y": np.arange(ny), "x": np.arange(nx)})
+    inst = _bound_inst(full.isel(y=slice(2, 5)), loc=None)  # scans 2-4 only, as a lat crop leaves it
+    fout = tmp_path / "render.tif"
+    inst.to_geotiff(str(fout), glt=fglt, full_bands=False, row_block=1)
+
+    with rasterio.open(fout) as src:
+        data, otr = src.read(1), src.transform
+    assert data.shape == (3, nx)
+    assert set(np.unique(data[np.isfinite(data)])) == set(cube[0, 2:5].ravel())
+    r, c = 3, 1
+    assert data[int((y[r, c] - otr.f) / otr.e), int((x[r, c] - otr.c) / otr.a)] == cube[0, r, c]
 
 
 def test_geoloc_vrt_warps_to_the_same_placement_as_glt(tmp_path):

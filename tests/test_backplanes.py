@@ -159,43 +159,6 @@ def test_write_read_loc_and_qa_round_trip_tif_and_img_absolute_rows(tmp_path):
             assert tags["IIRS_PRODUCT"] == "QA"
 
 
-def test_solve_scorecard_agrees_between_make_glt_and_glt_from_loc(tmp_path, monkeypatch):
-    from dataclasses import replace
-
-    import xarray as xr
-
-    from iirspy import solve
-    from iirspy.georef import GeorefConfig, make_glt
-
-    nrow0, ncol, extra = 5, 4, 3
-    gcps = {(r, c): (2000.0 * c, -2000.0 * r) for r in range(nrow0) for c in range(ncol)}
-
-    dem = _write_dem_tif(tmp_path / "dem.tif", 0.0, (-3000, 9000), (-17000, 3000))
-    monkeypatch.setattr(
-        ck, "bands", lambda: {"south": {"group": "south", "lat_range": (-90.0, 90.0), "dem_near": str(dem)}}
-    )
-
-    lon, lat, _radius = bp._group_loc_core(gcps, "south", nrow=nrow0 + extra, ncol=ncol)
-    assert np.isfinite(lon[nrow0:]).all() and np.isfinite(lat[nrow0:]).all()  # extrapolated rows, not NaN
-
-    ds = xr.Dataset(
-        {"lon": (("y", "x"), lon), "lat": (("y", "x"), lat)},
-        coords={"y": np.arange(nrow0 + extra), "x": np.arange(ncol)},
-    )
-    cfg = replace(GeorefConfig(), pole="south", aoi=(0.0, -2000.0 * (nrow0 - 1), 2000.0 * (ncol - 1), 0.0), ps=2000.0)
-    glt_loc, _tr = georef.glt_from_loc(ds, "south", cfg)
-
-    gcp_list = [georef.GroundControlPoint(row=float(r), col=float(c), x=x, y=y) for (r, c), (x, y) in gcps.items()]
-    glt_orig = make_glt(gcp_list, cfg, (nrow0, ncol), scan0=0)
-
-    score = solve._glt_scorecard(glt_orig, glt_loc)
-    assert score["n_both"] > 0
-    assert score["n_only_original"] == 0 and score["n_only_loc"] == 0
-    assert 0.0 < score["frac_identical"] <= 1.0
-    assert score["frac_within_1px"] == 1.0
-    assert score["max_dcol"] <= 1.0 and score["max_drow"] <= 1.0
-
-
 def test_glt_from_loc_recovers_known_camera_pixels(monkeypatch):
     from dataclasses import replace
 

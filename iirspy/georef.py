@@ -1790,6 +1790,19 @@ def apply_glt(cube, glt, cube_scan0=0, window=None) -> np.ndarray:
     return out
 
 
+def crop_glt(glt, tr, scan0, nrow) -> tuple[np.ndarray, rasterio.Affine]:
+    """`glt` cut down to the cells fed by scans `scan0 .. scan0+nrow-1` (e.g. a lat-cropped cube):
+    cells from other scans become `NODATA`, then the table is trimmed to those cells' bbox."""
+    glt = glt.copy()
+    keep = (glt[0] >= 0) & (glt[1] >= scan0) & (glt[1] < scan0 + nrow)
+    glt[:, ~keep] = NODATA
+    if not keep.any():
+        raise ValueError(f"glt has no cells from scans {scan0}-{scan0 + nrow - 1}")
+    rows, cols = np.flatnonzero(keep.any(1)), np.flatnonzero(keep.any(0))
+    r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+    return glt[:, r0:r1, c0:c1], tr * rasterio.Affine.translation(c0, r0)
+
+
 def save_glt(fout, glt, cfg, sid, group, scan0, lat_range, camera_shape, window=None, n_gcps=0) -> Path:
     """Write a 2-band int32 COG."""
     (ny, nx), tr = window_of(cfg, window)

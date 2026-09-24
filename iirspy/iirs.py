@@ -47,6 +47,23 @@ def _try_load_next_level_metadata(basename, target_level, directory, xyextent):
     return result
 
 
+def _loc_extent(fqub, lonlatextent):
+    """(minx, maxx, miny, maxy) of the rows whose pixels fall in `lonlatextent`, from the `_d_loc_`
+    ENVI backplane an ndi bundle ships beside its cube (it has no geometry csv). Same convention as
+    `utils.parse_geom`: x inclusive, y half-open."""
+    floc = next(Path(fqub).parent.glob(f"{Path(fqub).name.split('_d_')[0]}_d_loc_*.img"), None)
+    if floc is None:
+        raise FileNotFoundError(f"no geometry csv or _d_loc_ backplane beside {fqub} to crop by lon/lat")
+    with rasterio.open(floc) as src:
+        lon, lat = src.read(1), src.read(2)
+    lon = (lon + 180) % 360 - 180
+    lon0, lon1, lat0, lat1 = (d if e is None else e for e, d in zip(lonlatextent, (-180, 180, -90, 90), strict=True))
+    rows = np.flatnonzero(((lon >= lon0) & (lon <= lon1) & (lat >= lat0) & (lat <= lat1)).any(axis=1))
+    if not rows.size:
+        raise ValueError(f"no pixels of {floc.name} inside {lonlatextent}")
+    return (0, lon.shape[1] - 1, int(rows[0]), int(rows[-1]) + 1)
+
+
 def _write_json_atomic(path, obj):
     """Write `obj` as json via a temp file + rename, so a kill mid-write can't leave a torn file."""
     tmp = Path(str(path) + ".tmp")
@@ -289,16 +306,17 @@ class IIRSData(ABC):
             paths = utils.unzip_iirs(self.directory, self.basename, self.level)
         if "qub" not in paths:
             raise FileNotFoundError(f"{self.basename} not found at {self.directory}.")
+        # An ndi (L2) bundle ships no lbr/oat/spm/csv, so every ancillary is optional here
         self.qub = paths["qub"].get(self.basename, "")
-        self.hdr = paths["hdr"].get(self.basename, "")
-        self.xml = paths["xml"].get(self.basename, "")
-        self.lbr = paths["lbr"].get(self.basename, "")
-        self.oat = paths["oat"].get(self.basename, "")
-        self.oath = paths["oath"].get(self.basename, "")
-        self.spm = paths["spm"].get(self.basename, "")
+        self.hdr = paths.get("hdr", {}).get(self.basename, "")
+        self.xml = paths.get("xml", {}).get(self.basename, "")
+        self.lbr = paths.get("lbr", {}).get(self.basename, "")
+        self.oat = paths.get("oat", {}).get(self.basename, "")
+        self.oath = paths.get("oath", {}).get(self.basename, "")
+        self.spm = paths.get("spm", {}).get(self.basename, "")
         if self.level == 1:
-            self.csv = paths["csv"].get(self.basename, "")
-            self.xml_csv = paths["xml-csv"].get(self.basename, "")
+            self.csv = paths.get("csv", {}).get(self.basename, "")
+            self.xml_csv = paths.get("xml-csv", {}).get(self.basename, "")
 
         # Store metadata from the qub file
         self.metadata = self._extract_metadata()
@@ -468,22 +486,45 @@ class IIRSData(ABC):
         cfg = georef.GeorefConfig(pole=group, aoi=tuple(bounds), ps=res)
         return georef.glt_from_loc(loc, group, cfg)
 
-    def to_geotiff(self, fout, crs, res, bounds=None, bands=None, row_block=None, full_bands=True):
-        """Render `self.img` onto `crs` at `res` m/px (via `self.glt` + `georef.apply_glt`) and write it.
+    def _render(self, img, table, tr, crs, row_block=None):
+        """`img` pulled through GLT `table` as a lazy (band, y, x) DataArray, `row_block` map rows
+        per dask chunk, so a write streams it instead of holding the whole map grid."""
+        import dask.array as dsa
 
-        `bands` narrows which band numbers render; `full_bands` reindexes the output to the full
-        1..256 IIRS band range before writing.
-        """
         from iirspy import georef
 
-        table, tr = self.glt(crs, res, bounds)
-        img = self.img if bands is None else self.img.sel(band=list(bands))
-        warped = georef.apply_glt(img.values, table, cube_scan0=self._cube_scan0())
+        cube, scan0 = img.values, self._cube_scan0()
+        rows = row_block or max(1, int(utils.CHUNKSIZE / (cube.shape[0] * table.shape[2] * 4)))
+        t = dsa.from_array(table, chunks=(2, rows, -1))
+        warped = t.map_blocks(
+            lambda b: georef.apply_glt(cube, b, cube_scan0=scan0),
+            chunks=((cube.shape[0],), *t.chunks[1:]),
+            dtype="float32",
+        )
         da = xr.DataArray(warped, dims=("band", "y", "x"), coords={"band": img.band.values})
         if "wl" in img.coords:
             da = da.assign_coords(wl=("band", img.wl.values))
         da.attrs = dict(self.img.attrs)
-        da = da.rio.write_crs(crs).rio.write_transform(tr)
+        return da.rio.write_crs(crs).rio.write_transform(tr)
+
+    def to_geotiff(self, fout, crs=None, res=None, bounds=None, bands=None, row_block=None, full_bands=True, glt=None):
+        """Render `self.img` onto `crs` at `res` m/px (via `self.glt` + `georef.apply_glt`) and write it.
+
+        `glt` is a saved GLT (`georef.save_glt`, e.g. the solve's `<sid>_<group>_glt.tif`) to use
+        instead of one built from the loc; its own grid and CRS win over `crs`/`res`/`bounds`, and
+        it is cropped to the scans this cube holds. `bands` narrows which band numbers render;
+        `full_bands` reindexes the output to the full 1..256 IIRS band range before writing.
+        """
+        from iirspy import georef
+
+        if glt is not None:
+            with rasterio.open(glt) as src:
+                table, tr, crs = src.read(), src.transform, src.crs
+            table, tr = georef.crop_glt(table, tr, self._cube_scan0(), self.img.sizes["y"])
+        else:
+            table, tr = self.glt(crs, res, bounds)
+        img = self.img if bands is None else self.img.sel(band=list(bands))
+        da = self._render(img, table, tr, crs, row_block)
         return _write_camera_product(_expand_to_full_bands(da) if full_bands else da, fout, row_block)
 
     def clip_aoi(self, geometry, crs, res, geom_crs=None, fout=None, row_block=None, full_bands=True):
@@ -512,12 +553,7 @@ class IIRSData(ABC):
         if not inside.any():
             raise ValueError(f"no camera pixels of {self.basename} fall within the given geometry")
 
-        warped = georef.apply_glt(self.img.values, table, cube_scan0=self._cube_scan0())
-        da = xr.DataArray(warped, dims=("band", "y", "x"), coords={"band": self.img.band.values})
-        if "wl" in self.img.coords:
-            da = da.assign_coords(wl=("band", self.img.wl.values))
-        da.attrs = dict(self.img.attrs)
-        da = da.rio.write_crs(crs).rio.write_transform(tr)
+        da = self._render(self.img, table, tr, crs, row_block)
         if fout is None:
             return da
         return _write_camera_product(_expand_to_full_bands(da) if full_bands else da, fout, row_block)
@@ -954,7 +990,9 @@ class L1(IIRSData):
                 int(np.floor(self.img.y.values[0])),
                 int(np.ceil(self.img.y.values[-1])),
             )
-        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
+        # x extent is an inclusive last-pixel index (249 on a 250-wide cube) against pixel-centre
+        # coords, so +1 keeps that last column; y stays half-open to match `solve.build_l1`'s crop.
+        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(self.extent[0], self.extent[1] + 1))
         try:
             self.bounds = self.img.rio.bounds()
         except NoDataInBounds as e:
@@ -1339,8 +1377,12 @@ class L2(IIRSData):
         if self.geomdf is not None:
             self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, center=False)
             self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent, strict=False))
+        elif any(e is not None for e in lonlatextent):
+            self.extent = _loc_extent(self.qub, lonlatextent)
 
-        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
+        # x extent is an inclusive last-pixel index (249 on a 250-wide cube) against pixel-centre
+        # coords, so +1 keeps that last column; y stays half-open to match `solve.build_l1`'s crop.
+        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(self.extent[0], self.extent[1] + 1))
         try:
             self.bounds = self.img.rio.bounds()
         except NoDataInBounds as e:

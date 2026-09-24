@@ -64,8 +64,6 @@ KEEP_GLOBS = (
     "run.log",
     "*_L1_b*.tif",
     "*.vrt",
-    "*_loc.tif",
-    "*_glt_loc.tif",
 )
 
 # Set by `main` from argv; module-level because `build_l1` and `log` both need them.
@@ -458,104 +456,6 @@ def _make_glt(merged: dict, cfg0, scan0: int, glt_dir: str, overwrite: bool = Fa
     return georef.scene_glt(SID, GROUP, gcps, cfg, scan0, glt_dir, overwrite)
 
 
-def _glt_scorecard(glt1: np.ndarray, glt2: np.ndarray) -> dict:
-    from iirspy import georef
-
-    col1, row1_ = glt1[0], glt1[1]
-    col2, row2_ = glt2[0], glt2[1]
-    both = (col1 != georef.NODATA) & (col2 != georef.NODATA)
-    only1 = (col1 != georef.NODATA) & (col2 == georef.NODATA)
-    only2 = (col1 == georef.NODATA) & (col2 != georef.NODATA)
-    n_both = int(both.sum())
-    dcol = np.abs(col1[both].astype("int64") - col2[both].astype("int64"))
-    drow = np.abs(row1_[both].astype("int64") - row2_[both].astype("int64"))
-    identical = (dcol == 0) & (drow == 0)
-    within1 = (dcol <= 1) & (drow <= 1)
-    return {
-        "n_both": n_both,
-        "n_only_original": int(only1.sum()),
-        "n_only_loc": int(only2.sum()),
-        "frac_identical": float(identical.mean()) if n_both else None,
-        "frac_within_1px": float(within1.mean()) if n_both else None,
-        "p99_dcol": float(np.percentile(dcol, 99)) if n_both else None,
-        "p99_drow": float(np.percentile(drow, 99)) if n_both else None,
-        "max_dcol": float(dcol.max()) if n_both else None,
-        "max_drow": float(drow.max()) if n_both else None,
-    }
-
-
-def _build_loc_and_compare(merged: dict, cfg0, scan0: int, nrow: int, glt_dir: str) -> dict:
-    import resource
-    import traceback as _tb
-
-    from iirspy import backplanes, georef
-
-    def _peak_mb() -> float:
-        return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
-
-    try:
-        g = ck.GROUP_SHORT[GROUP]
-        xs = [x for x, _y in merged.values()]
-        ys = [y for _x, y in merged.values()]
-        cfg = replace(cfg0, aoi=(min(xs), min(ys), max(xs), max(ys)))
-        ncol = int(max(c for _r, c in merged)) + 1
-        log(f"glt_vs_loc: start cam=({nrow},{ncol}) grid={georef.window_of(cfg)[0]} peak={_peak_mb()}MB")
-
-        t0 = time.monotonic()
-        lon, lat, radius = backplanes._group_loc_core(merged, GROUP, nrow=nrow, ncol=ncol)
-        log(f"glt_vs_loc: loc core done peak={_peak_mb()}MB")
-        loc = {
-            "lon": lon,
-            "lat": lat,
-            "radius": radius,
-            "groups": {GROUP: (scan0, scan0 + nrow - 1)},
-        }
-        floc = Path(glt_dir) / f"{SID}_{g}_loc.tif"
-        backplanes.write_loc(floc, loc, SID, row0=scan0, fit_dir=OUT)
-        loc_wall_s, loc_peak_mb = round(time.monotonic() - t0, 1), _peak_mb()
-        log(f"glt_vs_loc: loc written peak={loc_peak_mb}MB")
-
-        t1 = time.monotonic()
-        ds = backplanes.read_loc(floc)
-        log(f"glt_vs_loc: loc read peak={_peak_mb()}MB")
-        glt2, tr2 = georef.glt_from_loc(ds, GROUP, cfg)
-        glt_loc_wall_s, glt_loc_peak_mb = round(time.monotonic() - t1, 1), _peak_mb()
-        log(f"glt_vs_loc: glt_from_loc done peak={glt_loc_peak_mb}MB")
-
-        (_ny_chk, _nx_chk), tr1 = georef.window_of(cfg)
-        fglt1 = Path(glt_dir) / f"{SID}_{GROUP}_glt.tif"
-        glt1, _tags1 = georef.read_glt(fglt1)
-        log(f"glt_vs_loc: original glt read peak={_peak_mb()}MB")
-        if glt1.shape != glt2.shape:
-            raise AssertionError(f"glt shape mismatch: {glt1.shape} vs {glt2.shape}")  # noqa: TRY301
-        if tr1 != tr2:
-            raise AssertionError(f"glt transform mismatch: {tr1} vs {tr2}")  # noqa: TRY301
-
-        fglt2 = Path(glt_dir) / f"{SID}_{g}_glt_loc.tif"
-        georef.save_glt(fglt2, glt2, cfg, SID, GROUP, scan0, cfg0.lat_band, (nrow, ncol))
-        log(f"glt_vs_loc: glt_loc saved peak={_peak_mb()}MB")
-
-        scorecard = {
-            **_glt_scorecard(glt1, glt2),
-            "loc_wall_s": loc_wall_s,
-            "loc_peak_rss_mb": loc_peak_mb,
-            "glt_from_loc_wall_s": glt_loc_wall_s,
-            "glt_from_loc_peak_rss_mb": glt_loc_peak_mb,
-            "loc_path": str(floc),
-            "glt_loc_path": str(fglt2),
-        }
-        log(
-            f"glt_vs_loc: n_both={scorecard['n_both']} identical={scorecard['frac_identical']} "
-            f"within_1px={scorecard['frac_within_1px']} p99_d=({scorecard['p99_dcol']},{scorecard['p99_drow']}) "
-            f"loc={loc_wall_s}s/{loc_peak_mb}MB glt_from_loc={glt_loc_wall_s}s/{glt_loc_peak_mb}MB"
-        )
-    except Exception:
-        err = _tb.format_exc()
-        log(f"glt_vs_loc FAILED:\n{err}")
-        return {"error": err}
-    return scorecard
-
-
 def _glt_only(args, cfg0, fgeom, lat_range) -> bool:
     """Already solved: build the GLT from the saved GCPs instead of restaging and re-solving."""
     fdone = next((f for f in _merged_gcps_paths(args.keep) if f.exists()), None)
@@ -569,22 +469,6 @@ def _glt_only(args, cfg0, fgeom, lat_range) -> bool:
     scan0 = _scene_scan0(fgeom, lat_range)
     f = _make_glt(merged, cfg, scan0, glt_dir)
     log(f"{fdone} exists ({len(merged)} gcps) -- skipped solve, glt: {f}")
-
-    from iirspy.iirs import _write_json_atomic
-
-    _, xyext = utils.parse_geom(fgeom, latlonextent=(-180, 180, *lat_range))
-    nrow = int(xyext[3]) - int(xyext[2]) + 1
-    glt_vs_loc = _build_loc_and_compare(merged, cfg, scan0, nrow, glt_dir)
-
-    g = ck.GROUP_SHORT[GROUP]
-    fsum = Path(glt_dir) / f"georef_solve_summary_{g}.json"
-    if fsum.exists():
-        data = json.loads(fsum.read_text())
-        data["glt_vs_loc"] = glt_vs_loc
-        _write_json_atomic(fsum, data)
-    else:
-        (Path(glt_dir) / f"glt_vs_loc_{g}.json").write_text(json.dumps(glt_vs_loc, indent=1, default=str))
-
     if args.clean:
         shutil.rmtree(OUT, ignore_errors=True)
         print(f"removed work dir {OUT}", flush=True)
@@ -1329,8 +1213,6 @@ def main(argv: list[str] | None = None) -> None:
     fglt = _make_glt(merged, cfg0, scan0, args.keep or str(ck.recal_dir(SID, GROUP)), overwrite=True)
     log(f"glt: {fglt}")
 
-    glt_vs_loc = _build_loc_and_compare(merged, cfg0, scan0, ny, args.keep or str(ck.recal_dir(SID, GROUP)))
-
     summary = {
         "sid": SID,
         "group": GROUP,
@@ -1350,7 +1232,6 @@ def main(argv: list[str] | None = None) -> None:
         "glt": str(fglt),
         "final_aoi_m": final_cfg.aoi,
         "final_shape": final_shape,
-        "glt_vs_loc": glt_vs_loc,
         "total_s": round(time.time() - t_start, 1),
     }
     (OUT / f"georef_solve_summary_{ck.GROUP_SHORT[GROUP]}.json").write_text(json.dumps(summary, indent=1, default=str))

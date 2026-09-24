@@ -141,6 +141,7 @@ def test_clip_aoi_warps_onto_the_map_grid_and_matches_a_polygon_masked_apply_glt
     inst._cube_scan0 = MethodType(IIRSData._cube_scan0, inst)
     inst._read_loc = MethodType(IIRSData._read_loc, inst)
     inst.clip_aoi = MethodType(IIRSData.clip_aoi, inst)
+    inst._render = MethodType(IIRSData._render, inst)
 
     crs = georef.stereo_crs("south")
     x0, y0, x1, y1 = 500.0, 3000.0, 800.0, 3400.0
@@ -167,3 +168,24 @@ def test_clip_aoi_warps_onto_the_map_grid_and_matches_a_polygon_masked_apply_glt
     assert out_x == pytest.approx(want_x, abs=1e-6)
     assert out_y == pytest.approx(want_y, abs=1e-6)
     assert out.rio.transform() == tr
+
+
+def test_loc_extent_crops_rows_by_latitude_from_the_ndi_loc_backplane(tmp_path):
+    import numpy as np
+    import pytest
+    import rasterio
+
+    from iirspy.iirs import _loc_extent
+
+    ny, nx = 20, 5
+    lat = np.repeat(np.linspace(-10, 9, ny)[:, None], nx, axis=1).astype("float32")  # 1 deg per row
+    lon = np.full((ny, nx), 300.0, "float32")  # 0-360 east, i.e. -60
+    floc = tmp_path / "ch2_iir_ndi_X_d_loc_hw1_ard.img"
+    with rasterio.open(floc, "w", driver="ENVI", height=ny, width=nx, count=4, dtype="float32") as dst:
+        dst.write(np.stack([lon, lat, lat, lat]))
+    fqub = tmp_path / "ch2_iir_ndi_X_d_rfl_hw1_srd.qub"
+
+    assert _loc_extent(fqub, (-180, 180, -2, 3)) == (0, nx - 1, 8, 14)  # rows at lat -2..3
+    assert _loc_extent(fqub, (-61, -59, None, None)) == (0, nx - 1, 0, ny)
+    with pytest.raises(ValueError):
+        _loc_extent(fqub, (0, 10, None, None))
