@@ -499,9 +499,11 @@ def _build_loc_and_compare(merged: dict, cfg0, scan0: int, nrow: int, glt_dir: s
         ys = [y for _x, y in merged.values()]
         cfg = replace(cfg0, aoi=(min(xs), min(ys), max(xs), max(ys)))
         ncol = int(max(c for _r, c in merged)) + 1
+        log(f"glt_vs_loc: start cam=({nrow},{ncol}) grid={georef.window_of(cfg)[0]} peak={_peak_mb()}MB")
 
         t0 = time.monotonic()
         lon, lat, radius = backplanes._group_loc_core(merged, GROUP, nrow=nrow, ncol=ncol)
+        log(f"glt_vs_loc: loc core done peak={_peak_mb()}MB")
         loc = {
             "lon": lon,
             "lat": lat,
@@ -511,15 +513,19 @@ def _build_loc_and_compare(merged: dict, cfg0, scan0: int, nrow: int, glt_dir: s
         floc = Path(glt_dir) / f"{SID}_{g}_loc.tif"
         backplanes.write_loc(floc, loc, SID, row0=scan0, fit_dir=OUT)
         loc_wall_s, loc_peak_mb = round(time.monotonic() - t0, 1), _peak_mb()
+        log(f"glt_vs_loc: loc written peak={loc_peak_mb}MB")
 
         t1 = time.monotonic()
         ds = backplanes.read_loc(floc)
+        log(f"glt_vs_loc: loc read peak={_peak_mb()}MB")
         glt2, tr2 = georef.glt_from_loc(ds, GROUP, cfg)
         glt_loc_wall_s, glt_loc_peak_mb = round(time.monotonic() - t1, 1), _peak_mb()
+        log(f"glt_vs_loc: glt_from_loc done peak={glt_loc_peak_mb}MB")
 
         (_ny_chk, _nx_chk), tr1 = georef.window_of(cfg)
         fglt1 = Path(glt_dir) / f"{SID}_{GROUP}_glt.tif"
         glt1, _tags1 = georef.read_glt(fglt1)
+        log(f"glt_vs_loc: original glt read peak={_peak_mb()}MB")
         if glt1.shape != glt2.shape:
             raise AssertionError(f"glt shape mismatch: {glt1.shape} vs {glt2.shape}")  # noqa: TRY301
         if tr1 != tr2:
@@ -527,6 +533,7 @@ def _build_loc_and_compare(merged: dict, cfg0, scan0: int, nrow: int, glt_dir: s
 
         fglt2 = Path(glt_dir) / f"{SID}_{g}_glt_loc.tif"
         georef.save_glt(fglt2, glt2, cfg, SID, GROUP, scan0, cfg0.lat_band, (nrow, ncol))
+        log(f"glt_vs_loc: glt_loc saved peak={_peak_mb()}MB")
 
         scorecard = {
             **_glt_scorecard(glt1, glt2),
