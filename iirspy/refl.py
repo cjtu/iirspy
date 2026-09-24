@@ -9,7 +9,7 @@ group's CRS. No re-registration -- if the scene isn't solved yet, this refuses t
         [--photom lambert|lommel_seeliger|lunar_lambert] [--no-topo] [--min-lit FRAC] [--mu-min FRAC]
 
 `--gcps` defaults to the standard `iirs-solve-scene --keep` layout:
-geometry/recalibrated/<day>/<sid>_<group>/<sid>_<group>.gcps under `IIRS_RECAL_ROOT`.
+geometry/recalibrated/<day>/<sid>_<group>.gcps under `IIRS_RECAL_ROOT`.
 
 Paths come from `IIRS_ARCHIVE`, `IIRS_DEM_ROOTS`, `IIRS_SPICE`, `IIRS_STAGE` and `IIRS_RECAL_ROOT`,
 same as `iirspy.solve`.
@@ -65,7 +65,7 @@ def _topo_info(ftopo: Path | None) -> dict:
 def _solve_quality(fgcps: Path, group: str) -> dict:
     """converged/corr/n_merged_gcps/overlap agreement from the solve's own summary json, if kept
     next to the GCPs -- so a suspect refl product points at the registration it was built on."""
-    fsummary = fgcps.parent / f"georef_solve_summary_{ck.GROUP_SHORT[group]}.json"
+    fsummary = fgcps.parent / f"{fgcps.stem}_solve_summary.json"
     if not fsummary.exists():
         return {}
     s = json.loads(fsummary.read_text())
@@ -137,7 +137,7 @@ def _parser():
         "--gcps",
         default=None,
         help="merged GCPs from iirs-solve-scene --keep (default geometry/recalibrated/<day>/"
-        "<sid>_<group>/<sid>_<group>.gcps under IIRS_RECAL_ROOT)",
+        "<sid>_<group>.gcps under IIRS_RECAL_ROOT)",
     )
     ap.add_argument("--thermal-corr", default="", choices=("", "verma"), help="L2 thermal correction")
     ap.add_argument("--photom", default="lambert", help="photometric model name (iirspy.photometry.MODELS)")
@@ -178,7 +178,7 @@ def main(argv: list[str] | None = None) -> None:
     dask.config.set(scheduler="threads", num_workers=solve.ncpu())
 
     solve.SID, solve.GROUP = sid, group
-    solve._open_run(args.out)
+    solve._open_run(args.out, "refl")
     t_start = time.time()
     solve._log_provenance()
     solve.log(f"{sid} group={group} zip={solve.ZIP.name} ncpu={solve.ncpu()} stage={solve.STAGE} gcps={fgcps}")
@@ -202,7 +202,7 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
     solve.log(f"aoi from {len(gcps)} merged gcps: {[round(v / 1000, 1) for v in aoi]} km")
 
     bands = _full_bands()
-    ftif, scan0, lat_range = solve.build_l1(lat_range, bands, solve.OUT / f"{sid}_{group}_l1_rad.tif")
+    ftif, scan0, lat_range = solve.build_l1(lat_range, bands, solve._work("l1_rad.tif"))
     solve.log(f"L1 built: {ftif} ({len(bands)} bands), scan0={scan0}")
 
     anc = ck.ancillary(sid)
@@ -239,7 +239,7 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
 
     # Camera space keeps one unblended spectrum per pixel; the GLT projects on demand and the
     # .vrt beside each product carries the GCPs for other GDAL readers.
-    fl2 = solve.OUT / f"{sid}_{group}_l2_refl.tif"
+    fl2 = solve._work("l2_refl.tif")
     l2.save(str(fl2))
     solve.log(f"L2 saved: {fl2}")
     for f in (Path(ftif), fl2):
@@ -248,7 +248,7 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
     # OBS from the same GCPs/topo/L1 already in hand; no LOC product (see backplanes.scene_obs)
     from iirspy import backplanes
 
-    fobs = solve.OUT / f"{sid}_{group}_obs.tif"
+    fobs = solve._work("obs.tif")
     obs = backplanes.scene_obs(sid, group, gcps, l1.img.shape[-2:], scan0, ftopo, ftif, solve.STAGE)
     backplanes.write_obs(fobs, obs, sid, row0=scan0)
     solve.log(f"OBS saved: {fobs} (sensor geometry from {obs['sensor_source']})")
@@ -290,11 +290,12 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
         "l2_diagnostics": {k: l2.img.attrs.get(k) for k in L2_DIAGNOSTIC_ATTRS},
         "total_s": round(time.time() - t_start, 1),
     }
-    (solve.OUT / "summary.json").write_text(json.dumps(summary, indent=1, default=str))
+    fsummary = solve._work("refl_summary.json")
+    fsummary.write_text(json.dumps(summary, indent=1, default=str))
     solve.log(f"\ndone in {summary['total_s']}s.")
 
     _keep(args.keep_l1, ftif, ftif.with_suffix(".vrt"))
-    _keep(args.keep, fl2, fl2.with_suffix(".vrt"), fobs, solve.OUT / "summary.json", solve.LOG)
+    _keep(args.keep, fl2, fl2.with_suffix(".vrt"), fobs, fsummary, solve.LOG)
 
     if args.clean:
         shutil.rmtree(solve.OUT, ignore_errors=True)

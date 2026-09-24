@@ -139,7 +139,7 @@ def test_clip_aoi_warps_onto_the_map_grid_and_matches_a_polygon_masked_apply_glt
 
     cube = np.arange(ny * nx, dtype="float32").reshape(1, ny, nx)
     img = xr.DataArray(cube, dims=("band", "y", "x"), coords={"band": [1]})
-    inst = SimpleNamespace(img=img, _loc_cache=loc)
+    inst = SimpleNamespace(img=img, _loc_cache={"south": loc})
     inst.glt = MethodType(IIRSData.glt, inst)
     inst._cube_scan0 = MethodType(IIRSData._cube_scan0, inst)
     inst._read_loc = MethodType(IIRSData._read_loc, inst)

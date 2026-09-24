@@ -51,18 +51,19 @@ CONSENSUS_ALL_GROUPS = os.environ.get("IIRS_CONSENSUS_SEED") == "1"
 # (finished) and from any real failure, so a submission script can requeue on it alone.
 EXIT_RESUME = 75
 
-# Copied to `--keep`; everything else in the work dir is rebuildable from the zip.
+# Copied to `--keep`, each after the `<sid>_<group>` prefix every work-dir file carries (the keep dir
+# is a shared day dir); everything else in the work dir is rebuildable from the zip.
 # - all gcp files generated and run log / json stats
-# - `*_L1_b*.tif`: the final warped raster at the registration band (only 1 band, 10s of MB)
+# - `_L1_b*.tif`: the final warped raster at the registration band (only 1 band, 10s of MB)
 # - `*.vrt`: the GCP sidecar for that raster; it names its tif relative to itself, so the pair has
 #   to travel together or the vrt dangles.
 KEEP_GLOBS = (
     "*.gcps",
-    "chunk*_fit.json",
-    "chunks.json",
-    "georef_solve_summary_*.json",
-    "run.log",
-    "*_L1_b*.tif",
+    "_chunk*_fit.json",
+    "_chunks.json",
+    "_solve_summary.json",
+    "_solve.log",
+    "_L1_b*.tif",
     "*.vrt",
 )
 
@@ -211,7 +212,7 @@ def _cached_chunk(out: Path, c: dict, good_corr: float, decay_m: float, tweaks: 
     the far tier per chunk, so two runs can agree on shape and still have used different
     references. Returns (fit, gcps_by_rc).
     """
-    ffit, fgcp = out / f"chunk{c['i']}_fit.json", out / f"chunk{c['i']}.gcps"
+    ffit, fgcp = out / f"{SID}_{GROUP}_chunk{c['i']}_fit.json", out / f"{SID}_{GROUP}_chunk{c['i']}.gcps"
     if not (ffit.exists() and fgcp.exists()):
         return None
     fit = json.loads(ffit.read_text())
@@ -407,7 +408,7 @@ def _merged_gcps_paths(keep: str | None) -> list[Path]:
 def merged_gcps_path(sid: str, group: str) -> Path:
     """Where `sid`/`group`'s merged GCPs land once solved -- the durable `--keep` layout every
     cluster script and CLI default assumes, independent of any particular run's `--out`."""
-    return ck.recal_dir(sid, group) / f"{sid}_{group}.gcps"
+    return ck.recal_dir(sid) / f"{sid}_{group}.gcps"
 
 
 def already_solved(sid: str, group: str) -> bool:
@@ -423,7 +424,7 @@ def keep_products(out: Path, dest: Path) -> list[Path]:
     dest.mkdir(parents=True, exist_ok=True)
     copied = []
     for pattern in KEEP_GLOBS:
-        for f in sorted(out.glob(pattern)):
+        for f in sorted(out.glob(f"{SID}_{GROUP}{pattern}")):
             shutil.copyfile(f, dest / f.name)
             copied.append(f)
     return copied
@@ -456,19 +457,42 @@ def _make_glt(merged: dict, cfg0, scan0: int, glt_dir: str, overwrite: bool = Fa
     return georef.scene_glt(SID, GROUP, gcps, cfg, scan0, glt_dir, overwrite)
 
 
+def _peak_mb() -> float:
+    import resource
+
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+def _make_loc(merged: dict, scan0: int, loc_dir: str, fit_dir: Path, overwrite: bool = False) -> Path:
+    """Write `<sid>_<group>_loc.tif` (lon, lat, LOLA radius per camera pixel) through the same TPS as the GLT."""
+    from iirspy import backplanes
+
+    floc = Path(loc_dir) / f"{SID}_{GROUP}_loc.tif"
+    if floc.exists() and not overwrite:
+        return floc
+    peak0 = _peak_mb()
+    with phase("loc"):
+        lon, lat, radius = backplanes._group_loc_core(merged, GROUP)
+        loc = {"lon": lon, "lat": lat, "radius": radius, "groups": {GROUP: (scan0, scan0 + lon.shape[0] - 1)}}
+        backplanes.write_loc(floc, loc, SID, row0=scan0, fit_dir=fit_dir)
+    log(f"loc: {floc} {lon.shape}, peak RSS {peak0:.0f} -> {_peak_mb():.0f} MB")
+    return floc
+
+
 def _glt_only(args, cfg0, fgeom, lat_range) -> bool:
-    """Already solved: build the GLT from the saved GCPs instead of restaging and re-solving."""
+    """Already solved: build the GLT (and LOC, if missing) from the saved GCPs instead of restaging and re-solving."""
     fdone = next((f for f in _merged_gcps_paths(args.keep) if f.exists()), None)
     if fdone is None or args.resolve or args.chunks or args.hillshade_only:
         return False
     if fgeom is None:
         sys.exit(f"missing geometry csv for {SID}")
     merged = _load_gcps(fdone)
-    glt_dir = args.keep or str(ck.recal_dir(SID, GROUP))
+    glt_dir = args.keep or str(ck.recal_dir(SID))
     cfg = replace(cfg0, lat_band=lat_range)
     scan0 = _scene_scan0(fgeom, lat_range)
     f = _make_glt(merged, cfg, scan0, glt_dir)
     log(f"{fdone} exists ({len(merged)} gcps) -- skipped solve, glt: {f}")
+    _make_loc(merged, scan0, glt_dir, Path(glt_dir))
     if args.clean:
         shutil.rmtree(OUT, ignore_errors=True)
         print(f"removed work dir {OUT}", flush=True)
@@ -722,7 +746,7 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=F
     wac = use_wac(elev, cfg)
     ref, hs_info = (render_wac if wac else render_reference)(fgeom, flabel, cfg, kernels)
     hs_s = time.time() - t0
-    save_grid(OUT / f"chunk{i}_hs.tif", ref, cfg)
+    save_grid(_work(f"chunk{i}_hs.tif"), ref, cfg)
     log(f"chunk {i}: {'wac' if wac else 'hillshade'} ref {hs_s:.1f}s, shape {ref.shape}")
 
     with phase(f"chunk {i} register") as ph:
@@ -733,7 +757,7 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=F
             log(f"chunk {i}: FAILED -- {err}")
             log(traceback.format_exc())
             fit = {"chunk": i, "band": c["band"], "row0": c["row0"], "row1": c["row1"], "corr": None, "error": err}
-            (OUT / f"chunk{i}_fit.json").write_text(json.dumps(fit, indent=1))
+            _work(f"chunk{i}_fit.json").write_text(json.dumps(fit, indent=1))
             return None
     solve_s = ph.wall
 
@@ -741,7 +765,7 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=F
     after = project(band_i, reg.gcps, cfg)
     m = np.isfinite(after) & np.isfinite(ref) & (after > 0) & (ref > 0)
     corr = float(np.corrcoef(after[m], ref[m])[0, 1]) if m.sum() > 1000 else None
-    save_grid(OUT / f"chunk{i}_final.tif", after, cfg)
+    save_grid(_work(f"chunk{i}_final.tif"), after, cfg)
 
     fit = {
         "chunk": i,
@@ -768,7 +792,7 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=F
         "quality": reg.stats.get("quality"),
         "stats": reg.stats,
     }
-    (OUT / f"chunk{i}_fit.json").write_text(json.dumps(fit, indent=1, default=str))
+    _work(f"chunk{i}_fit.json").write_text(json.dumps(fit, indent=1, default=str))
     q = reg.stats.get("quality", {})
     verdict = f"REJECTED ({q['reason']})" if q.get("rejected") else f"ok match_frac={q.get('match_frac')}"
     log(
@@ -779,7 +803,7 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=F
     )
 
     gcps_by_rc = {(g.row, g.col): (g.x, g.y) for g in reg.gcps}
-    _save_gcps(OUT / f"chunk{i}.gcps", gcps_by_rc)
+    _save_gcps(_work(f"chunk{i}.gcps"), gcps_by_rc)
     return {"chunk": c, "gcps": gcps_by_rc, "fit": fit}
 
 
@@ -791,7 +815,7 @@ def _solve_chunks_hillshade(chunks, cfg0, fgeom, flabel):
         cfg = replace(cfg0, aoi=c["aoi"], dem_near=c["dem_near"], dem_far=c["dem_far"])
         t0 = time.time()
         ref, hs_info = render_reference(fgeom, flabel, cfg, ck.kernels(SID[:8]))
-        save_grid(OUT / f"chunk{c['i']}_hs.tif", ref, cfg)
+        save_grid(_work(f"chunk{c['i']}_hs.tif"), ref, cfg)
         log(
             f"chunk {c['i']} [{c['band']}] hillshade {time.time() - t0:.1f}s shape={ref.shape} "
             f"near={Path(c['dem_near']).name} far={Path(c['dem_far']).name} "
@@ -922,7 +946,7 @@ def _plan_group_chunks(fgeom, scan0: int, ny: int, only: str | None, niter_max: 
             )
             sys.exit(f"--chunks {sorted(missing)} not in group {GROUP!r}: {detail}")
         chunks = [c for c in chunks if c["i"] in wanted]
-    (OUT / "chunks.json").write_text(json.dumps(chunks, indent=1))
+    _work("chunks.json").write_text(json.dumps(chunks, indent=1))
     log(f"{len(chunks)} chunks planned ({GROUP} group, {WIDTH_RANGE_KM[0]:.0f}-{WIDTH_RANGE_KM[1]:.0f}km):")
     for c in chunks:
         log(
@@ -964,7 +988,7 @@ def _parser():
         "--keep",
         default=None,
         help="copy GCPs, fits, summary, log and the GLT here when the run completes "
-        "(default geometry/recalibrated/<day>/<sid>_<group> under IIRS_RECAL_ROOT)",
+        "(default geometry/recalibrated/<day> under IIRS_RECAL_ROOT)",
     )
     ap.add_argument("--resolve", action="store_true", help="re-solve even if merged GCPs already exist")
     ap.add_argument(
@@ -1095,8 +1119,13 @@ def _resolve_stage(out: Path) -> Path:
     return out.parent / "stage"
 
 
-def _open_run(out: str | None) -> None:
-    """Locate the scene's zip and prepare the work dir, log and stage. Sets the module globals."""
+def _work(name: str) -> Path:
+    """`name` in the work dir, behind the `<sid>_<group>_` prefix every product carries."""
+    return OUT / f"{SID}_{GROUP}_{name}"
+
+
+def _open_run(out: str | None, step: str = "solve") -> None:
+    """Locate the scene's zip and prepare the work dir, `<sid>_<group>_<step>.log` and stage. Sets the module globals."""
     global ZIP, OUT, LOG, STAGE
 
     if not ck.ARCHIVE.exists():
@@ -1106,7 +1135,7 @@ def _open_run(out: str | None) -> None:
         sys.exit(f"no nri zip for {SID} under {ck.ARCHIVE / 'zips'}")
     ZIP = zip_path
     OUT = Path(out) if out else Path.cwd() / "runs" / f"{SID}_{GROUP}"
-    LOG = OUT / "run.log"
+    LOG = OUT / f"{SID}_{GROUP}_{step}.log"
     OUT.mkdir(parents=True, exist_ok=True)
     STAGE = _resolve_stage(OUT)
     STAGE.mkdir(parents=True, exist_ok=True)
@@ -1149,7 +1178,7 @@ def main(argv: list[str] | None = None) -> None:
     ftif, scan0, lat_range = build_l1(
         lat_range0,
         _cube_bands(cfg0.band),
-        OUT / f"{SID}_l1_{GROUP}_group.tif",
+        _work("l1_group.tif"),
         calibrate_kwargs={"output_bands": _band_window(cfg0.band)},
         out_bands=[cfg0.band],
         chunk_y=args.chunk_y,
@@ -1210,8 +1239,9 @@ def main(argv: list[str] | None = None) -> None:
     final_cfg, final = _warp_merged(merged, used_chunks, cfg0, ftif)
     final_shape = list(final.shape)
     del final  # written to disk by _warp_merged; only the shape is still needed below
-    fglt = _make_glt(merged, cfg0, scan0, args.keep or str(ck.recal_dir(SID, GROUP)), overwrite=True)
+    fglt = _make_glt(merged, cfg0, scan0, args.keep or str(ck.recal_dir(SID)), overwrite=True)
     log(f"glt: {fglt}")
+    floc = _make_loc(merged, scan0, str(fglt.parent), OUT, overwrite=True)
 
     summary = {
         "sid": SID,
@@ -1230,11 +1260,12 @@ def main(argv: list[str] | None = None) -> None:
         "n_merged_gcps": len(merged),
         "scan0": scan0,
         "glt": str(fglt),
+        "loc": str(floc),
         "final_aoi_m": final_cfg.aoi,
         "final_shape": final_shape,
         "total_s": round(time.time() - t_start, 1),
     }
-    (OUT / f"georef_solve_summary_{ck.GROUP_SHORT[GROUP]}.json").write_text(json.dumps(summary, indent=1, default=str))
+    _work("solve_summary.json").write_text(json.dumps(summary, indent=1, default=str))
     log(f"\ndone in {summary['total_s']}s.")
 
     if args.keep:

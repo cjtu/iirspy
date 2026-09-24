@@ -23,14 +23,12 @@ def test_xyz_round_trips_group_crs_for_every_pole():
 
 
 def _write_group(root, sid, group, scan0, rows, cols):
-    d = ck.recal_dir(sid, group)
+    d = ck.recal_dir(sid)
     d.mkdir(parents=True, exist_ok=True)
     gcps = {(r, c): (1000.0 * c, -1000.0 * r + 10.0 * group.__hash__() % 7) for r in rows for c in cols}
     solve._save_gcps(solve.merged_gcps_path(sid, group), gcps)
     chunks = [{"i": 0, "row0": min(rows), "row1": max(rows)}]
-    (d / f"georef_solve_summary_{ck.GROUP_SHORT[group]}.json").write_text(
-        json.dumps({"scan0": scan0, "chunks": chunks})
-    )
+    (d / f"{sid}_{group}_solve_summary.json").write_text(json.dumps({"scan0": scan0, "chunks": chunks}))
     return gcps
 
 
@@ -50,14 +48,12 @@ def test_group_info_row_range_uses_gcps_extent_not_the_full_chunk_plan(tmp_path,
 def _write_plain_group(sid, group, scan0, rows, cols):
     """Like `_write_group` but with plain x=1000*col, y=-1000*row, no per-group hash offset, so
     two groups can share the same ground truth for a seam-blend test."""
-    d = ck.recal_dir(sid, group)
+    d = ck.recal_dir(sid)
     d.mkdir(parents=True, exist_ok=True)
     gcps = {(r, c): (1000.0 * c, -1000.0 * r) for r in rows for c in cols}
     solve._save_gcps(solve.merged_gcps_path(sid, group), gcps)
     chunks = [{"i": 0, "row0": min(rows), "row1": max(rows)}]
-    (d / f"georef_solve_summary_{ck.GROUP_SHORT[group]}.json").write_text(
-        json.dumps({"scan0": scan0, "chunks": chunks})
-    )
+    (d / f"{sid}_{group}_solve_summary.json").write_text(json.dumps({"scan0": scan0, "chunks": chunks}))
     return gcps
 
 

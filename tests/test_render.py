@@ -1,6 +1,7 @@
 from types import MethodType, SimpleNamespace
 
 import numpy as np
+import pytest
 import rasterio
 import xarray as xr
 
@@ -20,7 +21,7 @@ def _synthetic_loc(ny, nx, x0=500.0, dx=30.0, y0=3500.0, dy=-50.0, pole="south")
 
 
 def _bound_inst(img, loc):
-    inst = SimpleNamespace(img=img, _loc_cache=loc)
+    inst = SimpleNamespace(img=img, _loc_cache={"south": loc})
     inst.glt = MethodType(IIRSData.glt, inst)
     inst.to_geotiff = MethodType(IIRSData.to_geotiff, inst)
     inst._cube_scan0 = MethodType(IIRSData._cube_scan0, inst)
@@ -121,20 +122,29 @@ def test_geoloc_vrt_warps_to_the_same_placement_as_glt(tmp_path):
 
 def test_get_iirs_paths_finds_reprocessed_products(tmp_path):
     sid = "20210101T0000000000"
-    geo = tmp_path / "geometry" / "recalibrated" / sid[:8] / sid
-    dat = tmp_path / "data" / "recalibrated" / sid[:8] / sid
-    geo.mkdir(parents=True)
-    dat.mkdir(parents=True)
-    (geo / f"{sid}.gcps").write_text("row,col,x,y,group\n")
-    (geo / f"{sid}_loc.tif").write_bytes(b"")
-    (geo / f"{sid}_obs.tif").write_bytes(b"")
-    (dat / f"{sid}_l1_rad.tif").write_bytes(b"")
+    geo = tmp_path / "geometry" / "recalibrated" / sid[:8]
+    dat = tmp_path / "data" / "recalibrated" / sid[:8]
+    der = tmp_path / "data" / "rederived" / sid[:8]
+    for d in (geo, dat, der):
+        d.mkdir(parents=True)
+    p = f"{sid}_south"
+    (geo / f"{p}.gcps").write_text("row,col,x,y\n")
+    (geo / f"{p}_loc.tif").write_bytes(b"")
+    (der / f"{p}_obs.tif").write_bytes(b"")
+    (dat / f"{p}_l1_rad.tif").write_bytes(b"")
 
     paths = utils.get_iirs_paths(tmp_path, basenames=[sid], exts=("gcps", "loc", "obs", "tif"), level=1)
-    assert paths["gcps"][sid] == geo / f"{sid}.gcps"
-    assert paths["loc"][sid] == geo / f"{sid}_loc.tif"
-    assert paths["obs"][sid] == geo / f"{sid}_obs.tif"
-    assert paths["tif"][sid] == dat / f"{sid}_l1_rad.tif"
+    assert paths["gcps"][sid] == geo / f"{p}.gcps"
+    assert paths["loc"][sid] == geo / f"{p}_loc.tif"
+    assert paths["obs"][sid] == der / f"{p}_obs.tif"
+    assert paths["tif"][sid] == dat / f"{p}_l1_rad.tif"
 
     paths2 = utils.get_iirs_paths(tmp_path, basenames=[sid], exts=("tif",), level=2)
     assert "tif" not in paths2
+
+    # a second group makes group=None ambiguous; naming the group resolves it
+    (geo / f"{sid}_equatorial_loc.tif").write_bytes(b"")
+    with pytest.raises(ValueError, match="pass group="):
+        utils.get_iirs_paths(tmp_path, basenames=[sid], exts=("loc",))
+    paths3 = utils.get_iirs_paths(tmp_path, basenames=[sid], exts=("loc",), group="equatorial")
+    assert paths3["loc"][sid] == geo / f"{sid}_equatorial_loc.tif"

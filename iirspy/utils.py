@@ -751,14 +751,16 @@ def _find_recursive(ddir, subdir, ext, wanted):
     return {b: f for f in Path(ddir).glob(f"**/{subdir}/**/*.{ext}") if (b := _iirs_basename(f)) in wanted}
 
 
-def _find_reprocessed(ddir, subdir, bnames, filename):
-    """O(1) lookup for reprocessed per-sid products at `<ddir>/<subdir>/<sid[:8]>/<sid>/<filename(sid)>`
-    (no group in the path)."""
+def _find_reprocessed(ddir, subdir, bnames, suffix, group=None):
+    """Reprocessed products at `<ddir>/<subdir>/<sid[:8]>/<sid>_<group><suffix>`, the flat day-dir
+    layout of PRADAN's own trees. `group=None` matches any group but raises if a sid has several."""
     found: dict[str, Path] = {}
     for sid in bnames:
-        f = Path(ddir) / subdir / sid[:8] / sid / filename(sid)
-        if f.is_file():
-            found[sid] = f
+        hits = sorted((Path(ddir) / subdir / sid[:8]).glob(f"{sid}_{group or '*'}{suffix}"))
+        if len(hits) > 1:
+            raise ValueError(f"{sid} has one {suffix} per group, pass group=: {[f.name for f in hits]}")
+        if hits:
+            found[sid] = hits[0]
     return found
 
 
@@ -775,16 +777,19 @@ def _find_by_basename(ddir, subdir, ext, bnames):
     return found
 
 
-def _resolve_ext(ddir, ext, level, bnames):
+def _resolve_ext(ddir, ext, level, bnames, group=None):
     """Every path `get_iirs_paths` knows how to locate for one `ext` at one `level`."""
     LVL2DIR = {0: "raw", 1: "calibrated", 2: "derived"}
     if ext == "gcps":
-        return _find_reprocessed(ddir, "geometry/recalibrated", bnames, lambda s: f"{s}.gcps")
-    if ext in ("loc", "obs"):
-        return _find_reprocessed(ddir, "geometry/recalibrated", bnames, lambda s, e=ext: f"{s}_{e}.tif")
+        return _find_reprocessed(ddir, "geometry/recalibrated", bnames, ".gcps", group)
+    if ext == "loc":
+        return _find_reprocessed(ddir, "geometry/recalibrated", bnames, "_loc.tif", group)
+    if ext == "obs":
+        return _find_reprocessed(ddir, "data/rederived", bnames, "_obs.tif", group)
     if ext == "tif":
-        suffix = "l1_rad" if level == 1 else "l2_refl"
-        return _find_reprocessed(ddir, "data/recalibrated", bnames, lambda s, suf=suffix: f"{s}_{suf}.tif")
+        if level == 1:
+            return _find_reprocessed(ddir, "data/recalibrated", bnames, "_l1_rad.tif", group)
+        return _find_reprocessed(ddir, "data/rederived", bnames, "_l2_refl.tif", group)
     if ext in ("png", "xml-png"):
         subdir = "browse/" + LVL2DIR[level]
     elif ext in ("hdr", "qub", "xml"):
@@ -803,12 +808,16 @@ def get_iirs_paths(
     basenames,
     exts=("qub", "hdr", "xml", "csv", "xml-csv", "lbr", "oat", "oath", "spm", "png", "xml-png"),
     level=1,
+    group=None,
 ):
-    """Return a list of paths to IIRS image, geom, and misc files for the given sids."""
+    """Return a list of paths to IIRS image, geom, and misc files for the given sids.
+
+    `group` picks one solve group's reprocessed products (gcps/loc/obs/tif); see `_find_reprocessed`.
+    """
     out: dict[str, Any] = {}
     bnames = [basenames] if isinstance(basenames, str) else list(basenames)
     for ext in exts:
-        found = _resolve_ext(ddir, ext, level, bnames)
+        found = _resolve_ext(ddir, ext, level, bnames, group)
         if found:
             out[ext] = found
     # Add list of basenames to dict

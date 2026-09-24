@@ -477,19 +477,22 @@ class IIRSData(ABC):
         return int(self.img.y.values[0])
 
     def _read_loc(self, group=None):
-        """This sid's `<sid>_loc.tif`, loaded via `utils.get_iirs_paths` and cached on the instance.
+        """This sid's `<sid>_<group>_loc.tif`, loaded via `utils.get_iirs_paths` and cached per group.
 
         Raises FileNotFoundError if no LOC product exists yet.
         """
-        if getattr(self, "_loc_cache", None) is None:
+        cache = self.__dict__.setdefault("_loc_cache", {})
+        if group not in cache:
             from iirspy import backplanes
 
-            paths = utils.get_iirs_paths(self.directory, level=self.level, basenames=[self.basename], exts=("loc",))
+            paths = utils.get_iirs_paths(
+                self.directory, level=self.level, basenames=[self.basename], exts=("loc",), group=group
+            )
             floc = paths.get("loc", {}).get(self.basename)
             if floc is None:
-                raise FileNotFoundError(f"no <sid>_loc.tif for {self.basename} under {self.directory}")
-            self._loc_cache = backplanes.read_loc(floc)
-        return self._loc_cache
+                raise FileNotFoundError(f"no {self.basename}_{group or '<group>'}_loc.tif under {self.directory}")
+            cache[group] = backplanes.read_loc(floc)
+        return cache[group]
 
     def glt(self, crs, res, bounds=None):
         """(table, transform) GLT for this sid's whole strip on `crs` at `res` m/px.

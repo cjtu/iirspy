@@ -55,13 +55,12 @@ class GroupInfo:
 def group_info(sid: str, group: str) -> GroupInfo:
     """Absolute-scan row range and per-chunk row ranges for one solved group.
 
-    The solve summary is authoritative: `chunks.json` holds the same pre-solve `chunks` plan, but only
+    The solve summary is authoritative: `<sid>_<group>_chunks.json` holds the same pre-solve `chunks` plan, but only
     the summary carries `scan0` and is written once the merge actually succeeds. The gcps file's
     own row extent (not the chunk plan) sets `row_range`, since a partial merge can fall short of
     the last planned chunk; `chunk_rows` is the plan's chunks clipped to that same extent.
     """
-    d = ck.recal_dir(sid, group)
-    f = d / f"georef_solve_summary_{ck.GROUP_SHORT[group]}.json"
+    f = ck.recal_dir(sid) / f"{sid}_{group}_solve_summary.json"
     if not f.exists():
         raise FileNotFoundError(f"{f} missing: {sid}/{group} was not merged (partial --chunks run?)")
     data = json.loads(f.read_text())
@@ -155,11 +154,11 @@ def _group_loc_core(gcps: dict, group: str, nrow: int | None = None, ncol: int |
 
 def _tie_point_residual(sid: str, groups: list[str], fit_dir: Path | None = None) -> dict[str, float] | None:
     """Aggregate p50/p95 tie-point residual [m] across every chunk fit json under `groups`' own
-    solve dirs, or `None` if no `chunk*_fit.json` is found (an older solve, or a synthetic test)."""
+    solve dirs, or `None` if no `<sid>_<group>_chunk*_fit.json` is found (an older solve, or a synthetic test)."""
     med, p95 = [], []
     for g in groups:
-        d = fit_dir if fit_dir is not None else ck.recal_dir(sid, g)
-        for f in sorted(Path(d).glob("chunk*_fit.json")):
+        d = fit_dir if fit_dir is not None else ck.recal_dir(sid)
+        for f in sorted(Path(d).glob(f"{sid}_{g}_chunk*_fit.json")):
             iters = json.loads(f.read_text()).get("stats", {}).get("iters", [])
             if iters and "shift_m" in iters[-1]:
                 med.append(iters[-1]["shift_m"]["median"])
@@ -410,7 +409,7 @@ def _read_group_topo(sid: str, group: str) -> dict | None:
     local-true-north the M3 OBS convention needs — `build_obs` corrects it with the same
     grid/true-north offset `georef.sun_geometry` derives for the hillshade renderer.
     """
-    return _read_topo(ck.recal_dir(sid, group) / f"{sid}_{group}_topo.tif")
+    return _read_topo(ck.recal_dir(sid) / f"{sid}_{group}_topo.tif")
 
 
 def _read_topo(f: Path) -> dict | None:
@@ -422,7 +421,7 @@ def _read_topo(f: Path) -> dict | None:
 
 
 def _l1_rad_path(sid: str, group: str) -> Path:
-    return ck.RECAL_ROOT / "data" / "recalibrated" / sid[:8] / f"{sid}_{group}" / f"{sid}_{group}_l1_rad.tif"
+    return ck.recal_dir(sid, "data/recalibrated") / f"{sid}_{group}_l1_rad.tif"
 
 
 def _group_snr(sid: str, group: str) -> np.ndarray | None:

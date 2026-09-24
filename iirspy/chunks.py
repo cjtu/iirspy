@@ -164,7 +164,6 @@ for _a, _ba in BANDS.items():
 
 GROUPS = ("south", "north", "equatorial")
 GROUP_PRIMARY_BAND = {"south": "south", "north": "north", "equatorial": "equatorial"}
-GROUP_SHORT = {"south": "south", "north": "north", "equatorial": "eq"}  # filename codes
 
 
 AOI_BUFFER_M = 15_000.0  # covers coarse_shift's bulk error plus the tie-point window half-width
@@ -273,13 +272,14 @@ def _one(pattern: str, roots: list[Path] | None = None) -> Path | None:
     return None
 
 
-def recal_dir(sid: str, group: str) -> Path:
-    """Where `sid`/`group`'s recalibrated geometry lives: `geometry/recalibrated/<day>/<sid>_<group>`.
+def recal_dir(sid: str, tree: str = "geometry/recalibrated") -> Path:
+    """`sid`'s day dir in one of this pipeline's product trees: `<tree>/<day>` under `RECAL_ROOT`.
 
-    One dir holds everything a solve produces for that scene/group -- merged GCPs, chunk fits,
-    run log, and the GLT -- mirroring `geometry/calibrated`'s own `<day>` nesting.
+    Flat like PRADAN's own `<tree>/<level>/<day>/`: every file in it is named `<sid>_<group>_*`, so
+    scenes and groups share the dir. Trees: `geometry/recalibrated` (solve: GCPs, chunk fits, GLT,
+    LOC, topo, summary, log), `data/recalibrated` (L1 radiance), `data/rederived` (L2, OBS).
     """
-    return RECAL_ROOT / "geometry" / "recalibrated" / sid[:8] / f"{sid}_{group}"
+    return RECAL_ROOT / tree / sid[:8]
 
 
 def ancillary(sid: str) -> dict[str, Path | None]:
@@ -291,7 +291,7 @@ def ancillary(sid: str) -> dict[str, Path | None]:
         "miscellaneous/raw": spm(sid),
     }
     for group in GROUPS:
-        d = recal_dir(sid, group)
+        d = recal_dir(sid)
         gcps = d / f"{sid}_{group}.gcps"
         glt = d / f"{sid}_{group}_glt.tif"
         out[f"geometry/recalibrated/gcps_{group}"] = gcps if gcps.is_file() and gcps.stat().st_size > 0 else None

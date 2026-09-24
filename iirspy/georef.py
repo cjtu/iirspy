@@ -2017,7 +2017,7 @@ def _glt_parser():
         "--out",
         default=None,
         help="directory to write <sid>_<group>_glt.tif into (default alongside the GCPs, "
-        "geometry/recalibrated/<day>/<sid>_<group> under IIRS_RECAL_ROOT)",
+        "geometry/recalibrated/<day> under IIRS_RECAL_ROOT)",
     )
     ap.add_argument(
         "--scan0",
@@ -2046,7 +2046,7 @@ def main(argv: list[str] | None = None) -> None:
     shape = (int(max(g.row for g in gcps)) + 1, int(max(g.col for g in gcps)) + 1)
     glt = make_glt(gcps, cfg, shape, scan0=args.scan0)
 
-    out = Path(args.out) if args.out else ck.recal_dir(args.sid, args.group)
+    out = Path(args.out) if args.out else ck.recal_dir(args.sid)
     out.mkdir(parents=True, exist_ok=True)
     f = save_glt(
         out / f"{args.sid}_{args.group}_glt.tif",
