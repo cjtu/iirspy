@@ -87,16 +87,11 @@ def test_group_loc_samples_constant_dem_elevation(tmp_path, monkeypatch):
     assert lon.shape == (21, 3)
     assert np.isfinite(lon).all() and np.isfinite(lat).all()
     np.testing.assert_allclose(radius, georef.MOON_RADIUS_M + 500.0, atol=1.0)
-    # cross-checked against the same GCP TPS evaluated independently via GCPTransformer
-    from rasterio.control import GroundControlPoint
-    from rasterio.transform import GCPTransformer
-
-    gcps = {(r, c): (1000.0 * c, -1000.0 * r) for r in rows for c in cols}
-    gcp_list = [GroundControlPoint(row=float(r), col=float(c), x=x, y=y) for (r, c), (x, y) in gcps.items()]
-    with GCPTransformer(gcp_list, tps=True) as t:
-        x0, y0 = t.xy([0], [0], offset="center")
-    lon0, lat0 = georef.xy_to_lonlat(x0[0], y0[0], "south")
-    assert abs(lon[0, 0] - lon0) < 1e-6 and abs(lat[0, 0] - lat0) < 1e-6
+    # the lattice is linear in (row, col), so pixel centres (r + 0.5, c + 0.5) are exact
+    rr, cc = np.meshgrid(np.arange(21) + 0.5, np.arange(3) + 0.5, indexing="ij")
+    lon0, lat0 = georef.xy_to_lonlat(1000.0 * cc, -1000.0 * rr, "south")
+    np.testing.assert_allclose(lon, lon0, atol=1e-9)
+    np.testing.assert_allclose(lat, lat0, atol=1e-9)
 
 
 def test_write_read_loc_round_trip(tmp_path):

@@ -347,6 +347,21 @@ def _haversine_m(lon1, lat1, lon2, lat2, radius=MOON_RADIUS_M):
     return 2 * radius * np.arcsin(np.sqrt(a))
 
 
+def _track_dir(lon, lat, s, s0: float, s1: float, group: str) -> tuple[float, float]:
+    """Unit along-track vector (toward increasing `s`) over backbone span `s0`..`s1`, in `group`'s CRS.
+
+    >>> lat = np.linspace(-10, 10, 21)
+    >>> [round(v, 3) for v in _track_dir(np.zeros(21), lat, lat * 3e4, -1e5, 1e5, "equatorial")]
+    [0.0, 1.0]
+    """
+    k = np.flatnonzero((s >= s0) & (s <= s1))
+    if k.size < 2:  # span fell between backbone nodes: use the two nearest
+        k = np.sort(np.argsort(np.abs(s - 0.5 * (s0 + s1)))[:2])
+    x, y = to_stereo(group).transform(lon[k[[0, -1]]], lat[k[[0, -1]]])
+    d = np.array([x[1] - x[0], y[1] - y[0]])
+    return tuple(float(v) for v in d / np.hypot(*d))  # type: ignore[return-value]
+
+
 def _even_chunks(length_m: float, width_range_km: tuple[float, float], overlap_frac: float):
     """Split `length_m` into equal chunks within `width_range_km`, each overlapping the next by
     `overlap_frac` of its own width. Returns [(s0, s1), ...] with s0=0 at the region's start.
@@ -440,7 +455,8 @@ def plan_chunks(fgeom: Path, width_range_km: tuple[float, float] = (100.0, 150.0
 
     Returns chunks ordered along the strip, each with: `i`, `band`, `group`, `dem_near`/`dem_far`,
     `s0`/`s1` (great-circle metres from the strip's southernmost sample), `scan_lo`/`scan_hi` (the
-    geometry csv's own `Scan` bounds, for row membership) and `aoi` (the chunk's bbox in its band's
+    geometry csv's own `Scan` bounds, for row membership), `t` (unit along-track vector in the band's
+    CRS) and `aoi` (the chunk's bbox in its band's
     CRS, buffered by `AOI_BUFFER_M` and clamped to `xy_half`).
 
     Callers filter by `group` and only merge within one group.
@@ -481,6 +497,7 @@ def plan_chunks(fgeom: Path, width_range_km: tuple[float, float] = (100.0, 150.0
                 "scan_lo": int(in_chunk.min()),
                 "scan_hi": int(in_chunk.max()),
                 "aoi": _chunk_aoi(df, in_chunk, b),
+                "t": _track_dir(lon, lat, s, gs0, gs1, b["group"]),
             })
 
     # Split any residual row gap between same-group neighbours at its midpoint, so no row is left

@@ -15,7 +15,6 @@ import rasterio
 
 # import xarray_regrid
 import xarray as xr
-from issdc_iirs import fetch
 
 # import xesmf as xe
 from pyproj import CRS
@@ -575,12 +574,14 @@ def geom2grid(fgeom, extent, xs=None, ys=None):
     # NOTE: Makes almost no difference (pixel lvl offset, overall offset much larger)
     # df_buf, _ = parse_geom(fgeom, extent, buffer=0.5)
 
-    # Create thin plate spline interpolators
+    # TPS on unit vectors, not lon/lat: near a pole lon swings up to 180 deg within a few scans (and
+    # wraps at +-180 anywhere), and a spline on lon oscillates there by tens of km.
     points = df_buf[["Pixel", "Scan"]].values
     lons = df_buf["Longitude"].values
-    lats = df_buf["Latitude"].values
-    rbf_lon = RBFInterpolator(points, lons, kernel="thin_plate_spline")
-    rbf_lat = RBFInterpolator(points, lats, kernel="thin_plate_spline")
+    lon, lat = np.radians(lons), np.radians(df_buf["Latitude"].values)
+    rbf = RBFInterpolator(
+        points, np.c_[np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], kernel="thin_plate_spline"
+    )
 
     # Create a 2D grid of all pixel x and y values in extent
     pixel_range = np.arange(xyext[0], xyext[1] + 1, 1)
@@ -591,9 +592,12 @@ def geom2grid(fgeom, extent, xs=None, ys=None):
         scan_range = ys
     grid_pixel, grid_scan = np.meshgrid(pixel_range, scan_range)
 
-    # Create the 2D interpolated grids of lon and lat
-    gridlon = rbf_lon(np.column_stack([grid_pixel.ravel(), grid_scan.ravel()])).reshape(grid_pixel.shape)
-    gridlat = rbf_lat(np.column_stack([grid_pixel.ravel(), grid_scan.ravel()])).reshape(grid_pixel.shape)
+    v = rbf(np.column_stack([grid_pixel.ravel(), grid_scan.ravel()]))
+    v /= np.linalg.norm(v, axis=1)[:, None]
+    gridlon = np.degrees(np.arctan2(v[:, 1], v[:, 0])).reshape(grid_pixel.shape)
+    gridlat = np.degrees(np.arcsin(np.clip(v[:, 2], -1, 1))).reshape(grid_pixel.shape)
+    if (lons > 180).any():  # keep the csv's own 0-360 convention
+        gridlon %= 360
     return gridlon, gridlat, xyext
 
 
@@ -692,6 +696,9 @@ def read_gcps(fgcps):
 def extract(fzip, out_dir, **kw):
     """`issdc_iirs.fetch` on one local bundle (`kw`: include/exclude/bands), md5-verified against its
     PDS4 labels. Raises on failure, where `fetch` itself only prints and returns an empty list."""
+    # Local import: the coreg subprocess imports this module from the arosics env, which lacks issdc.
+    from issdc_iirs import fetch
+
     paths = fetch([str(fzip)], str(out_dir), **kw)[str(fzip)]
     if not paths:
         raise RuntimeError(f"issdc_iirs extracted nothing from {fzip} (see its output above)")

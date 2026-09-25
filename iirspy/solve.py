@@ -42,11 +42,16 @@ OVERLAP_FRAC = 0.10
 CONSENSUS_TOL_M = 2000.0
 # Grades a merged product from the worst overlap-boundary p95 (see `_solve_grade`).
 GRADE_ACCEPTABLE_M = 500.0
-# Reseeding assumes one constant x/y correction per strip. In polar stereographic grid north rotates
-# with longitude, so a body-frame-constant pointing error is *not* a constant grid vector along a
-# strip spanning longitude; only the equidistant-cylindrical equatorial group clearly satisfies it.
-# Polar groups therefore log the consensus but keep their solves unless this is opted into.
-CONSENSUS_ALL_GROUPS = os.environ.get("IIRS_CONSENSUS_SEED") == "1"
+# The consensus is two lines in along-track distance, one per component of the shift in the chunk's
+# (along-track, cross-track) frame: line timing and pointing have independent causes. Over 91
+# a3_9regions run-2 strips the accepted chunks drift |slope| p90 1.0 m/km on both components; cross-track
+# never exceeds 5.6 m/km, along-track reaches 8.5 (20210103T0245) and 45 (20201226T1745 south, a line-
+# timing drift that walks its equatorial group out of coarse capture entirely).
+CONSENSUS_MAX_DRIFT_ALONG = 0.060
+CONSENSUS_MAX_DRIFT_CROSS = 0.012
+# Anchors per local line; beyond the outermost inlier the line is held flat after this many chunk spans.
+CONSENSUS_LOCAL_K = 5
+CONSENSUS_HOLD_CHUNKS = 2.0
 
 # Exit code for "stopped early on purpose, work is checkpointed, run me again" -- distinct from 0
 # (finished) and from any real failure, so a submission script can tell a resumable stop from a failure.
@@ -472,7 +477,7 @@ def _peak_mb() -> float:
 
 
 def _make_loc(merged: dict, scan0: int, loc_dir: str, fits: list[dict], overwrite: bool = False) -> Path:
-    """Write `<sid>_<group>_loc.tif` (lon, lat, LOLA radius per camera pixel) through the same TPS as the GLT."""
+    """Write `<sid>_<group>_loc.tif` (lon, lat, LOLA radius per camera pixel) from the merged GCP lattice."""
     from iirspy import backplanes
 
     floc = Path(loc_dir) / f"{SID}_{GROUP}_loc.tif"
@@ -673,23 +678,56 @@ def _is_anchor(r, cfg0) -> bool:
     return frac is not None and frac >= cfg0.min_match_frac
 
 
-def _consensus_shift(shifts, tol_m: float = CONSENSUS_TOL_M):
-    """Per-axis median of `shifts` after dropping points further than max(3*MAD, `tol_m`) from it.
+def _consensus_model(anchors, hold_m: float, max_drift: float, tol_m: float = CONSENSUS_TOL_M):
+    """One shift component as a function of along-track distance, from `anchors` = [(s_m, v_m, weight)].
 
-    None when there is nothing to vote. See `CONSENSUS_TOL_M` for why a plain median is not enough.
+    Inliers: the line (through an anchor pair, or flat through one anchor) with |slope| <= `max_drift`
+    that the most anchor weight lies within `tol_m` of. Then, per query, a weighted line through the
+    `CONSENSUS_LOCAL_K` nearest inliers (slope clamped to `max_drift`; flat below 3 inliers), held flat
+    beyond `hold_m` past the outermost inlier. Returns (f(s) -> v, inlier mask), or None when there
+    is nothing to vote.
 
-    >>> _consensus_shift([(0.0, -8800.0), (320.0, -8640.0), (9920.0, -320.0)])
-    (160.0, -8720.0)
-    >>> _consensus_shift([]) is None
+    >>> f, inl = _consensus_model([(0, 0, 1), (1e5, 500, 1), (2e5, 1000, 1), (3e5, 15000, 1)], 2e5, 0.012)
+    >>> inl.tolist(), round(f(3e5)), round(f(9e5))
+    ([True, True, True, False], 1500, 2000)
+    >>> _consensus_model([], 1.0, 0.012) is None
     True
     """
-    if not shifts:
+    if not anchors:
         return None
-    a = np.asarray(shifts, float)
-    med = np.median(a, axis=0)
-    dev = np.hypot(*(a - med).T)
-    keep = a[dev <= max(3 * float(np.median(dev)), tol_m)]
-    return tuple(float(v) for v in np.median(keep, axis=0))
+    s, v, w = np.asarray(anchors, float).T
+    best, inliers = None, None
+    for i in range(len(s)):
+        for j in range(i, len(s)):
+            ds = s[j] - s[i]
+            if j > i and ds == 0:
+                continue
+            slope = (v[j] - v[i]) / ds if j > i else 0.0
+            if abs(slope) > max_drift:
+                continue
+            dev = np.abs(v - v[i] - (s - s[i]) * slope)
+            inl = dev <= tol_m
+            score = (w[inl].sum(), -dev[inl].sum())
+            if best is None or score > best:
+                best, inliers = score, inl
+    si, vi, wi = s[inliers], v[inliers], w[inliers]
+
+    def f(q):
+        q = float(np.clip(q, si.min() - hold_m, si.max() + hold_m))
+        near = np.argsort(np.abs(si - q))[:CONSENSUS_LOCAL_K]
+        sn, vn, wn = si[near], vi[near], wi[near]
+        if len(sn) < 3 or np.ptp(sn) == 0:  # two points are a slope of pure noise; hold flat
+            return float(np.average(vn, weights=wn))
+        m = float(np.clip(np.polyfit(sn, vn, 1, w=np.sqrt(wn))[0], -max_drift, max_drift))
+        return float(np.average(vn - m * sn, weights=wn) + m * q)
+
+    return f, inliers
+
+
+def _frame(c) -> np.ndarray:
+    """Rows: chunk `c`'s unit along-track `t` and cross-track `n` (t rotated +90 deg), in its grid CRS."""
+    t = np.asarray(c["t"], float)
+    return np.array([t, [-t[1], t[0]]])
 
 
 def _dev_m(shift, consensus) -> float:
@@ -847,6 +885,11 @@ def _solve_chunks_hillshade(chunks, cfg0, fgeom, flabel):
         )
 
 
+def _s_mid(c) -> float:
+    """A chunk's along-track position [m]: the centre of its planned `s0`..`s1` span."""
+    return 0.5 * float(c["s0"] + c["s1"])
+
+
 def _consensus_pass(chunks, results, cfg0, ftif, fgeom, flabel, decay_m, tweaks):
     """Re-solve every chunk that disagrees with the strip's consensus coarse shift, seeded from it.
 
@@ -860,29 +903,58 @@ def _consensus_pass(chunks, results, cfg0, ftif, fgeom, flabel, decay_m, tweaks)
 
     Returns (results, info) with `info` for the summary.
     """
-    consensus = _consensus_shift([_shift_of(r) for r in results if _is_anchor(r, cfg0)])
-    if consensus is None:
+    idx_a = [k for k, r in enumerate(results) if _is_anchor(r, cfg0)]
+    if not idx_a:
         log("\nno anchor chunk in this strip: no consensus coarse shift, product is UNCORRECTED")
-        return results, {"coarse_consensus_m": None, "consensus_enforced": False, "uncorrected": True}
+        return results, {"coarse_consensus_m": None, "uncorrected": True}
 
-    enforce = GROUP == "equatorial" or CONSENSUS_ALL_GROUPS
+    spans = [c["s1"] - c["s0"] for c in chunks]
+    hold_m = CONSENSUS_HOLD_CHUNKS * float(np.median(spans))
+    ac = {k: _frame(chunks[k]) @ _shift_of(results[k]) for k in idx_a}
+    fits, outliers = [], {}
+    for ax, name, cap in ((0, "along", CONSENSUS_MAX_DRIFT_ALONG), (1, "cross", CONSENSUS_MAX_DRIFT_CROSS)):
+        anchors = [(_s_mid(chunks[k]), ac[k][ax], results[k]["fit"]["quality"]["match_frac"]) for k in idx_a]
+        f, inl = _consensus_model(anchors, hold_m, cap)
+        fits.append(f)
+        outliers[name] = [chunks[k]["i"] for k, ok in zip(idx_a, inl, strict=True) if not ok]
+        if name == "along":
+            along_inl = [(a[0], a[2]) for a, ok in zip(anchors, inl, strict=True) if ok]
+
+    def outmatched(k) -> bool:
+        """Whether anchor `k` matched at least as well as the weakest inlier its local along-track line rests on.
+
+        Along-track error can step (dropped/duplicated frames), not only drift, so a well-matched anchor
+        off the along-track line is evidence against the line, not a mis-latch.
+        """
+        if k not in ac:
+            return False
+        near = sorted(along_inl, key=lambda a: abs(a[0] - _s_mid(chunks[k])))[:CONSENSUS_LOCAL_K]
+        return bool(results[k]["fit"]["quality"]["match_frac"] >= min(a[1] for a in near))
+
+    consensus = {c["i"]: [round(float(v), 1) for v in _frame(c).T @ [f(_s_mid(c)) for f in fits]] for c in chunks}
     log(
-        f"\nconsensus coarse shift {tuple(round(v) for v in consensus)} m from "
-        f"{sum(_is_anchor(r, cfg0) for r in results)} anchor chunk(s), "
-        f"tol={CONSENSUS_TOL_M:.0f}m, enforced={enforce}"
+        f"\nconsensus coarse shift (local lines in along-track distance) from {len(idx_a)} anchor chunk(s), "
+        f"outlier anchors {outliers}, tol={CONSENSUS_TOL_M:.0f}m per component, max drift along/cross "
+        f"{CONSENSUS_MAX_DRIFT_ALONG * 1000:.0f}/{CONSENSUS_MAX_DRIFT_CROSS * 1000:.0f} m/km"
     )
     for idx, c in enumerate(chunks):
-        dev = _dev_m(_shift_of(results[idx]), consensus)
+        seed = tuple(consensus[c["i"]])
+        dev = _frame(c) @ np.subtract(_shift_of(results[idx]), seed)
         # A chunk already sitting on the consensus (a `fallback` that inherited it as its seed)
         # would re-solve to exactly what it has, so the 90 s it costs buys nothing.
-        off = dev > 1.0 and (not _accepted(results[idx]) or dev > CONSENSUS_TOL_M)
-        log(f"  chunk {c['i']}: shift={_shift_of(results[idx])} dev={dev:.0f}m {'RESEED' if off else 'keep'}")
-        if not (off and enforce):
+        worst = float(np.abs(dev).max())
+        far = abs(dev[1]) > CONSENSUS_TOL_M or (abs(dev[0]) > CONSENSUS_TOL_M and not outmatched(idx))
+        off = worst > 1.0 and (not _accepted(results[idx]) or far)
+        log(
+            f"  chunk {c['i']}: shift={_shift_of(results[idx])} consensus={seed} "
+            f"dev along/cross={dev[0]:.0f}/{dev[1]:.0f}m {'RESEED' if off else 'keep'}"
+        )
+        if not off:
             continue
-        results[idx] = _solve_one(c, consensus, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=True)
+        results[idx] = _solve_one(c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=True)
         if results[idx] is not None:
             results[idx]["fit"]["reseeded"] = True
-    return results, {"coarse_consensus_m": list(consensus), "consensus_enforced": enforce, "uncorrected": False}
+    return results, {"coarse_consensus_m": consensus, "consensus_outlier_anchors": outliers, "uncorrected": False}
 
 
 def _solve_chunks(chunks, cfg0, ftif, fgeom, flabel, decay_m, tweaks, hillshade_only):
@@ -911,7 +983,7 @@ def _solve_chunks(chunks, cfg0, ftif, fgeom, flabel, decay_m, tweaks, hillshade_
     for r in solved:
         r["fit"]["chunk_grade"] = _chunk_grade(r)
         r["fit"].setdefault("reseeded", False)
-        r["fit"]["shift_dev_m"] = round(_dev_m(_shift_of(r), consensus), 1) if consensus else None
+        r["fit"]["shift_dev_m"] = round(_dev_m(_shift_of(r), consensus[r["chunk"]["i"]]), 1) if consensus else None
     return solved, info
 
 

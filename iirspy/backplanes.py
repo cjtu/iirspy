@@ -8,8 +8,7 @@ from pathlib import Path
 import numpy as np
 import rasterio
 import xarray as xr
-from rasterio.control import GroundControlPoint
-from rasterio.transform import GCPTransformer
+from scipy.interpolate import RectBivariateSpline
 from scipy.ndimage import map_coordinates
 from scipy.spatial import Delaunay, cKDTree
 
@@ -91,7 +90,7 @@ def chunk_overlaps(gi: GroupInfo) -> list[tuple[int, int, int, int]]:
 # ------------------------------------------------------------------------------------------
 def _dem_band(group: str, lat: float) -> dict:
     """The `chunks.bands()` entry covering `lat` within `group`; clamped to the nearest band's
-    `lat_range` if `lat` falls outside every one (TPS extrapolating past the solved edge)."""
+    `lat_range` if `lat` falls outside every one (LOC extrapolating past the solved edge)."""
     resolved = ck.bands()
     cands = [b for b in resolved.values() if b["group"] == group]
     inside = [b for b in cands if b["lat_range"][0] <= lat <= b["lat_range"][1]]
@@ -108,11 +107,16 @@ def _sample_radius(x: np.ndarray, y: np.ndarray, lat: np.ndarray, group: str) ->
     band there, so the height error at that seam is bounded by the DEM tiers' own overlap.
     """
     band = _dem_band(group, float(np.nanmedian(lat)))
+    with rasterio.open(band["dem_near"]) as src:
+        b, px = src.bounds, abs(src.res[0])
+    # Clamped into the DEM so a block wholly past its edge (an equatorial strip's first rows south of
+    # the +-60 deg DEM) reads a 1-px edge strip; `mode="nearest"` then extends it, as it already does
+    # for a block that only straddles the edge.
     bounds = (
-        float(np.nanmin(x)) - DEM_MARGIN_M,
-        float(np.nanmin(y)) - DEM_MARGIN_M,
-        float(np.nanmax(x)) + DEM_MARGIN_M,
-        float(np.nanmax(y)) + DEM_MARGIN_M,
+        float(np.clip(np.nanmin(x) - DEM_MARGIN_M, b.left, b.right - px)),
+        float(np.clip(np.nanmin(y) - DEM_MARGIN_M, b.bottom, b.top - px)),
+        float(np.clip(np.nanmax(x) + DEM_MARGIN_M, b.left + px, b.right)),
+        float(np.clip(np.nanmax(y) + DEM_MARGIN_M, b.bottom + px, b.top)),
     )
     elev, tr, _ = load_lola_elev(band["dem_near"], bounds=bounds)
     rr = (y - tr.f) / tr.e
@@ -122,33 +126,48 @@ def _sample_radius(x: np.ndarray, y: np.ndarray, lat: np.ndarray, group: str) ->
 
 
 def _group_loc_core(gcps: dict, group: str, nrow: int | None = None, ncol: int | None = None, row_block: int = 500):
-    """(lon, lat, radius) at every camera pixel centre of one group's GCP TPS, crop-relative rows.
+    """(lon, lat, radius) at every camera pixel centre of one group's GCP lattice, crop-relative rows.
 
-    `offset="center"`: GDAL's GCP pixel/line convention puts integer row/col on pixel *corners*, so
-    this reproduces the `georef.project`/`scene_glt` warp; `offset="ul"` would be half a pixel off.
-    `nrow`/`ncol` default to the lattice extent; larger values extrapolate the TPS past the last GCP.
-    The transformer is built once (its O(n_gcps^3) solve dominates) and evaluated in `row_block` rows.
+    x/y are an interpolating bicubic spline on the merged (row, col) lattice, which the solve always
+    leaves complete and rectilinear. Not GDAL's TPS: on these ~5-22k point lattices its solve is
+    ill-conditioned and returns pockets of 1e20+ m near some GCPs, and costs O(n_gcps) per pixel.
+    Pixel centres sit at (r + 0.5, c + 0.5) in GDAL's corner-origin GCP convention, the same one
+    `georef.project`/`scene_glt` warp with. Rows/cols off the lattice (the solve can leave the first
+    few hundred rows without GCPs, and `nrow`/`ncol` may exceed the lattice extent) extrapolate
+    linearly from the lattice edge -- a cubic end polynomial runs away by ~100 km over 450 rows.
     """
-    rows_g = [r for r, _c in gcps]
-    cols_g = [c for _r, c in gcps]
-    nrow = int(max(rows_g)) + 1 if nrow is None else nrow
-    ncol = int(max(cols_g)) + 1 if ncol is None else ncol
-    gcp_list = [GroundControlPoint(row=float(r), col=float(c), x=x, y=y) for (r, c), (x, y) in gcps.items()]
+    ur = np.unique([r for r, _c in gcps])
+    uc = np.unique([c for _r, c in gcps])
+    if len(ur) * len(uc) != len(gcps):
+        raise ValueError(f"GCP lattice is incomplete: {len(gcps)} points on {len(ur)} rows x {len(uc)} cols")
+    ir = {v: i for i, v in enumerate(ur)}
+    ic = {v: i for i, v in enumerate(uc)}
+    gx = np.empty((len(ur), len(uc)))
+    gy = np.empty_like(gx)
+    for (r, c), (x, y) in gcps.items():
+        gx[ir[r], ic[c]], gy[ir[r], ic[c]] = x, y
+    nrow = int(ur[-1]) + 1 if nrow is None else nrow
+    ncol = int(uc[-1]) + 1 if ncol is None else ncol
+    kx, ky = min(3, len(ur) - 1), min(3, len(uc) - 1)
+    splines = [RectBivariateSpline(ur, uc, g, kx=kx, ky=ky, s=0) for g in (gx, gy)]
+    cc = np.arange(ncol) + 0.5
+    ce = np.clip(cc, uc[0], uc[-1])
+
+    def at(rr):
+        re = np.clip(rr, ur[0], ur[-1])
+        return [
+            sp(re, ce) + sp(re, ce, dx=1) * (rr - re)[:, None] + sp(re, ce, dy=1) * (cc - ce)[None] for sp in splines
+        ]
 
     lon = np.full((nrow, ncol), np.nan)
     lat = np.full((nrow, ncol), np.nan)
     radius = np.full((nrow, ncol), np.nan)
-    cols = np.arange(ncol)
-    with GCPTransformer(gcp_list, tps=True) as t:
-        for r0 in range(0, nrow, row_block):
-            r1 = min(r0 + row_block, nrow)
-            rr, cc = np.meshgrid(np.arange(r0, r1), cols, indexing="ij")
-            xf, yf = t.xy(rr.ravel().tolist(), cc.ravel().tolist(), offset="center")
-            x = np.asarray(xf).reshape(rr.shape)
-            y = np.asarray(yf).reshape(rr.shape)
-            lo, la = xy_to_lonlat(x, y, pole=group)
-            lon[r0:r1], lat[r0:r1] = lo, la
-            radius[r0:r1] = _sample_radius(x, y, la, group)
+    for r0 in range(0, nrow, row_block):
+        r1 = min(r0 + row_block, nrow)
+        x, y = at(np.arange(r0, r1) + 0.5)
+        lo, la = xy_to_lonlat(x, y, pole=group)
+        lon[r0:r1], lat[r0:r1] = lo, la
+        radius[r0:r1] = _sample_radius(x, y, la, group)
     return lon, lat, radius
 
 
@@ -222,8 +241,8 @@ def write_loc(
         "IIRS_FORMAT_VERSION": "1",
         "IIRS_SID": sid,
         "GEOMETRY_BASIS": (
-            "Registration-derived: camera pixels TPS-fitted to LOLA hillshade per solve group "
-            "(pixel-centre offset); radius is LOLA sampled at the "
+            "Registration-derived: camera pixels registered to LOLA hillshade per solve group, bicubic spline "
+            "on the GCP lattice (pixel-centre offset); radius is LOLA sampled at the "
             "registered point; not a sensor-model ray/DEM intersection. No fill value defined by "
             "the M3 SIS; NaN outside every solved group's rows."
         ),
@@ -688,7 +707,7 @@ def write_obs(fout: Path, obs: dict, sid: str, compress: str = "ZSTD", predictor
         "CONVENTION": "Bands 1-9 follow the ISSDC ndi _d_obs_ band order; bands 10+ are extensions",
         "ISSDC_OBS_FIXES": ISSDC_OBS_FIXES,
         "GEOMETRY_BASIS": (
-            "Registration-derived: sun/sensor terms at the loc's TPS-registered XYZ, row times from the nri "
+            "Registration-derived: sun/sensor terms at the loc's registered XYZ, row times from the nri "
             "label; facet terms from the LOLA DEM normal, not a sensor-model ray/DEM intersection."
         ),
         "SENSOR_GEOMETRY_SOURCE": (
@@ -733,7 +752,7 @@ QA_BITS = {
 
 def _extrapolated_mask(sid: str, groups: dict[str, tuple[int, int]], ny: int, nx: int) -> np.ndarray:
     """True where a pixel lies outside the convex hull of its owning group's own GCP lattice
-    (row, col), i.e. the TPS is extrapolating rather than interpolating."""
+    (row, col), i.e. the LOC is extrapolating rather than interpolating."""
     out = np.zeros((ny, nx), dtype=bool)
     for g in groups:
         gi = group_info(sid, g)
@@ -801,7 +820,7 @@ def write_qa(
         "IIRS_FORMAT_VERSION": "1",
         "IIRS_SID": sid,
         "QA_BIT_0": "no_geometry: LOC undefined (row outside every solved group)",
-        "QA_BIT_1": "gcp_extrapolated: outside the GCP lattice hull, TPS extrapolating",
+        "QA_BIT_1": "gcp_extrapolated: outside the GCP lattice hull, LOC extrapolating",
         "QA_BIT_2": "in_gcp_chunk_overlap: overlap of two chunks of one group, geometry cross-faded",
         "QA_BIT_3": "in_gcp_region_overlap: overlap of two solve groups, geometry seam-blended",
         "QA_BIT_4": f"in_geometric_shadow: lit_frac < {GEOM_SHADOW_LIT} (sun centre below local LOLA horizon)",

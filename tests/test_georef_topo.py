@@ -327,8 +327,8 @@ def test_coarse_shift_falls_through_to_a_lower_ranked_base_peak_when_rank0_fails
 def test_gcp_lattice_samples_the_geometry_spline_at_the_right_rows(tmp_path):
     """The lattice evaluates the geometry TPS only where GCPs go, so row->Scan must line up.
 
-    A linear geometry is reproduced exactly by a thin-plate spline, so the lattice's lon/lat are
-    analytic and a row/Scan off-by-one fails hard instead of shifting the product slightly.
+    Lattice nodes sit on csv nodes (every Scan, the same 6 pixels), where the interpolating spline
+    is exact, so a row/Scan off-by-one fails hard instead of shifting the product slightly.
     """
     from dataclasses import replace
 
@@ -336,9 +336,9 @@ def test_gcp_lattice_samples_the_geometry_spline_at_the_right_rows(tmp_path):
 
     scan0, ny, nx = 500, 200, 250  # cube row r is geometry Scan scan0 + r
     scans = np.arange(scan0, scan0 + ny)
-    pixels = np.array([0, 50, 100, 150, 200, nx - 1])  # the 6-point cross-track sampling
+    pixels = np.linspace(0, nx - 1, 6).astype(int)  # 6-point cross-track sampling, = the lattice cols
     pg, sg = np.meshgrid(pixels, scans)
-    lon = 0.01 * pg + 0.002 * sg  # linear: reproduced exactly by a thin-plate spline
+    lon = 0.01 * pg + 0.002 * sg
     lat = -60.0 + 0.001 * sg
     fgeom = tmp_path / "geom.csv"
     pd.DataFrame({
@@ -348,7 +348,7 @@ def test_gcp_lattice_samples_the_geometry_spline_at_the_right_rows(tmp_path):
         "Latitude": lat.ravel(),
     }).to_csv(fgeom, index=False)
 
-    cfg = replace(georef.GeorefConfig(), pole="equatorial", lat_band=(lat.min(), lat.max()), row_step=25, ncol=13)
+    cfg = replace(georef.GeorefConfig(), pole="equatorial", lat_band=(lat.min(), lat.max()), row_step=25, ncol=6)
     jj, ii, x, y = georef.gcp_lattice(fgeom, ny, nx, cfg)
 
     want_lon = 0.01 * ii + 0.002 * (scan0 + jj)
