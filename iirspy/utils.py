@@ -1,7 +1,7 @@
 import hashlib
 import re
 import warnings
-import zipfile
+from importlib import metadata
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -48,6 +48,11 @@ INVALID = (*range(1, 7), *range(252, 257))  # Invalid band list
 # IIRS L1 radiance is stored in [1000 mW/cm^2/sr/um]; multiply to get physical [W/m^2/sr/um].
 RAD_NATIVE_SCALE = 0.01  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
 E1_EXPOSURE_MS = 1.0  # exposure duration the e1g2 gain LUT was measured at (see get_gain_offset)
+AU_KM = 1.495978707e8
+try:
+    IIRSPY_VERSION = metadata.version("iirspy")
+except metadata.PackageNotFoundError:  # running from a source tree not pip-installed
+    IIRSPY_VERSION = "0+source"
 
 
 ## Reflectance corr
@@ -569,12 +574,14 @@ def geom2grid(fgeom, extent, xs=None, ys=None):
     # NOTE: Makes almost no difference (pixel lvl offset, overall offset much larger)
     # df_buf, _ = parse_geom(fgeom, extent, buffer=0.5)
 
-    # Create thin plate spline interpolators
+    # TPS on unit vectors, not lon/lat: near a pole lon swings up to 180 deg within a few scans (and
+    # wraps at +-180 anywhere), and a spline on lon oscillates there by tens of km.
     points = df_buf[["Pixel", "Scan"]].values
     lons = df_buf["Longitude"].values
-    lats = df_buf["Latitude"].values
-    rbf_lon = RBFInterpolator(points, lons, kernel="thin_plate_spline")
-    rbf_lat = RBFInterpolator(points, lats, kernel="thin_plate_spline")
+    lon, lat = np.radians(lons), np.radians(df_buf["Latitude"].values)
+    rbf = RBFInterpolator(
+        points, np.c_[np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], kernel="thin_plate_spline"
+    )
 
     # Create a 2D grid of all pixel x and y values in extent
     pixel_range = np.arange(xyext[0], xyext[1] + 1, 1)
@@ -585,9 +592,12 @@ def geom2grid(fgeom, extent, xs=None, ys=None):
         scan_range = ys
     grid_pixel, grid_scan = np.meshgrid(pixel_range, scan_range)
 
-    # Create the 2D interpolated grids of lon and lat
-    gridlon = rbf_lon(np.column_stack([grid_pixel.ravel(), grid_scan.ravel()])).reshape(grid_pixel.shape)
-    gridlat = rbf_lat(np.column_stack([grid_pixel.ravel(), grid_scan.ravel()])).reshape(grid_pixel.shape)
+    v = rbf(np.column_stack([grid_pixel.ravel(), grid_scan.ravel()]))
+    v /= np.linalg.norm(v, axis=1)[:, None]
+    gridlon = np.degrees(np.arctan2(v[:, 1], v[:, 0])).reshape(grid_pixel.shape)
+    gridlat = np.degrees(np.arcsin(np.clip(v[:, 2], -1, 1))).reshape(grid_pixel.shape)
+    if (lons > 180).any():  # keep the csv's own 0-360 convention
+        gridlon %= 360
     return gridlon, gridlat, xyext
 
 
@@ -683,24 +693,30 @@ def read_gcps(fgcps):
     return gcps, crs
 
 
-def unzip_iirs(ddir, basename, level, md5checksum=True):
-    """Find zipped IIRS image from PRADAN ISSDC, unzip and run checksum."""
+def extract(fzip, out_dir, **kw):
+    """`issdc_iirs.fetch` on one local bundle (`kw`: include/exclude/bands), md5-verified against its
+    PDS4 labels. Raises on failure, where `fetch` itself only prints and returns an empty list."""
+    # Local import: the coreg subprocess imports this module from the arosics env, which lacks issdc.
+    from issdc_iirs import fetch
+
+    paths = fetch([str(fzip)], str(out_dir), **kw)[str(fzip)]
+    if not paths:
+        raise RuntimeError(f"issdc_iirs extracted nothing from {fzip} (see its output above)")
+    return paths
+
+
+def unzip_iirs(ddir, basename, level):
+    """Find a PRADAN bundle for `basename` under `ddir` and extract all of it, qub included, beside itself."""
     mtc = LVL2MTC[level]
     f = next((f for f in Path(ddir).glob(f"**/*{mtc}*.zip") if basename in f.stem), None)
     if f is None:
         raise FileNotFoundError(
             f"Image {basename} not found in {ddir}. Please download from PRADAN or check file path."
         )
-    with zipfile.ZipFile(f, "r") as zipf:
-        print(f"Extracting {basename} to {f.parent}")
-        zipf.extractall(f.parent)
+    extract(f, f.parent, exclude=())
     paths = get_iirs_paths(f.parent, level=level, basenames=[basename])
     if "qub" not in paths:
         raise RuntimeError("Unzip failed.")
-    if md5checksum:
-        print("Verifying unzipped image...", end=" ")
-        checksum(paths["qub"][basename].as_posix())
-        print("Success!")
     return paths
 
 
@@ -713,46 +729,119 @@ def iirsbasename(input_str):
     return match.group()
 
 
+def _iirs_basename(img_path_obj):
+    """Return IIRS basename e.g. 20210122T0920157625 from pathlib path, or None if the filename
+    doesn't follow the IIRS naming convention."""
+    parts = img_path_obj.stem.split("_")
+    return parts[3] if len(parts) > 3 else None
+
+
+def _find_direct(ddir, subdir, ext, bnames):
+    """Fast lookup under IIRS archive path: `<ddir>/<subdir>/<sid[:8]>/*.<ext>`."""
+    found: dict[str, Path] = {}
+    for sid in bnames:
+        date_dir = Path(ddir) / subdir / sid[:8]
+        if date_dir.is_dir():
+            for f in date_dir.glob(f"*.{ext}"):
+                if _iirs_basename(f) == sid:
+                    found[sid] = f
+    return found
+
+
+def _find_flat(ddir, ext, wanted):
+    """Fast lookup for files dropped directly in `ddir` instead of the normal tree."""
+    return {b: f for f in Path(ddir).glob(f"*.{ext}") if f.is_file() and (b := _iirs_basename(f)) in wanted}
+
+
+def _find_recursive(ddir, subdir, ext, wanted):
+    """Slow full recursive walk search for missing files (last resort)."""
+    return {b: f for f in Path(ddir).glob(f"**/{subdir}/**/*.{ext}") if (b := _iirs_basename(f)) in wanted}
+
+
+def _find_reprocessed(ddir, subdir, bnames, suffix, group=None):
+    """Reprocessed products at `<ddir>/<subdir>/<sid[:8]>/<sid>_<group><suffix>`, the flat day-dir
+    layout of PRADAN's own trees. `group=None` matches any group but raises if a sid has several."""
+    found: dict[str, Path] = {}
+    for sid in bnames:
+        hits = sorted((Path(ddir) / subdir / sid[:8]).glob(f"{sid}_{group or '*'}{suffix}"))
+        if len(hits) > 1:
+            raise ValueError(f"{sid} has one {suffix} per group, pass group=: {[f.name for f in hits]}")
+        if hits:
+            found[sid] = hits[0]
+    return found
+
+
+def _find_by_basename(ddir, subdir, ext, bnames):
+    """Look up each sid in `bnames`, cheapest strategy first (see `_find_direct`/`_find_flat`/
+    `_find_recursive`), only escalating for sids the previous tier didn't find."""
+    found = _find_direct(ddir, subdir, ext, bnames)
+    missing = [sid for sid in bnames if sid not in found]
+    if missing:
+        found.update(_find_flat(ddir, ext, missing))
+        missing = [sid for sid in bnames if sid not in found]
+    if missing:
+        found.update(_find_recursive(ddir, subdir, ext, missing))
+    return found
+
+
+def _resolve_ext(ddir, ext, level, bnames, group=None):
+    """Every path `get_iirs_paths` knows how to locate for one `ext` at one `level`."""
+    LVL2DIR = {0: "raw", 1: "calibrated", 2: "derived"}
+    if ext == "gcps":
+        return _find_reprocessed(ddir, "geometry/recalibrated", bnames, ".gcps", group)
+    if ext == "loc":
+        return _find_reprocessed(ddir, "geometry/recalibrated", bnames, "_loc.tif", group)
+    if ext == "obs":
+        return _find_reprocessed(ddir, "data/rederived", bnames, "_obs.tif", group)
+    if ext == "tif":
+        if level == 1:
+            return _find_reprocessed(ddir, "data/recalibrated", bnames, "_l1_rad.tif", group)
+        return _find_reprocessed(ddir, "data/rederived", bnames, "_l2_refl.tif", group)
+    if ext in ("png", "xml-png"):
+        subdir = "browse/" + LVL2DIR[level]
+    elif ext in ("hdr", "qub", "xml"):
+        subdir = "data/" + LVL2DIR[level]
+    elif ext in ("csv", "xml-csv"):
+        subdir = "geometry/calibrated"
+    elif ext in ("lbr", "oat", "oath", "spm"):
+        subdir = "miscellaneous/" + LVL2DIR[level]
+    else:
+        raise ValueError(f"Unknown IIRS file extension: {ext}")
+    return _find_by_basename(ddir, subdir, ext.split("-")[0], bnames)
+
+
 def get_iirs_paths(
     ddir,
+    basenames,
     exts=("qub", "hdr", "xml", "csv", "xml-csv", "lbr", "oat", "oath", "spm", "png", "xml-png"),
     level=1,
-    basenames=None,
+    group=None,
 ):
-    """Return a list of paths to IIRS image, geom, and misc files."""
+    """Return a list of paths to IIRS image, geom, and misc files for the given sids.
 
-    def basename(img_path_obj):
-        """Return IIRS basename e.g. 20210122T0920157625 from pathlib path."""
-        return img_path_obj.stem.split("_")[3]
-
-    LVL2DIR = {0: "raw", 1: "calibrated", 2: "derived"}
+    `group` picks one solve group's reprocessed products (gcps/loc/obs/tif); see `_find_reprocessed`.
+    """
     out: dict[str, Any] = {}
+    bnames = [basenames] if isinstance(basenames, str) else list(basenames)
     for ext in exts:
-        subdir = "."
-        if ext in ("png", "xml-png"):
-            subdir = "browse/" + LVL2DIR[level]
-        elif ext in ("hdr", "qub", "xml"):
-            subdir = "data/" + LVL2DIR[level]
-        elif ext in ("csv", "xml-csv"):
-            subdir = "geometry/calibrated"
-        elif ext in ("lbr", "oat", "oath", "spm"):
-            subdir = "miscellaneous/" + LVL2DIR[level]
-        else:
-            raise ValueError(f"Unknown IIRS file extension: {ext}")
-        paths = Path(ddir).glob(f"**/{subdir}/**/*.{ext.split('-')[0]}")
-
-        if basenames is not None:
-            basenames = [basenames] if isinstance(basenames, str) else basenames
-            out[ext] = {basename(f): f for f in paths if basename(f) in basenames}
-        else:
-            out[ext] = {basename(f): f for f in paths}
-        # Drop this entry from dict if it is empty
-        if not out[ext]:
-            del out[ext]
+        found = _resolve_ext(ddir, ext, level, bnames, group)
+        if found:
+            out[ext] = found
     # Add list of basenames to dict
     if "qub" in out:
         out["imgs"] = list(out["qub"].keys())
     return out
+
+
+def read_geom_csv(fgeom) -> pd.DataFrame:
+    """IIRS geometry csv, minus the (0, 0) fill rows some bundles pad the tail with.
+
+    Seen on real scenes (e.g. 20240523T1600301891): trailing rows with Pixel=Scan=0 and
+    Longitude=Latitude=0.0 exactly, duplicating the legit Scan=0 row. No lunar limb sample lands
+    on (0.0, 0.0) to full float precision, so safe to drop.
+    """
+    df = pd.read_csv(fgeom)
+    return df[(df.Longitude != 0.0) | (df.Latitude != 0.0)]
 
 
 def get_wls(fwavelengths=FWAVELENGTHS):
@@ -779,7 +868,7 @@ def get_iirs_latlon(fgeom, center=False):
 
     Note: Provided lat/lon are reported for every 50th line/sample, not every pixel.
     """
-    df = pd.read_csv(fgeom).rename(columns={"Pixel": "x", "Scan": "y"})
+    df = read_geom_csv(fgeom).rename(columns={"Pixel": "x", "Scan": "y"})
     df["Longitude"] = (df["Longitude"] + 180) % 360 - 180  # lon in [-180, 180]
     # set coords from 1 to max(coord) unless center coords, which start at 0.5
     df["x"] = df.x + 1 - 0.5 * center
@@ -834,12 +923,12 @@ def parse_geom(
     Examples
     --------
     >>> # Filter by lat/lon, snapping to nearest GCP grid
-    >>> gcps, xyext = parse_geom(fgeom, latlonextent=(-10, 10, 20, 40))
+    >>> gcps, xyext = parse_geom(fgeom, latlonextent=(-10, 10, 20, 40))  # doctest: +SKIP
 
     >>> # Filter by pixel coordinates, snapping to nearest GCP grid
     >>> # If xyextent is (101, 200, 499, 601) and GCPs are every 50,
     >>> # returns GCPs with x from 100 to 200 and y from 450 to 650
-    >>> gcps, xyext = parse_geom(fgeom, xyextent=(101, 200, 499, 601), as_gcps=True)
+    >>> gcps, xyext = parse_geom(fgeom, xyextent=(101, 200, 499, 601), as_gcps=True)  # doctest: +SKIP
     """
     # Check that only one extent type is provided
     latlon_given = any(e is not None for e in latlonextent)
@@ -849,7 +938,7 @@ def parse_geom(
         raise ValueError("Only one of latlonextent or xyextent can be specified, not both.")
 
     # Read GCPs from iirs geometry file
-    df = pd.read_csv(fgeom)
+    df = read_geom_csv(fgeom)
     df["Longitude"] = (df["Longitude"] + 180) % 360 - 180  # lon in [-180, 180]
 
     # Use pixel centers if requested
@@ -1006,7 +1095,8 @@ def load_iirs_spm(fspm):
     df = pd.read_csv(fspm, sep="\\s+", header=None, usecols=range(0, 19), names=colnames)
     df["year"] = df["year"].astype(str).str.slice(3, None)
     df["datetime"] = pd.to_datetime(df.iloc[:, 2:9])
-    df["timestamp"] = df["datetime"].astype("int64") / 1e9  # Equiv to .timestamp(), but faster
+    # Conversion to epoch time (like .timestamp() but faster)
+    df["timestamp"] = df["datetime"].astype("datetime64[ns]").astype("int64") / 1e9
     # df['timestamp'] = df['datetime'].apply(lambda x: x.timestamp())  # Slow
     return df
 
@@ -1017,17 +1107,24 @@ def get_line_times(fimg):
     tstart = pd.to_datetime(img.metaget("start_date_time")).timestamp()
     _, lines, _ = get_iirs_shape_meta(fimg)
     dt = float(img.metaget("isda:line_exposure_duration")) / 1000  # [ms]->[s]
-    orbit_dir = img.metaget("isda:orbit_limb_direction").lower()  # Ascending or Descending
 
     # Note: clock not precise - sometimes nlines != (tstop - tstart) / dt
     # For this reason, don't do np.arange(tstart, tstop+dt, dt) nor linspace(tstart, tstop, nlines)
     # tstop = pd.to_datetime(img.metaget('stop_date_time')).timestamp()
 
-    # Data collection time is bottom up for ascending orbit, top down for descending
+    # Note: Data collection time follows spacecraft collect direction
     line_times = tstart + dt * np.arange(lines)
-    if orbit_dir == "Ascending":
-        line_times = line_times[::-1]
     return line_times
+
+
+def scan_utc(flabel, scans):
+    """UTC (ISO, SPICE-ready) of each absolute Scan in `scans`, from `flabel`'s start time + line exposure.
+
+    The one scan -> time mapping: the .spm is ~40 ms ancillary records, not one per ~53 ms scan line, so
+    its row number is not a Scan.
+    """
+    t = get_line_times(flabel)[np.asarray(scans, dtype=int)]
+    return [pd.Timestamp(v, unit="s").strftime("%Y-%m-%dT%H:%M:%S.%f") for v in np.atleast_1d(t)]
 
 
 def get_iirs_shape_meta(fimg):
@@ -1200,19 +1297,29 @@ def get_solar_flux(sdist=1.0, fflux=FSOLAR):
     return xr.DataArray(flux, coords={"band": np.arange(1, 257)}, name="Solar flux [W/m^2/sr/um]")
 
 
-def get_solar_distance(fimg):
-    """Return the solar distance from the IIRS metadata."""
-    # TODO: Do properly - needs spice. doesn't seem to be in the metadata
+def get_solar_distance(fimg, kernels=None):
+    """Return the Sun-Moon distance in AU at the scene's mid-line epoch, from SPICE.
+
+    `kernels=None` resolves the kernel set via `chunks.kernels(day)`. Warns and returns 1.0 AU if
+    the label or kernels can't be found, rather than failing the whole calibration.
+    """
+    import spiceypy as sp
+
+    from iirspy import chunks
+
     fimg = Path(fimg)
-    if "20201226T1745264921" in fimg.stem:
-        return 0.9855
-    elif "20210122T0920157625" in fimg.stem:
-        return 0.9849
-    elif "20210719T1622353775" in fimg.stem:
-        return 1.0174
-    elif "20210622T1850441449" in fimg.stem or "20210622T1454378054" in fimg.stem or "20210622T1256344234" in fimg.stem:
-        return 1.0184
-    return 1.0
+    try:
+        line_times = get_line_times(fimg)
+        t = pd.Timestamp(line_times[len(line_times) // 2], unit="s")
+        ks = kernels if kernels is not None else chunks.kernels(t.strftime("%Y%m%d"))
+        for k in ks:
+            sp.furnsh(str(k))
+        et = sp.str2et(t.strftime("%Y-%m-%dT%H:%M:%S.%f"))
+        v, _ = sp.spkpos("SUN", et, "IAU_MOON", "LT+S", "MOON")
+    except Exception as e:
+        warnings.warn(f"get_solar_distance: could not compute from SPICE for {fimg} ({e}); using 1.0 AU", stacklevel=2)
+        return 1.0
+    return float(np.linalg.norm(v) / AU_KM)
 
 
 def write_envi(da, fout):
@@ -1240,48 +1347,101 @@ def write_envi(da, fout):
 
 
 ## ENVI BIL streaming writer
-def write_envi_hdr(fhdr, nx, ny, nband, wls, description="IIRS", bands=None, x_start=1, y_start=1):
-    """Write an ENVI header for a float32 BIL cube (data type 4, little-endian).
+ENVI_DTYPE_CODES = {"uint8": 1, "int16": 2, "int32": 3, "float32": 4, "float64": 5, "uint16": 12}
+
+
+def write_envi_hdr(
+    fhdr,
+    nx,
+    ny,
+    nband,
+    wls,
+    description="IIRS",
+    bands=None,
+    x_start=1,
+    y_start=1,
+    dtype="float32",
+    band_names=None,
+    extra_tags=None,
+):
+    """Write an ENVI header for a BIL cube.
 
     `bands` are the IIRS band numbers of the planes (default 1..nband); they go in `band names` so
-    a band subset reads back as itself rather than 1..N. `x_start`/`y_start` are the 1-indexed
-    sample/line of this crop in the parent scene: ENVI carries no transform, so they are the only
-    place a crop's absolute position survives (GeoTIFF uses the geotransform instead).
+    a band subset reads back as itself rather than 1..N, unless `band_names` (arbitrary strings,
+    e.g. a backplane's own per-band names) overrides them -- that also drops the wavelength lines,
+    since a non-wavelength product has none. `x_start`/`y_start` are the 1-indexed sample/line of
+    this crop in the parent scene: ENVI carries no transform, so they are the only place a crop's
+    absolute position survives (GeoTIFF uses the geotransform instead). `extra_tags` (scalar
+    provenance attrs) are written as extra header keys; GDAL surfaces unknown ENVI header keys as
+    dataset metadata, so this keeps ENVI output as provenance-rich as GeoTIFF tags.
     """
-    bands = range(1, nband + 1) if bands is None else bands
-    band_names = ", ".join(str(int(b)) for b in bands)
-    wl_str = ", ".join(f"{float(w):.4f}" for w in wls)
+    dtype_code = ENVI_DTYPE_CODES[str(np.dtype(dtype))]
+    if band_names is not None:
+        names = ", ".join(str(n) for n in band_names)
+        wl_lines = ""
+    else:
+        bands = range(1, nband + 1) if bands is None else bands
+        names = ", ".join(str(int(b)) for b in bands)
+        if wls is None:
+            wl_lines = ""
+        else:
+            wl_str = ", ".join(f"{float(w):.4f}" for w in wls)
+            wl_lines = f"wavelength units = Nanometers\nwavelength = {{{wl_str}}}\n"
+    extra_lines = "".join(f"{k} = {v}\n" for k, v in (extra_tags or {}).items())
     Path(fhdr).write_text(
         "ENVI\n"
         f"description = {{ {description} }}\n"
         f"samples = {nx}\nlines = {ny}\nbands = {nband}\n"
         "header offset = 0\nfile type = ENVI Standard\n"
-        "data type = 4\ninterleave = bil\nbyte order = 0\n"
+        f"data type = {dtype_code}\ninterleave = bil\nbyte order = 0\n"
         f"x start = {int(x_start)}\ny start = {int(y_start)}\n"
-        "wavelength units = Nanometers\n"
-        f"band names = {{{band_names}}}\n"
-        f"wavelength = {{{wl_str}}}\n"
+        f"band names = {{{names}}}\n"
+        f"{wl_lines}{extra_lines}"
     )
 
 
-def _write_bil_rows(f, da, i0, i1, sub_rows):
-    """Stream rows [i0:i1) of a (band, y, x) DataArray to open file f as ENVI BIL float32."""
+def _write_bil_rows(f, da, i0, i1, sub_rows, dtype="float32"):
+    """Stream rows [i0:i1) of a (band, y, x) DataArray to open file f as ENVI BIL."""
     for a in range(i0, i1, sub_rows):
         b = min(a + sub_rows, i1)
-        blk = np.asarray(da.isel(y=slice(a, b)).values, dtype="float32")  # (band, rows, x)
+        blk = np.asarray(da.isel(y=slice(a, b)).values, dtype=dtype)  # (band, rows, x)
         blk.transpose(1, 0, 2).tofile(f)  # C-order of (row, band, x) == ENVI BIL
 
 
-def write_envi_bil(da, fout, sub_rows=1000, description="IIRS"):
-    """Sequentially stream a (band, y, x) DataArray to an ENVI BIL float32 file (bounded memory)."""
+def write_envi_bil(da, fout, sub_rows, description="IIRS"):
+    """Sequentially stream a (band, y, x) DataArray to an ENVI BIL file (bounded memory).
+
+    Integer dtypes are written as-is (e.g. QA's uint16); everything else is written float32.
+    `sub_rows` is required: it is resolved once in `IIRSData._write`, so no second default can
+    drift away from the cube's dask chunking.
+    """
     fout = str(fout)
     nband, ny, nx = da.shape
+    dtype = str(da.dtype) if np.issubdtype(da.dtype, np.integer) else "float32"
     with open(fout, "wb") as f:
-        _write_bil_rows(f, da, 0, ny, sub_rows)
-    wls = da.wl.values if "wl" in da.coords else np.arange(1, nband + 1)
+        _write_bil_rows(f, da, 0, ny, sub_rows, dtype)
+    has_wl = "wl" in da.coords
+    wls = da.wl.values if has_wl else None
+    band_names = None if has_wl else da.coords.get("band_name")
+    if band_names is not None:
+        band_names = [str(n) for n in band_names.values]
     # Pixel centres (n + 0.5) -> ENVI's 1-indexed sample/line of the crop's upper-left pixel
     x_start, y_start = (int(np.floor(float(da[d].min()))) + 1 for d in ("x", "y"))
-    write_envi_hdr(Path(fout).with_suffix(".hdr"), nx, ny, nband, wls, description, da.band.values, x_start, y_start)
+    extra_tags = {k: v for k, v in da.attrs.items() if isinstance(v, str | int | float | bool)}
+    write_envi_hdr(
+        Path(fout).with_suffix(".hdr"),
+        nx,
+        ny,
+        nband,
+        wls,
+        description,
+        da.band.values,
+        x_start,
+        y_start,
+        dtype=dtype,
+        band_names=band_names,
+        extra_tags=extra_tags,
+    )
     return fout
 
 
@@ -1555,20 +1715,3 @@ def plot_spectra_with_sigma(da: xr.DataArray, ax=None, label: str = "", stdev_al
     ax.set_xlabel("Wavelength")
     ax.legend(frameon=False)
     return ax
-
-
-if __name__ == "__main__":  # pragma: no cover
-    fqub = (
-        "/home/cjtu/projects/lai/issdc-requester/data/corrected_python/refl/ch2_iir_20210622T1256344234_destriped.img"
-    )
-    fgeom = "/home/cjtu/projects/lai/data/moon/ch2/iirs/geometry/calibrated/20210622/ch2_iir_nci_20210622T1256344234_g_grd_d32.csv"
-    fpoints = "/home/cjtu/projects/lai/data/moon/ch2/iirs/corrected_python/refl/ch2_iir_20210622T1256344234_destriped.img.points"
-
-    # Read un-georeferenced data qub and add projection info
-    da = xr.open_dataarray(fqub, engine="rasterio")
-    gridlon, gridlat, xyext = geom2grid(fgeom, (None, None, -86, -83))
-    gcps, gcps_crs = read_gcps(fpoints)
-
-    # projected = warp2grid(da, xyext, gridlon, gridlat)
-    proj_from_gcps = warp2gcps(fqub, da, gcps, gcps_crs, "./test.tif")
-    pass
