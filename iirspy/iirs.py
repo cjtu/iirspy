@@ -232,7 +232,7 @@ def _save_geotiff(fout, row_block, da, compress="ZSTD", predictor=None):
     Restartable: each finished block records `rows_done` in a `<fout>.progress` sidecar, and a
     rerun of the same shape reopens the file and picks up there. A cluster task killed at its
     wall clock therefore loses one block, not the whole cube -- which for a long strip is the
-    difference between a resumable requeue and starting the scene from zero.
+    difference between a resumable rerun and starting the scene from zero.
 
     Integer `da` (e.g. QA's uint16) keeps its own dtype and nodata from `da.attrs["nodata"]` (or
     none); everything else writes float32 with NaN nodata. `compress`/`predictor` default to ZSTD

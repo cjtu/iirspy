@@ -149,3 +149,18 @@ def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeyp
     fmeta.write_text(json.dumps({"scan0": 0, "lat_range": [10.0, 20.0], "bands": [1, 2]}))
     with pytest.raises(RuntimeError, match="rebuild-attempted"):
         solve.build_l1((10.0, 20.0), [1, 2], ftif)
+
+
+def test_keep_products_lands_only_what_is_new(tmp_path, monkeypatch):
+    monkeypatch.setattr(solve, "SID", "s")
+    monkeypatch.setattr(solve, "GROUP", "equatorial")
+    out, dest = tmp_path / "out", tmp_path / "keep"
+    out.mkdir()
+    (out / "s_equatorial.gcps").write_text("gcps")
+    assert [f.name for f in solve.keep_products(out, dest)] == ["s_equatorial.gcps"]
+    (out / "s_equatorial_glt.tif").write_text("glt")
+    assert [f.name for f in solve.keep_products(out, dest)] == ["s_equatorial_glt.tif"]
+    assert solve.keep_products(out, dest) == []
+    (out / "s_equatorial.gcps").write_text("re-solved")
+    assert [f.name for f in solve.keep_products(out, dest)] == ["s_equatorial.gcps"]
+    assert (dest / "s_equatorial.gcps").read_text() == "re-solved"

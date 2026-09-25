@@ -7,7 +7,7 @@ chunks with a cosine cross-fade over each row overlap and warps the merged resul
     iirs-solve-scene <sid> --group south|north|equatorial [--out WORKDIR] [--keep DIR] [--clean]
 
 `--out` holds everything the run produces and doubles as its restart cache: a re-run reuses any
-chunk already solved at the same shape, so a requeued job only re-solves what it did not finish.
+chunk already solved at the same shape, so a rerun only re-solves what it did not finish.
 `--keep` copies the durable products out of it -- GCPs, per-chunk fits, summary, log -- and
 `--clean` then deletes the rest, which is rebuildable from the zip.
 
@@ -17,6 +17,7 @@ Paths come from `IIRS_ARCHIVE`, `IIRS_DEM_ROOTS`, `IIRS_SPICE` and `IIRS_STAGE`.
 from __future__ import annotations
 
 import errno
+import filecmp
 import json
 import os
 import shutil
@@ -48,7 +49,7 @@ GRADE_ACCEPTABLE_M = 500.0
 CONSENSUS_ALL_GROUPS = os.environ.get("IIRS_CONSENSUS_SEED") == "1"
 
 # Exit code for "stopped early on purpose, work is checkpointed, run me again" -- distinct from 0
-# (finished) and from any real failure, so a submission script can requeue on it alone.
+# (finished) and from any real failure, so a submission script can tell a resumable stop from a failure.
 EXIT_RESUME = 75
 
 # Copied to `--keep`, each after the `<sid>_<group>` prefix every work-dir file carries (the keep dir
@@ -191,7 +192,7 @@ def _cached_chunk(out: Path, c: dict, good_corr: float, decay_m: float, tweaks: 
     Valid means its band, DEM pair, row bounds, aoi, decay_m, tweaks and the iirspy version that
     wrote it all match `c` and it wasn't rejected, at corr >= `good_corr`. The version is in the key
     because none of the other fields say anything about the *code* that solved the chunk, so without
-    it a rerun or an `EXIT_RESUME` requeue after an algorithm change mixes old and new solves in one
+    it a rerun after an algorithm change mixes old and new solves in one
     product. `"0+source"` (not installed as a distribution, so the version cannot invalidate
     anything) always misses; the cluster venv picks up a bump when iirspy is reinstalled into it.
 
@@ -410,12 +411,17 @@ def already_solved(sid: str, group: str) -> bool:
 
 
 def keep_products(out: Path, dest: Path) -> list[Path]:
-    """Copy the durable products in `out` (see `KEEP_GLOBS`) to `dest`. Returns what was copied."""
+    """Copy the durable products in `out` (see `KEEP_GLOBS`) to `dest`, skipping any already there
+    unchanged, so calling it after each new product lands just that product. Returns what was copied."""
     dest.mkdir(parents=True, exist_ok=True)
     copied = []
     for pattern in KEEP_GLOBS:
         for f in sorted(out.glob(f"{SID}_{GROUP}{pattern}")):
-            shutil.copyfile(f, dest / f.name)
+            d = dest / f.name
+            # copy2 keeps mtime, so a file this kept before matches on filecmp's size+mtime alone.
+            if d.exists() and filecmp.cmp(f, d):
+                continue
+            shutil.copy2(f, d)
             copied.append(f)
     return copied
 
@@ -499,15 +505,17 @@ def _glt_only(args, cfg0, fgeom, lat_range) -> bool:
     cfg = replace(cfg0, lat_band=lat_range)
     scan0 = _scene_scan0(fgeom, lat_range)
     log(f"{fdone} exists ({len(merged)} gcps) -- skipped solve")
-    # Built on scratch, then copied: nothing is written into or read back from keep as a cache.
+    # GCPs found only in the work dir are an interrupted run's, so land them before anything else.
+    keep_products(OUT, keep)
+    # Built on scratch, then kept: nothing is written into or read back from keep as a cache.
     for name, build in (
         ("glt.tif", lambda: _make_glt(merged, cfg, scan0, str(OUT))),
         ("loc.tif", lambda: _make_loc(merged, scan0, str(OUT), _kept_fits(keep))),
     ):
         f = keep / f"{SID}_{GROUP}_{name}"
         if not f.exists():
-            keep.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(build(), f)
+            build()
+            keep_products(OUT, keep)
         log(f"{name.split('.')[0]}: {f}")
     if args.clean:
         shutil.rmtree(OUT, ignore_errors=True)
@@ -708,7 +716,7 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=F
 
     Returns {"chunk", "gcps", "fit"}, or None on total failure. Exits `EXIT_RESUME` if this chunk
     would not fit in the time left (see `--max-seconds`) -- stopping *before* a chunk rather than
-    being killed inside one keeps every finished chunk's cache intact for the requeue.
+    being killed inside one keeps every finished chunk's cache intact for the rerun.
     """
     from iirspy.georef import (
         project,
