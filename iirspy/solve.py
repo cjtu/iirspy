@@ -420,6 +420,18 @@ def keep_products(out: Path, dest: Path) -> list[Path]:
     return copied
 
 
+def _write_and_keep(summary: dict, dest: Path | None) -> None:
+    """Write the solve summary to the work dir and, with `dest`, copy the products there. Before LOC
+    (`summary["loc"]` None) any earlier solve's LOC is deleted from both, since it would pair with the
+    wrong GCPs."""
+    if summary["loc"] is None:
+        for d in (OUT, dest or OUT):
+            (d / f"{SID}_{GROUP}_loc.tif").unlink(missing_ok=True)
+    _work("solve_summary.json").write_text(json.dumps(summary, indent=1, default=str))
+    if dest:
+        log(f"kept {len(keep_products(OUT, dest))} file(s) -> {dest}")
+
+
 def _scene_scan0(fgeom: Path, lat_range: tuple[float, float]) -> int:
     """First Scan of the group's L1 crop, from the geometry csv alone -- no cube needed."""
 
@@ -1245,7 +1257,6 @@ def main(argv: list[str] | None = None) -> None:
     del final  # written to disk by _warp_merged; only the shape is still needed below
     fglt = _make_glt(merged, cfg0, scan0, str(OUT), overwrite=True)
     log(f"glt: {fglt}")
-    floc = _make_loc(merged, scan0, str(OUT), [r["fit"] for r in results], overwrite=True)
 
     summary = {
         "sid": SID,
@@ -1264,18 +1275,20 @@ def main(argv: list[str] | None = None) -> None:
         "n_merged_gcps": len(merged),
         "scan0": scan0,
         "glt": fglt.name,
-        "loc": floc.name,
+        "loc": None,
         "final_aoi_m": final_cfg.aoi,
         "final_shape": final_shape,
         "total_s": round(time.time() - t_start, 1),
     }
-    _work("solve_summary.json").write_text(json.dumps(summary, indent=1, default=str))
+    dest = Path(args.keep) if args.keep else None
+    # Keep the GCPs and GLT before LOC: a LOC that dies (OOM, wall clock) must not take the solve with it.
+    _write_and_keep(summary, dest)
+    floc = _make_loc(merged, scan0, str(OUT), [r["fit"] for r in results], overwrite=True)
+    summary |= {"loc": floc.name, "total_s": round(time.time() - t_start, 1)}
     log(f"\ndone in {summary['total_s']}s.")
+    _write_and_keep(summary, dest)
 
-    if args.keep:
-        dest = Path(args.keep)
-        copied = keep_products(OUT, dest)
-        log(f"kept {len(copied)} file(s) -> {dest}")
+    if dest:
         if args.clean:
             shutil.rmtree(OUT, ignore_errors=True)
             print(f"removed work dir {OUT}", flush=True)
