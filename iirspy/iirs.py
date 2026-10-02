@@ -6,9 +6,11 @@ from pathlib import Path
 
 import numpy as np
 import pdr
+import rasterio
 import xarray as xr
 from rioxarray.exceptions import NoDataInBounds
 
+import iirspy.photometry as photometry
 import iirspy.utils as utils
 from iirspy.empirical import empirical_frames
 
@@ -45,6 +47,79 @@ def _try_load_next_level_metadata(basename, target_level, directory, xyextent):
     return result
 
 
+def _flip(da, flip):
+    """`da` reversed along y and/or x per `flip` = (flip_y, flip_x), keeping its ascending coords."""
+    sl = {d: slice(None, None, -1) for d, f in zip(("y", "x"), flip, strict=True) if f}
+    return da.isel(sl).assign_coords({d: da[d].values for d in sl})
+
+
+def read_issdc_loc(fqub):
+    """ISSDC's ndi `_d_loc_` beside `fqub` as a `backplanes.read_loc` dataset in the nci camera frame
+    (y = Scan, x = Pixel, as the geometry csv and our GLTs index it), and the (flip_y, flip_x) that
+    takes the ndi cube to the same frame, or None if there is no `_d_loc_`.
+
+    ndi products are stored north-up/west-left, not in acquisition order: a descending pass comes
+    column-mirrored, an ascending one row-reversed. The label's Refined upper-left corner is nci
+    Scan 0/Pixel 0, so whichever loc corner sits on it is the origin.
+    """
+    from iirspy.backplanes import read_loc
+
+    floc = next(Path(fqub).parent.glob(f"{Path(fqub).name.split('_d_')[0]}_d_loc_*.img"), None)
+    if floc is None:
+        return None
+    loc = read_loc(floc)
+    ul = pdr.open(fqub).metaget("isda:Refined_Corner_Coordinates")
+    lon0, lat0 = float(ul["isda:upper_left_longitude"]), float(ul["isda:upper_left_latitude"])
+    lon, lat = loc.lon.values[:: -1 or None], loc.lat.values
+    corners = [(i, j) for i in (0, -1) for j in (0, -1)]
+    dlon = [((lon[c] - lon0 + 180) % 360 - 180) * np.cos(np.radians(lat0)) for c in corners]
+    d = np.hypot(dlon, [lat[c] - lat0 for c in corners])
+    flip = tuple(bool(k) for k in corners[int(np.argmin(d))])
+    return _flip(loc, flip), flip
+
+
+def _loc_extent(loc, lonlatextent):
+    """(minx, maxx, miny, maxy) of the rows whose pixels fall in `lonlatextent`, from an ndi bundle's
+    `read_issdc_loc` (it has no geometry csv). Same convention as `utils.parse_geom`: x inclusive,
+    y half-open."""
+    lon, lat = (loc.lon.values + 180) % 360 - 180, loc.lat.values
+    lon0, lon1, lat0, lat1 = (d if e is None else e for e, d in zip(lonlatextent, (-180, 180, -90, 90), strict=True))
+    rows = np.flatnonzero(((lon >= lon0) & (lon <= lon1) & (lat >= lat0) & (lat <= lat1)).any(axis=1))
+    if not rows.size:
+        raise ValueError(f"no pixels of the _d_loc_ inside {lonlatextent}")
+    return (0, lon.shape[1] - 1, int(rows[0]), int(rows[-1]) + 1)
+
+
+def _write_json_atomic(path, obj):
+    """Write `obj` as json via a temp file + rename, so a kill mid-write can't leave a torn file."""
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(obj))
+    tmp.replace(path)
+
+
+def _resume_row(fout, fprog, key):
+    """First row `_save_geotiff` still has to write, from a previous run's progress sidecar.
+
+    0 unless `fout` and its sidecar both exist, the sidecar agrees with `key` (same cube shape and
+    block size -- a different one is a different product, not a resume), and `fout` still opens for
+    update. A file killed mid-flush may not reopen at all, so that case restarts from 0 too.
+    """
+    if not (Path(fout).exists() and Path(fprog).exists()):
+        return 0
+    try:
+        prog = json.loads(Path(fprog).read_text())
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if {k: prog.get(k) for k in key} != key or not prog.get("rows_done"):
+        return 0
+    try:
+        with rasterio.open(fout, "r+"):
+            pass
+    except Exception:
+        return 0
+    return int(prog["rows_done"])
+
+
 def _band_numbers(img):
     """Original IIRS band numbers, from the GeoTIFF band_numbers tag or ENVI band names, else 1..N."""
     for attr in ("band_numbers", "band_names"):
@@ -64,7 +139,168 @@ def _apply_envi_start(da):
     return da
 
 
+def _chunks(nband, ny, nx, chunk=True):
+    """dask chunk dict for a (band, y, x) cube, or None to leave it unchunked.
+
+    `chunk` is a dict to use as-is, or True to split along y at `utils.CHUNKSIZE`. A cube already
+    under one chunk's worth stays whole -- dask would only add graph overhead.
+    """
+    if not chunk:
+        return None
+    if isinstance(chunk, dict):
+        return chunk
+    if nband * ny * nx * 4 <= utils.CHUNKSIZE:
+        return None
+    return {"band": nband, "y": int(utils.CHUNKSIZE / (nband * nx * 4)), "x": nx}
+
+
+def _row_block(da, sub_rows=None):
+    """Rows per write step. Defaults to the array's own y-chunk, so a block is read exactly once.
+
+    An explicit `sub_rows` wins. Unchunked the cube is already resident, so the block only bounds
+    the float32 copy and `utils.CHUNKSIZE` worth of rows is as good a size as any.
+    """
+    if sub_rows:
+        return sub_rows
+    chunks = getattr(da, "chunks", None)
+    if chunks:
+        return max(chunks[da.dims.index("y")])
+    nband, _, nx = da.shape
+    return max(1, int(utils.CHUNKSIZE / (nband * nx * 4)))
+
+
 FLAT_SMILE_MIN = 0.2  # clip flat*smile away from 0 before dividing (avoids blow-ups)
+
+
+def _in_wl_ranges(wl, ranges):
+    """True where `wl` falls in any (lo, hi) of `ranges` (inclusive); all False if `ranges` is falsy."""
+    hit = xr.zeros_like(wl, dtype=bool)
+    for lo, hi in ranges or ():
+        hit = hit | ((wl >= lo) & (wl <= hi))
+    return hit
+
+
+def _narrow_bands(rad, output_bands):
+    """`rad` restricted to `output_bands`, or `rad` unchanged if `output_bands` is None."""
+    return rad if output_bands is None else rad.sel(band=output_bands)
+
+
+def _expand_to_full_bands(da):
+    """Reindex `da`'s band dim onto the full 1..256 IIRS range, NaN-filling any band not present.
+
+    A cube narrowed to a band subset writes only its own bands contiguously, this restores the full
+    1:1 mapping so the dropped/OSF/invalid bands become all-NaN, consistent with IIRS images.
+    """
+    all_bands = np.arange(1, len(utils.get_wls()) + 1)
+    if da.sizes["band"] == len(all_bands) and np.array_equal(da.band.values, all_bands):
+        return da
+    da = da.reindex(band=all_bands)
+    return da.assign_coords(wl=("band", utils.get_wls()))
+
+
+def _attach_empirical_frames(rad, dark, flat, smile, attach):
+    """Attach dark/flat/smile as (band, x) coords on `rad` when `attach`, for save()'s sidecar.
+
+    dark is (x,)-only zeros when no shadow was found; broadcast to flat's (band, x) so all three
+    sidecar frames share one shape.
+    """
+    if not attach:
+        return rad
+    return rad.assign_coords(
+        empirical_dark=(("band", "x"), dark.broadcast_like(flat).values),
+        empirical_flat=(("band", "x"), flat.values),
+        empirical_smile=(("band", "x"), smile.values),
+    )
+
+
+def _write_camera_product(da, fout, row_block=None, compress="ZSTD", predictor=None):
+    """Format dispatch for any camera-space product: `.tif` -> GeoTIFF, else ENVI BIL.
+
+    Module-level (not a method) so callers with just a DataArray -- not a full IIRSData instance
+    -- can write a product too (e.g. `IIRSData.clip_aoi`, which only needs `self.img`).
+    """
+    fout = str(fout)
+    row_block = _row_block(da, row_block)
+    if fout.lower().endswith(".tif"):
+        return _save_geotiff(fout, row_block, da, compress=compress, predictor=predictor)
+    return utils.write_envi_bil(da, fout, row_block, f"IIRS {da.attrs.get('name', '')}".strip())
+
+
+def _save_geotiff(fout, row_block, da, compress="ZSTD", predictor=None):
+    """Write a BigTIFF sequentially in windowed blocks (bounded memory).
+
+    Restartable: each finished block records `rows_done` in a `<fout>.progress` sidecar, and a
+    rerun of the same shape reopens the file and picks up there. A cluster task killed at its
+    wall clock therefore loses one block, not the whole cube -- which for a long strip is the
+    difference between a resumable rerun and starting the scene from zero.
+
+    Integer `da` (e.g. QA's uint16) keeps its own dtype and nodata from `da.attrs["nodata"]` (or
+    none); everything else writes float32 with NaN nodata. `compress`/`predictor` default to ZSTD
+    with predictor 2 (int) or 3 (float) -- not frozen, callers may override either.
+    """
+    from dask.diagnostics import ProgressBar
+    from rasterio.windows import Window
+
+    nband, ny, nx = da.shape
+    is_int = np.issubdtype(da.dtype, np.integer)
+    dtype = str(da.dtype) if is_int else "float32"
+    predictor = predictor if predictor is not None else (2 if is_int else 3)
+    nodata = da.attrs.get("nodata") if is_int else np.nan
+    profile = {
+        "driver": "GTiff",
+        "height": ny,
+        "width": nx,
+        "count": nband,
+        "dtype": dtype,
+        "nodata": nodata,
+        "crs": da.rio.crs if da.rio.crs else None,
+        "transform": da.rio.transform(),
+        "compress": compress,
+        "predictor": predictor,
+        "tiled": True,
+        "interleave": "band",  # per-band planes: viewers read one band without decompressing all 256
+        "BIGTIFF": "YES",
+    }
+    wls = [f"{float(w):.2f}" for w in da.wl.values] if "wl" in da.coords else None
+    band_names = None if wls or "band_name" not in da.coords else da.coords["band_name"].values
+    band_units = None if band_names is None else da.coords["units"].values
+    # Provenance: scalar attrs (incl. empirical_notes JSON) round-trip as GDAL metadata tags.
+    # Drop stale band-count/name tags a source raster may carry in da.attrs (e.g. from GDAL
+    # metadata on read) -- band_numbers/per-band descriptions below are the actual truth and
+    # must not be contradicted by a leftover count/name list from an earlier band selection.
+    tags = {
+        k: str(v)
+        for k, v in da.attrs.items()
+        if isinstance(v, str | int | float | bool) and k not in ("bands", "band_names")
+    }
+    tags["PROVENANCE_IIRSPY_VERSION"] = utils.IIRSPY_VERSION
+    if wls:
+        # Which IIRS bands these planes are: 1..256 on a full cube, arbitrary on a subset
+        tags["band_numbers"] = ",".join(str(int(b)) for b in da.band.values)
+    fprog = Path(str(fout) + ".progress")
+    key = {"shape": [nband, ny, nx], "row_block": int(row_block)}
+    y_start = _resume_row(fout, fprog, key)
+    mode = "r+" if y_start else "w"
+    with rasterio.open(fout, mode, **({} if y_start else profile)) as dst, ProgressBar():
+        if tags:
+            dst.update_tags(**tags)
+        for y0 in range(y_start, ny, row_block):
+            y1 = min(y0 + row_block, ny)
+            block = da.isel(y=slice(y0, y1)).values.astype(dtype, copy=False)
+            dst.write(block, window=Window(0, y0, nx, y1 - y0))
+            _write_json_atomic(fprog, {**key, "rows_done": y1})
+        if wls:
+            for i, wl in enumerate(wls):
+                dst.set_band_description(i + 1, wl)
+                # Per-band "wavelength"/"wavelength_units" is the generic hyperspectral metadata
+                # GDAL/QGIS read for spectral band labels; description alone isn't.
+                dst.update_tags(i + 1, wavelength=wl, wavelength_units="Nanometers")
+        elif band_names is not None and band_units is not None:
+            for i, (name, unit) in enumerate(zip(band_names, band_units, strict=True)):
+                dst.set_band_description(i + 1, str(name))
+                dst.update_tags(i + 1, UNITS=str(unit), DEFINITION=f"{name} [{unit}]")
+    fprog.unlink(missing_ok=True)
+    return fout
 
 
 class IIRSData(ABC):
@@ -96,16 +332,17 @@ class IIRSData(ABC):
             paths = utils.unzip_iirs(self.directory, self.basename, self.level)
         if "qub" not in paths:
             raise FileNotFoundError(f"{self.basename} not found at {self.directory}.")
+        # An ndi (L2) bundle ships no lbr/oat/spm/csv, so every ancillary is optional here
         self.qub = paths["qub"].get(self.basename, "")
-        self.hdr = paths["hdr"].get(self.basename, "")
-        self.xml = paths["xml"].get(self.basename, "")
-        self.lbr = paths["lbr"].get(self.basename, "")
-        self.oat = paths["oat"].get(self.basename, "")
-        self.oath = paths["oath"].get(self.basename, "")
-        self.spm = paths["spm"].get(self.basename, "")
+        self.hdr = paths.get("hdr", {}).get(self.basename, "")
+        self.xml = paths.get("xml", {}).get(self.basename, "")
+        self.lbr = paths.get("lbr", {}).get(self.basename, "")
+        self.oat = paths.get("oat", {}).get(self.basename, "")
+        self.oath = paths.get("oath", {}).get(self.basename, "")
+        self.spm = paths.get("spm", {}).get(self.basename, "")
         if self.level == 1:
-            self.csv = paths["csv"].get(self.basename, "")
-            self.xml_csv = paths["xml-csv"].get(self.basename, "")
+            self.csv = paths.get("csv", {}).get(self.basename, "")
+            self.xml_csv = paths.get("xml-csv", {}).get(self.basename, "")
 
         # Store metadata from the qub file
         self.metadata = self._extract_metadata()
@@ -121,10 +358,8 @@ class IIRSData(ABC):
         self.img = self.img.assign_coords(wl=("band", utils.get_wls()[self.img.band.values - 1]))
 
         # Chunk with dask if needed
-        if chunk and self.nband * self.ny * self.nx * 4 > utils.CHUNKSIZE:
-            if not isinstance(chunk, dict):
-                dy = int(utils.CHUNKSIZE / (self.nband * self.nx * 4))
-                chunk = {"band": self.nband, "y": dy, "x": self.nx}
+        chunk = _chunks(self.nband, self.ny, self.nx, chunk)
+        if chunk:
             self.img = self.img.chunk(chunk)
 
     def _extract_metadata(self):
@@ -158,7 +393,7 @@ class IIRSData(ABC):
         """Mask invalid bands (OSF, bad bands)."""
         self.img = self.img.where(~self.img.band.isin((*utils.OSF, *utils.INVALID)))
 
-    def save(self, fout, sub_rows=1000, snr_sidecar=True):
+    def save(self, fout, sub_rows=None, snr_sidecar=True, empirical_sidecar=True, full_bands=True):
         """
         Stream the image cube to disk with bounded memory.
 
@@ -167,79 +402,190 @@ class IIRSData(ABC):
         regardless of image or machine size. GeoTIFF (.tif): float32 BigTIFF, windowed blocks.
 
         When the cube carries an empirical `snr` coordinate (from calibrate_to_rad with attach_snr),
-        a float32 sidecar `<basename>_snr.img` is written alongside it (ENVI coords don't survive the
-        BIL write), unless snr_sidecar is False.
+        a float32 sidecar `<basename>_snr<ext>` is written alongside it in the same format (ENVI
+        coords don't survive the BIL write), unless snr_sidecar is False.
+
+        When the cube carries `empirical_dark`/`empirical_flat`/`empirical_smile` coordinates (from
+        calibrate_to_rad with attach_empirical_frames), they're written to a single
+        `<basename>_empirical.npz` (keys dark/flat/smile/band/x) beside fout, unless
+        empirical_sidecar is False -- these are (band, x) diagnostic frames, not a raster, so they
+        skip the cube writer entirely.
 
         Parameters
         ----------
         fout : str or Path
             Output path. Extension selects the format (.tif -> GeoTIFF, else ENVI).
-        sub_rows : int
-            Scanlines computed/written per step (bounds peak memory).
+        sub_rows : int, optional
+            Scanlines computed/written per step (bounds peak memory). Default None: the cube's own
+            dask y-chunk, so a write block and a compute block are the same rows.
         snr_sidecar : bool
             Write the broadband `snr` field (if present) to a float32 sidecar next to fout.
+        empirical_sidecar : bool
+            Write the empirical dark/flat/smile frames (if present) to an `.npz` sidecar next to fout.
+        full_bands : bool
+            Reindex the cube onto the full 1..256 IIRS band range before writing, NaN-filling any
+            band a subset dropped (e.g. `output_bands`, OSF/invalid), so band position always
+            matches the real IIRS band number and wavelength. Default True.
 
         Returns
         -------
         str : the path written.
         """
         fout = str(fout)
+        if self.level in (1, 2):
+            self.img.attrs.setdefault("IIRS_PRODUCT", "L1" if self.level == 1 else "L2")
+            self.img.attrs.setdefault("IIRS_FORMAT_VERSION", "1")
+            self.img.attrs.setdefault("IIRS_SID", self.basename)
         if snr_sidecar and "snr" in self.img.coords:
-            self._save_snr_sidecar(fout)
-        if fout.lower().endswith(".tif"):
-            return self._save_geotiff(fout, sub_rows)
-        description = f"IIRS {self.img.attrs.get('name', '')}".strip()
-        return utils.write_envi_bil(self.img, fout, sub_rows, description)
+            self._save_snr_sidecar(fout, sub_rows)
+        if empirical_sidecar and "empirical_flat" in self.img.coords:
+            self._save_empirical_sidecar(fout)
+        img = _expand_to_full_bands(self.img) if full_bands else self.img
+        return self._write(img, fout, sub_rows)
 
-    def _save_snr_sidecar(self, fout):
-        """Write the (y, x) empirical broadband SNR field to a float32 ENVI sidecar next to fout."""
-        import rasterio
+    def _write(self, da, fout, row_block=None, compress="ZSTD", predictor=None):
+        """Format dispatch for any camera-space product: `.tif` -> GeoTIFF, else ENVI BIL."""
+        return _write_camera_product(da, fout, row_block, compress=compress, predictor=predictor)
 
-        snr = self.img.snr.values.astype("float32")
-        ny, nx = snr.shape
-        fsnr = Path(fout).with_name(Path(fout).stem + "_snr.img")
-        with rasterio.open(fsnr, "w", driver="ENVI", height=ny, width=nx, count=1, dtype="float32") as dst:
-            dst.write(snr, 1)
-        return str(fsnr)
+    def _save_snr_sidecar(self, fout, row_block=None):
+        """Write the (y, x) empirical broadband SNR field beside fout, in fout's own format."""
+        snr = self.img.snr.reset_coords(drop=True).expand_dims(band=[1]).astype("float32")
+        snr.attrs = {"name": "SNR", "units": ""}
+        f = Path(fout)
+        return self._write(snr, f.with_name(f.stem + "_snr" + f.suffix), row_block)
 
-    def _save_geotiff(self, fout, row_block):
-        """Write a float32 BigTIFF sequentially in windowed blocks (bounded memory)."""
-        import rasterio
-        from dask.diagnostics import ProgressBar
-        from rasterio.windows import Window
+    def _save_empirical_sidecar(self, fout):
+        """Write the (band, x) empirical dark/flat/smile frames beside fout as one .npz."""
+        f = Path(fout)
+        fnpz = f.with_name(f.stem + "_empirical.npz")
+        np.savez_compressed(
+            fnpz,
+            dark=self.img.empirical_dark.values.astype("float32"),
+            flat=self.img.empirical_flat.values.astype("float32"),
+            smile=self.img.empirical_smile.values.astype("float32"),
+            band=self.img.band.values,
+            x=self.img.x.values,
+        )
+        return str(fnpz)
 
-        da = self.img
-        nband, ny, nx = da.shape
-        profile = {
-            "driver": "GTiff",
-            "height": ny,
-            "width": nx,
-            "count": nband,
-            "dtype": "float32",
-            "nodata": np.nan,
-            "crs": da.rio.crs if da.rio.crs else None,
-            "transform": da.rio.transform(),
-            "compress": "LZW",
-            "tiled": True,
-            "interleave": "band",  # per-band planes: viewers read one band without decompressing all 256
-            "BIGTIFF": "YES",
-        }
-        wls = [f"{float(w):.2f}" for w in da.wl.values] if "wl" in da.coords else None
-        # Provenance: scalar attrs (incl. empirical_notes JSON) round-trip as GDAL metadata tags
-        tags = {k: str(v) for k, v in da.attrs.items() if isinstance(v, str | int | float | bool)}
-        # Which IIRS bands these planes are: 1..256 on a full cube, arbitrary on a subset
-        tags["band_numbers"] = ",".join(str(int(b)) for b in da.band.values)
-        with rasterio.open(fout, "w", **profile) as dst, ProgressBar():
-            if tags:
-                dst.update_tags(**tags)
-            for y0 in range(0, ny, row_block):
-                y1 = min(y0 + row_block, ny)
-                block = da.isel(y=slice(y0, y1)).values.astype("float32", copy=False)
-                dst.write(block, window=Window(0, y0, nx, y1 - y0))
-            if wls:
-                for i, wl in enumerate(wls):
-                    dst.set_band_description(i + 1, wl)
-        return fout
+    def _cube_scan0(self):
+        """Absolute scan row of this cube's first line.
+
+        `self.img`'s `y` coord is never reset by cropping (`.sel`, not `.isel`), so the first
+        label is already the absolute scan row.
+        """
+        return int(self.img.y.values[0])
+
+    def _read_loc(self, group=None):
+        """This sid's `<sid>_<group>_loc.tif`, loaded via `utils.get_iirs_paths` and cached per group.
+
+        Raises FileNotFoundError if no LOC product exists yet.
+        """
+        cache = self.__dict__.setdefault("_loc_cache", {})
+        if group not in cache:
+            from iirspy import backplanes
+
+            paths = utils.get_iirs_paths(
+                self.directory, level=self.level, basenames=[self.basename], exts=("loc",), group=group
+            )
+            floc = paths.get("loc", {}).get(self.basename)
+            if floc is None:
+                raise FileNotFoundError(f"no {self.basename}_{group or '<group>'}_loc.tif under {self.directory}")
+            cache[group] = backplanes.read_loc(floc)
+        return cache[group]
+
+    def glt(self, crs, res, bounds=None):
+        """(table, transform) GLT for this sid's whole strip on `crs` at `res` m/px.
+
+        `crs` must be one of the three IIRS projected CRSs (`georef.pole_from_crs`), since that
+        ties camera pixels to a group's own TPS. `bounds` defaults to the loc's own finite extent
+        in `crs`.
+        """
+        from iirspy import georef
+
+        group = georef.pole_from_crs(crs)
+        loc = self._read_loc(group)
+        if bounds is None:
+            x, y = georef.to_stereo(group).transform(loc.lon.values, loc.lat.values)
+            x, y = np.asarray(x), np.asarray(y)
+            finite = np.isfinite(x) & np.isfinite(y)
+            if not finite.any():
+                raise ValueError(f"{self.basename}'s loc has no finite (x, y) in {crs}")
+            bounds = (float(x[finite].min()), float(y[finite].min()), float(x[finite].max()), float(y[finite].max()))
+        cfg = georef.GeorefConfig(pole=group, aoi=tuple(bounds), ps=res)
+        return georef.glt_from_loc(loc, group, cfg)
+
+    def _render(self, img, table, tr, crs, row_block=None):
+        """`img` pulled through GLT `table` as a lazy (band, y, x) DataArray, `row_block` map rows
+        per dask chunk, so a write streams it instead of holding the whole map grid."""
+        import dask.array as dsa
+
+        from iirspy import georef
+
+        cube, scan0 = img.values, self._cube_scan0()
+        rows = row_block or max(1, int(utils.CHUNKSIZE / (cube.shape[0] * table.shape[2] * 4)))
+        t = dsa.from_array(table, chunks=(2, rows, -1))
+        warped = t.map_blocks(
+            lambda b: georef.apply_glt(cube, b, cube_scan0=scan0),
+            chunks=((cube.shape[0],), *t.chunks[1:]),
+            dtype="float32",
+        )
+        da = xr.DataArray(warped, dims=("band", "y", "x"), coords={"band": img.band.values})
+        if "wl" in img.coords:
+            da = da.assign_coords(wl=("band", img.wl.values))
+        da.attrs = dict(self.img.attrs)
+        return da.rio.write_crs(crs).rio.write_transform(tr)
+
+    def to_geotiff(self, fout, crs=None, res=None, bounds=None, bands=None, row_block=None, full_bands=True, glt=None):
+        """Render `self.img` onto `crs` at `res` m/px (via `self.glt` + `georef.apply_glt`) and write it.
+
+        `glt` is a saved GLT (`georef.save_glt`, e.g. the solve's `<sid>_<group>_glt.tif`) to use
+        instead of one built from the loc; its own grid and CRS win over `crs`/`res`/`bounds`, and
+        it is cropped to the scans this cube holds. `bands` narrows which band numbers render;
+        `full_bands` reindexes the output to the full 1..256 IIRS band range before writing.
+        """
+        from iirspy import georef
+
+        if glt is not None:
+            with rasterio.open(glt) as src:
+                table, tr, crs = src.read(), src.transform, src.crs
+            table, tr = georef.crop_glt(table, tr, self._cube_scan0(), self.img.sizes["y"])
+        else:
+            table, tr = self.glt(crs, res, bounds)
+        img = self.img if bands is None else self.img.sel(band=list(bands))
+        da = self._render(img, table, tr, crs, row_block)
+        return _write_camera_product(_expand_to_full_bands(da) if full_bands else da, fout, row_block)
+
+    def clip_aoi(self, geometry, crs, res, geom_crs=None, fout=None, row_block=None, full_bands=True):
+        """Render `self.img` clipped to a polygon `geometry`, via a GLT built from this sid's loc.
+
+        `geometry`'s bounding box in `crs` becomes the GLT's bounds to keep the render small, then
+        any GLT cell outside the true polygon (not just its bbox) is nulled before `apply_glt`
+        resamples. Returns the clipped `DataArray` if `fout` is None, else writes it and returns
+        the written path.
+        """
+        from rasterio.features import geometry_mask
+        from rasterio.warp import transform_geom
+
+        from iirspy import georef
+
+        geom_crs = georef.LONLAT if geom_crs is None else geom_crs
+        geom = transform_geom(geom_crs, crs, geometry)
+        xs, ys = zip(*geom["coordinates"][0], strict=False)
+        bounds = (min(xs), min(ys), max(xs), max(ys))
+
+        table, tr = self.glt(crs, res, bounds=bounds)
+        poly_mask = geometry_mask([geom], out_shape=table.shape[1:], transform=tr, invert=True)
+        table = table.copy()
+        table[0][~poly_mask] = georef.NODATA  # outside the true polygon, not just its bbox
+        inside = table[0] >= 0
+        if not inside.any():
+            raise ValueError(f"no camera pixels of {self.basename} fall within the given geometry")
+
+        da = self._render(self.img, table, tr, crs, row_block)
+        if fout is None:
+            return da
+        return _write_camera_product(_expand_to_full_bands(da) if full_bands else da, fout, row_block)
 
     @abstractmethod
     def plot(self, band=12, yrange=(None, None), xrange=(None, None), **kwargs):
@@ -342,9 +688,12 @@ class L0(IIRSData):
         interp_bands=None,
         interp_spatial=False,
         attach_snr=True,
+        attach_empirical_frames=False,
         empirical_kws=None,
         bad_pixel_mask=True,
         calib_dir=utils.DCALIB,
+        exclude_wl=None,
+        output_bands=None,
     ):
         """
         Perform IIRS L0 digital number to L1 radiance calibration.
@@ -360,7 +709,7 @@ class L0(IIRSData):
         is poorly correlated with the on-orbit response and injects striping/speckle. With
         empirical=True, derive a per-scene residual dark + sensor flat + band-relative smile (see
         iirspy.empirical) and use the LUT only for the per-band absolute scale. The in-scene dark,
-        when present, anchors the zero point (no longer use the LUT offset):
+        when present, anchors the zero point in place of the LUT offset:
 
           scene with dark rows   : rad = 10 * gain_med * (DN - dark_resid) / (flat * smile)
           scene without dark rows: rad = 10 * (gain_med * DN / (flat * smile) + offset_med)
@@ -395,6 +744,11 @@ class L0(IIRSData):
             downstream users threshold the SNR themselves (a typical cut is empirical.SHADOW_SNR) to
             null, ignore, or study low-signal shadow pixels. save() can write it to a float32 sidecar
             (ENVI coords don't survive the BIL write).
+        attach_empirical_frames : bool
+            When empirical, attach the derived dark/flat/smile (band, x) frames as non-dimension
+            coordinates on the returned DataArray, for diagnosing the empirical correction itself
+            (e.g. comparing flat shape/RMS across scenes). save() writes them to an `.npz` sidecar
+            when present. Off by default -- these are diagnostic, not part of the production output.
         empirical_kws : dict or None
             Extra keyword arguments forwarded to empirical.empirical_frames, e.g.
             dark_yrange=(ylow, yhigh) / flat_yrange=(ylow, yhigh) to override the auto dark-row /
@@ -404,6 +758,18 @@ class L0(IIRSData):
             Mask known bad detector elements (x, band). True (default) uses the packaged mask
             (utils.load_bad_pixel_mask); False skips masking; or pass a custom boolean mask
             (True where bad) to null instead.
+        exclude_wl : list of (lo, hi) or None
+            Extra wavelength [nm] ranges to null, on top of OSF/invalid bands -- e.g. bands that
+            stay noisy no matter the flat/smile derivation. Cut alongside OSF/invalid, so a band
+            in range is excluded from interp_bands' neighbour fill too, not patched over it.
+        output_bands : list of int or None
+            Restrict masking/interpolation/output (steps 3-5) to this band subset after the
+            empirical dark/flat/smile derivation has already used the full cube -- e.g. a caller
+            that only wants one band back can still supply that band's `interp_bands` neighbours
+            (+-6) here instead of paying to mask/interpolate every staged band. None (default):
+            every band `self.img` holds. Only safe to narrow past what `interp_bands`' max_gap=6
+            could reach for the bands you actually want out; empirical_frames itself always sees
+            the unnarrowed `self.img`, so this has no effect on the empirical frames' quality.
 
         Returns
         -------
@@ -425,12 +791,17 @@ class L0(IIRSData):
             else:
                 # No zero reference: the lab offset is the only zero-point info, so keep it
                 rad = 10 * (gain_med * self.img / fs + offset_med)
+            rad = _attach_empirical_frames(rad, dark, flat, smile, attach_empirical_frames)
         else:
             # Apply per-element gain and offset to convert DN -> Radiance
             rad = 10 * (self.img * gain + offset)  # [mW/cm^2/sr/μm] -> [W/m^2/sr/um]
 
-        # Drop OSF and invalid bands. interp if specified
-        rad = rad.where(~rad.band.isin((*utils.OSF, *utils.INVALID)))
+        # Narrow to the requested output bands before the mask/interpolate stage below -- the
+        # empirical frames above already saw every band `self.img` holds, so this can't affect them.
+        rad = _narrow_bands(rad, output_bands)
+
+        # Drop OSF and invalid bands, plus any caller-supplied wavelength ranges. interp if specified
+        rad = rad.where(~(rad.band.isin((*utils.OSF, *utils.INVALID)) | _in_wl_ranges(rad.wl, exclude_wl)))
 
         # Drop known bad detector elements (x, bands)
         if bad_pixel_mask is True:  # Load default bad pixel mask
@@ -456,7 +827,10 @@ class L0(IIRSData):
         out.attrs["name"] = "Radiance"
         out.attrs["units"] = "W/m^2/sr/um"
         out.attrs["calibration_source"] = "empirical" if empirical else "user"
-        out.attrs["iirspy_version"] = metadata.version("iirspy")
+        try:
+            out.attrs["iirspy_version"] = metadata.version("iirspy")
+        except metadata.PackageNotFoundError:  # running from a source tree not pip-installed, e.g. iirspy.coreg
+            out.attrs["iirspy_version"] = "0+source"
         if empirical:
             out.attrs["empirical_notes"] = json.dumps(emp_notes)  # provenance: how the product was made
 
@@ -546,6 +920,7 @@ class L1(IIRSData):
             )
             fimg = paths.get("qub", {}).get(instance.basename) or paths.get("xml", {}).get(instance.basename)
             if fimg is not None:
+                instance.qub = fimg
                 # yrange as contiguous absolute line indices matching this cube's y, so the
                 # incidence array lines up exactly (extent min/max int-truncation can be off by 1).
                 y0 = round(float(instance.img.y.min()) - 0.5)
@@ -559,7 +934,7 @@ class L1(IIRSData):
         return instance
 
     @classmethod
-    def from_file(cls, path, basename, directory="."):
+    def from_file(cls, path, basename, directory=".", chunk=True):
         """Load a cropped empirical-L1 GeoTIFF or ENVI cube (native [1000 mW/cm^2/sr/um]) as an L1.
 
         Restores the band numbers, wavelengths and absolute line/sample offset, rescales radiance to
@@ -574,8 +949,14 @@ class L1(IIRSData):
             Image basename (e.g. 20210723T1445053074), used to find spm/geometry in `directory`.
         directory : str
             Directory holding the IIRS bundle (nci ancillary: spm + geometry csv).
+        chunk : bool or dict
+            Chunk image automatically (default: True). Or supply dict of x,y,band chunk sizes (see dask).
         """
         da = _apply_envi_start(xr.open_dataarray(path, engine="rasterio").sortby("y").sortby("x"))
+        nband, ny, nx = da.shape
+        chunk = _chunks(nband, ny, nx, chunk)
+        if chunk:
+            da = da.chunk(chunk)
         bands = np.asarray(_band_numbers(da), dtype=int)
         da = da.assign_coords(band=bands, wl=("band", utils.get_wls()[bands - 1]))
         da = da * utils.RAD_NATIVE_SCALE  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
@@ -623,7 +1004,24 @@ class L1(IIRSData):
         self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, xyextent, center=False)
         # replace any None in extent with values from xy_extent
         self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent, strict=False))
-        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
+        # ...but the geometry csv always describes the WHOLE strip, while the cube may be a crop of
+        # it (our own polar L1 products are). Where the caller named no extent, take the line range
+        # from the image itself -- `_apply_envi_start` has already put its y coords into strip
+        # numbering via the ENVI `y start` field, which is what that field is for. Without this,
+        # per-line solar geometry is built for the full strip and collides with the cropped cube:
+        # "conflicting sizes for dimension 'y': length 49013 ... and length 3600".
+        if all(e is None for e in xyextent) and all(e is None for e in lonlatextent):
+            # floor/ceil, not int(): rasterio hands back pixel-CENTRE coords (0.5 .. n-0.5), so
+            # truncating both ends drops a row and a column off the crop.
+            self.extent = (
+                int(np.floor(self.img.x.values[0])),
+                int(np.ceil(self.img.x.values[-1])),
+                int(np.floor(self.img.y.values[0])),
+                int(np.ceil(self.img.y.values[-1])),
+            )
+        # x extent is an inclusive last-pixel index (249 on a 250-wide cube) against pixel-centre
+        # coords, so +1 keeps that last column; y stays half-open to match `solve.build_l1`'s crop.
+        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(self.extent[0], self.extent[1] + 1))
         try:
             self.bounds = self.img.rio.bounds()
         except NoDataInBounds as e:
@@ -638,7 +1036,9 @@ class L1(IIRSData):
         self.img.attrs["calibration_source"] = "issdc"
 
         # Assign lat, lon coordinates
-        lon, lat = utils.geom2latlon_coords(self.geomdf, xy_extent, self.shape[2], self.shape[1])
+        # `self.extent`, not `xy_extent`: the latter spans the whole strip even when the cube is a
+        # crop, which put +44 deg latitudes on a south-polar product.
+        lon, lat = utils.geom2latlon_coords(self.geomdf, self.extent, self.shape[2], self.shape[1])
 
         # Get solar incidence for each line of image
         inc, iaz = utils.get_iirs_inc_az(self.qub, self.spm, self.extent[2:])
@@ -662,8 +1062,35 @@ class L1(IIRSData):
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
         return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
-    def calibrate(self, inc=None, dem=None, solar_flux=None, thermal_corr=""):
-        """Calibrate to L2 reflectance object (requires SPM file for solar angles)."""
+    def calibrate(
+        self,
+        inc=None,
+        dem=None,
+        solar_flux=None,
+        thermal_corr="",
+        topo=None,
+        photom="lambert",
+        phase=None,
+        min_lit=0.9,
+        mu_min=0.0,
+        sun_az_offset=0.0,
+    ):
+        """Calibrate to L2 reflectance object (requires SPM file for solar angles).
+
+        `topo` (camera-space slope/aspect, see iirspy.photometry.load_topo) and `photom` (a
+        iirspy.photometry model name or callable) select the photometric normalization; the
+        defaults reproduce the flat-surface Lambert I/F this pipeline has always produced.
+
+        `phase` : bool, optional. When True, layers iirspy.photometry.besse_phase on top of
+        `photom`. Default None/False is a no-op (current behaviour).
+
+        `mu_min` floors mu0 and mu individually before they enter the disk function, so grazing
+        incidence/emission pixels don't blow up the I/F division -- Besse's rule, applied at
+        85 deg (mu_min = cos(85deg) ~= 0.0872) is the convention that keeps his corrected
+        reflectance in [0, 1]. Default 0.0 is a no-op (current behaviour). Pixels below the floor
+        are CLAMPED (level capped, pixel kept), not nulled -- the fraction that hit each floor is
+        recorded in refl.attrs["mu0_floor_frac"] / ["mu_floor_frac"] so it can be masked later.
+        """
         if self.spm is None:
             raise FileNotFoundError(
                 f"SPM file required for reflectance calibration. Expected: "
@@ -676,7 +1103,21 @@ class L1(IIRSData):
             dem=dem,
             solar_flux=solar_flux,
             thermal_corr=thermal_corr,
+            topo=topo,
+            photom=photom,
+            phase=phase,
+            min_lit=min_lit,
+            mu_min=mu_min,
+            sun_az_offset=sun_az_offset,
         )
+
+
+def _apply_besse_phase(refl, photom, g, wl):
+    """Rescale `refl` from `photom`'s own f=1 normalization onto Besse's RADF(30,0,30) convention."""
+    xl_ref = photometry.get_model(photom)(np.cos(np.radians(30.0)), 1.0, 30.0)
+    g_dims = getattr(g, "dims", ("y",))
+    f_ratio = xr.DataArray(photometry.besse_phase(np.asarray(g), wl.values), dims=("band", *g_dims))
+    return refl * xl_ref * f_ratio
 
 
 class L2(IIRSData):
@@ -740,7 +1181,20 @@ class L2(IIRSData):
         return instance
 
     @classmethod
-    def _from_l1(cls, l1_instance, inc=None, dem=None, solar_flux=None, thermal_corr=""):
+    def _from_l1(
+        cls,
+        l1_instance,
+        inc=None,
+        dem=None,
+        solar_flux=None,
+        thermal_corr="",
+        topo=None,
+        photom="lambert",
+        phase=None,
+        min_lit=0.9,
+        mu_min=0.0,
+        sun_az_offset=0.0,
+    ):
         """Internal method to create L2 from L1 instance."""
         instance = cls.__new__(cls)
         instance.basename = l1_instance.basename
@@ -763,12 +1217,33 @@ class L2(IIRSData):
             dem=dem,
             solar_flux=solar_flux,
             thermal_corr=thermal_corr,
+            topo=topo,
+            photom=photom,
+            phase=phase,
+            min_lit=min_lit,
+            mu_min=mu_min,
+            sun_az_offset=sun_az_offset,
         )
         instance.img.attrs["calibration_source"] = "user"
 
         return instance
 
-    def _compute_reflectance(self, rad, qub_path, csv_path, inc=None, dem=None, solar_flux=None, thermal_corr=""):
+    def _compute_reflectance(
+        self,
+        rad,
+        qub_path,
+        csv_path,
+        inc=None,
+        dem=None,
+        solar_flux=None,
+        thermal_corr="",
+        topo=None,
+        photom="lambert",
+        phase=None,
+        min_lit=0.9,
+        mu_min=0.0,
+        sun_az_offset=0.0,
+    ):
         """
         Compute I/f reflectance from radiance data and solar geometry.
 
@@ -794,6 +1269,32 @@ class L2(IIRSData):
             Thermal correction method. Currently supports:
             - "" (empty string): No thermal correction (default)
             - "verma": Apply Verma thermal correction method
+        topo : str, Path, xarray object or tuple, optional
+            Camera-space slope, aspect and (optionally) lit fraction on this cube's grid, as
+            written by iirspy.georef.save_topo. See iirspy.photometry.load_topo. Default None: the
+            surface is the flat local horizontal.
+        photom : str or callable, optional
+            Photometric model, by name from iirspy.photometry.MODELS or as any f(mu0, mu, g)
+            callable. Default "lambert".
+        phase : bool, optional
+            When True, layers iirspy.photometry.besse_phase on top of `photom`. Default
+            None/False is a no-op.
+        min_lit : float, optional
+            Null pixels the terrain leaves less than this fraction of the solar disk illuminated,
+            from the topo product's `lit` band. Default 0.9. No-op without `topo`.
+        mu_min : float, optional
+            Floor applied to mu0 (cosine of local solar incidence) and mu (cosine of local
+            emission) individually, before they enter the disk function, so grazing pixels (mu0
+            or mu -> 0, e.g. near the terminator, on slopes facing away from a low sun, or at
+            steep view angles) don't blow up in the I/F division. This is Besse's rule: clamping
+            both incidence and emission at 85 deg (mu_min = cos(85deg) ~= 0.0872) is what keeps
+            his corrected reflectance in [0, 1]. Default 0.0 is a no-op, matching all existing
+            callers. Pixels below either floor are CLAMPED, not nulled: their reflectance level is
+            capped rather than the pixel being dropped. The fraction of valid pixels that hit each
+            floor is recorded in refl.attrs["mu0_floor_frac"] / ["mu_floor_frac"].
+        sun_az_offset : float, optional
+            Degrees added to the spm solar azimuth, which is measured from local north, to bring
+            it into the grid-north frame the topo product's aspect uses. Default 0.0.
         Returns
         -------
         xarray.DataArray
@@ -829,13 +1330,58 @@ class L2(IIRSData):
         elif thermal_corr:
             raise ValueError('thermal_corr must be "" or "verma"')
 
-        refl = (rad - trad) / (cos_inc * solar_flux)
+        # Photometric normalization. Without topography the surface is the flat local horizontal:
+        # mu0 is the per-line solar cosine, the view is nadir (mu = 1), phase = incidence. With
+        # `topo`, mu0/mu are the local cosines about each facet.
+        sun_az = (rad.solar_az if "solar_az" in rad.coords else 0.0) + sun_az_offset
+        lit = 1.0
+        if topo is not None:
+            # cos_inc is per-line (y,); the topo fields are (y, x), so match them to the image
+            slope, aspect, lit, sun = photometry.load_topo(topo, like=rad.isel(band=0, drop=True))
+            # Slope/aspect are referenced to the DEM's tangent plane, the spm's angles to each
+            # pixel's local horizontal, so the product's own sun is used whenever it carries one.
+            az, elev = sun if sun is not None else (sun_az, 90 - rad.solar_inc)
+            mu0, mu, g = photometry.topo_angles(slope, aspect, az, elev)
+        else:
+            inc_deg = np.degrees(np.arccos(np.clip(cos_inc, -1.0, 1.0)))
+            mu0, mu, g = cos_inc, xr.ones_like(cos_inc), photometry.phase_angle(sun_az, 90 - inc_deg)
+        mu0_floor_frac = 0.0
+        mu_floor_frac = 0.0
+        if mu_min > 0.0:
+            mu0_floor_frac = float(np.asarray(mu0 < mu_min).mean())
+            mu0 = mu0.clip(min=mu_min) if hasattr(mu0, "clip") else np.clip(mu0, mu_min, None)
+            mu_floor_frac = float(np.asarray(mu < mu_min).mean())
+            mu = mu.clip(min=mu_min) if hasattr(mu, "clip") else np.clip(mu, mu_min, None)
+        # photfn is the disk function times the lit fraction. Facets the sun does not reach have
+        # no direct beam to normalize by, so they are nulled rather than clipped.
+        photfn = photometry.get_model(photom)(mu0, mu, g) * lit
+        if min_lit > 0.0:
+            photfn = photfn.where(np.asarray(lit) >= min_lit) if hasattr(photfn, "where") else photfn
+        photfn = photfn.where(photfn > 0) if hasattr(photfn, "where") else photfn
+
+        refl = (rad - trad) / (photfn * solar_flux)
+        refl = _apply_besse_phase(refl, photom, g, rad.wl) if phase else refl
         # add wl array as coordinate if missing
         if "wl" not in refl.coords:
             refl = refl.assign_coords(wl=rad.wl)
         refl.name = "Reflectance"
         refl.attrs["name"] = "Reflectance"
         refl.attrs["units"] = ""
+
+        inc_deg = np.degrees(np.arccos(np.clip(cos_inc, -1.0, 1.0)))
+        refl.attrs["thermal_corr"] = thermal_corr
+        refl.attrs["photom"] = photom if isinstance(photom, str) else getattr(photom, "__name__", "custom")
+        refl.attrs["phase"] = bool(phase)
+        refl.attrs["min_lit"] = min_lit
+        refl.attrs["mu_min"] = mu_min
+        refl.attrs["mu0_floor_frac"] = mu0_floor_frac
+        refl.attrs["mu_floor_frac"] = mu_floor_frac
+        refl.attrs["sun_az_offset"] = sun_az_offset
+        refl.attrs["topo_used"] = topo is not None
+        refl.attrs["solar_distance_au"] = sdist
+        refl.attrs["inc_min_deg"] = float(inc_deg.min())
+        refl.attrs["inc_max_deg"] = float(inc_deg.max())
+        refl.attrs["inc_mean_deg"] = float(inc_deg.mean())
 
         return refl
 
@@ -857,17 +1403,27 @@ class L2(IIRSData):
         self.geomdf = metadata["geometry_df"]
         self.spm = metadata["spm"]
 
+        issdc = None if self.geomdf is not None else read_issdc_loc(self.qub)
+        if issdc is not None:
+            self.img = _flip(self.img, issdc[1])  # into the nci camera frame, like the loc
         if self.geomdf is not None:
             self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, center=False)
             self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent, strict=False))
+        elif any(e is not None for e in lonlatextent):
+            if issdc is None:
+                raise FileNotFoundError(f"no geometry csv or _d_loc_ backplane beside {self.qub} to crop by lon/lat")
+            self.extent = _loc_extent(issdc[0], lonlatextent)
 
-        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
+        # x extent is an inclusive last-pixel index (249 on a 250-wide cube) against pixel-centre
+        # coords, so +1 keeps that last column; y stays half-open to match `solve.build_l1`'s crop.
+        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(self.extent[0], self.extent[1] + 1))
         try:
             self.bounds = self.img.rio.bounds()
         except NoDataInBounds as e:
             raise ValueError(f"No data found within extent {self.extent} for {self.basename}.") from e
 
         self.shape = self.img.shape
+        self.img = self.img.where(self.img != 0)  # ISSDC ndi fill is exact 0, not a declared nodata
 
         if self.geomdf is not None:
             lon, lat = utils.geom2latlon_coords(self.geomdf, self.extent, self.shape[2], self.shape[1])

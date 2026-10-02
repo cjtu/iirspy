@@ -1,0 +1,25 @@
+# Environment for iirspy.coreg (AROSICS tie-point matching); see that module.
+#   mamba env create -f arosics-environment.yml
+name: arosics
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - gdal
+  - libgdal-jp2openjpeg
+  - arosics
+  - geoarray
+  - rasterio
+  - rioxarray
+  - xarray
+  - dask
+  - numpy
+  - scipy
+  - pandas
+  - pyproj
+  - scikit-image
+  - spiceypy
+  - bottleneck
+  - matplotlib-base
+  - py-opencv
+  - pdr
