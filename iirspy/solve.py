@@ -1122,8 +1122,8 @@ def _parser():
     ap.add_argument(
         "--gcp-row-margin",
         type=int,
-        default=250,
-        help="rows of GCP lattice kept either side of a chunk's own rows (GeorefConfig."
+        default=None,
+        help="rows of GCP lattice kept either side of a chunk's own rows (default GeorefConfig."
         "gcp_row_margin; -1 = the whole cube). Clipping cuts per-iteration TPS cost.",
     )
     ap.add_argument(
@@ -1136,43 +1136,43 @@ def _parser():
     ap.add_argument(
         "--edge-reject-m",
         type=float,
-        default=0.0,
+        default=None,
         help="drop tie points whose centre is closer than this to the swath's own nodata edge "
-        "(GeorefConfig.edge_reject_m; 0 = off)",
+        "(default GeorefConfig.edge_reject_m; 0 = off)",
     )
     ap.add_argument(
         "--shadow-max",
         type=float,
-        default=1.0,
+        default=None,
         help="drop tie points whose reference match window is more shadowed than this fraction "
-        "(GeorefConfig.shadow_max; 1 = off)",
+        "(default GeorefConfig.shadow_max; 1 = off)",
     )
     ap.add_argument(
         "--plateau-frac",
         type=float,
-        default=0.02,
+        default=None,
         help="stop when p95 improves by less than this fraction of the previous iteration's p95, "
-        "independent of GeorefConfig.p95_stop_m (GeorefConfig.p95_plateau_frac; 0 = off)",
+        "independent of GeorefConfig.p95_stop_m (default GeorefConfig.p95_plateau_frac; 0 = off)",
     )
     ap.add_argument(
         "--min-iter",
         type=int,
-        default=0,
+        default=None,
         help="never declare convergence before this iteration; mad_from_iter+1 (=4) guarantees one "
-        "MAD-culled field is applied and measured (GeorefConfig.min_iter; 0 = off)",
+        "MAD-culled field is applied and measured (default GeorefConfig.min_iter; 0 = off)",
     )
     ap.add_argument(
         "--edge-fit-k",
         type=int,
-        default=0,
+        default=None,
         help="off-support displacement fallback: fit a plane to the k nearest tie points instead "
-        "of using the chunk-wide bulk median (GeorefConfig.edge_fit_k; 0 = off)",
+        "of using the chunk-wide bulk median (default GeorefConfig.edge_fit_k; 0 = off)",
     )
     ap.add_argument(
         "--edge-dense-m",
         type=float,
-        default=0.0,
-        help="second, denser tie-point pass within this far of the swath edge (GeorefConfig.edge_dense_m; 0 = off)",
+        default=None,
+        help="second, denser tie-point pass within this far of the swath edge (default GeorefConfig.edge_dense_m; 0 = off)",
     )
     return ap
 
@@ -1293,14 +1293,18 @@ def main(argv: list[str] | None = None) -> None:
     chunks = _plan_group_chunks(fgeom, scan0, ny, args.chunks, cfg0.niter)
 
     decay_m = args.decay_m if args.decay_m is not None else cfg0.decay_m
+    # An unset flag takes GeorefConfig's tuned default, recorded in each fit so the cache key sees it.
     tweaks = {
-        "edge_reject_m": args.edge_reject_m,
-        "shadow_max": args.shadow_max,
-        "edge_dense_m": args.edge_dense_m,
-        "edge_fit_k": args.edge_fit_k,
-        "p95_plateau_frac": args.plateau_frac,
-        "min_iter": args.min_iter,
-        "gcp_row_margin": args.gcp_row_margin,
+        k: getattr(cfg0, k) if v is None else v
+        for k, v in {
+            "edge_reject_m": args.edge_reject_m,
+            "shadow_max": args.shadow_max,
+            "edge_dense_m": args.edge_dense_m,
+            "edge_fit_k": args.edge_fit_k,
+            "p95_plateau_frac": args.plateau_frac,
+            "min_iter": args.min_iter,
+            "gcp_row_margin": args.gcp_row_margin,
+        }.items()
     }
 
     results, consensus_info = _solve_chunks(chunks, cfg0, ftif, fgeom, flabel, decay_m, tweaks, args.hillshade_only)
