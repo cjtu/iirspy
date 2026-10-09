@@ -1,0 +1,81 @@
+PDS_VERSION_ID               = PDS3                                           
+LABEL_REVISION_NOTE          = "2011-03-16  M3:sam  Fixed typo APLHA->ALPHA,  
+  changed FILE_RECORDS to 102 and ROWS to 101.                                
+  2011-10-20  M3:sam  Adjusted label for latest format of table:  Changed     
+    RECORD_BYTES/BYTES/ROWS to 1028 and FILE_RECORDS to 100 and ROWS to 99.   
+  2011-11-09  M3:sam  Adjusted label for latest table which was expanded to   
+    include phase angles from 0 to 120 deg.                                   
+  2012-03-05  M3:sam  Corrected typos in DESCRIPTIONs."                       
+RECORD_TYPE                  = "FIXED_LENGTH"                                 
+RECORD_BYTES                 = 1028                                           
+FILE_RECORDS                 = 122                                            
+                                                                              
+^HEADER                      = ("M3G20111109_RFL_F_ALPHA_HIL.TAB",1)          
+^TABLE                       = ("M3G20111109_RFL_F_ALPHA_HIL.TAB",2)          
+                                                                              
+DATA_SET_ID                  = "CH1-ORB-L-M3-4-L2-REFLECTANCE-V1.0"           
+PRODUCT_ID                   = "M3G20111109_RFL_F_ALPHA_HIL"                  
+MISSION_ID                   = "CH1"                                          
+MISSION_NAME                 = "CHANDRAYAAN-1"                                
+INSTRUMENT_HOST_ID           = "CH1-ORB"                                      
+INSTRUMENT_HOST_NAME         = "CHANDRAYAAN-1 ORBITER"                        
+INSTRUMENT_NAME              = "MOON MINERALOGY MAPPER"                       
+INSTRUMENT_ID                = "M3"                                           
+INSTRUMENT_MODE_ID           = "GLOBAL"                                       
+TARGET_NAME                  = "MOON"                                         
+TARGET_TYPE                  = "SATELLITE"                                    
+PRODUCT_CREATION_TIME        = 2011-11-09T11:27:00                            
+                                                                              
+OBJECT     = HEADER                                                           
+  HEADER_TYPE        = "TEXT"                                                 
+  BYTES              = 1028                                                   
+  RECORDS            = 1                                                      
+  DESCRIPTION        = "                                                      
+    This header counts the 85 global-mode channels (1 to 85) of F-of-Alpha    
+    photometric correction factors in this table."                            
+END_OBJECT = HEADER                                                           
+                                                                              
+OBJECT     = TABLE                                                            
+  INTERCHANGE_FORMAT = "ASCII"                                                
+  NAME               = "GLOBAL_MODE_F_OF_ALPHA_TABLE"                         
+  ROWS               = 121                                                    
+  ROW_BYTES          = 1028                                                   
+  COLUMNS            = 2                                                      
+  DESCRIPTION        = "                                                      
+    This table provides F-of-Alpha photometric correction factors for         
+    global-mode reflectance data.  The factors are dependent on phase angle   
+    (alpha) and channel (wavelength) for and were derived from highland       
+    data."                                                                    
+                                                                              
+  OBJECT     = COLUMN                                                         
+    COLUMN_NUMBER = 1                                                         
+    NAME          = "PHASE_ANGLE"                                             
+    START_BYTE    = 1                                                         
+    BYTES         = 3                                                         
+    DATA_TYPE     = "ASCII_INTEGER"                                           
+    FORMAT        = "I3"                                                      
+    UNIT          = "DEGREE"                                                  
+    DESCRIPTION   = "This column contains integral phase angles from 0 to     
+      98 degrees."                                                            
+  END_OBJECT = COLUMN                                                         
+                                                                              
+  OBJECT     = COLUMN                                                         
+    COLUMN_NUMBER = 2                                                         
+    NAME          = "F_ALPHA_CORRECTION_FACTOR"                               
+    START_BYTE    = 5                                                         
+    BYTES         = 1020                                                      
+    ITEMS         = 85                                                        
+    ITEM_BYTES    = 11                                                        
+    ITEM_OFFSET   = 12                                                        
+    DATA_TYPE     = "ASCII_REAL"                                              
+    FORMAT        = "85F11.9"                                                 
+    DESCRIPTION   = "This column contains derived F-of-Alpha photometric      
+      correction factors, one for each of the 85 channels (bands) of          
+      global-mode data.  Each value is a unitless multiplicative factor       
+      used for the F-of-Alpha photometric correction."                        
+    END_OBJECT = COLUMN                                                       
+                                                                              
+END_OBJECT = TABLE                                                            
+                                                                              
+END                                                                           
+                                                                              

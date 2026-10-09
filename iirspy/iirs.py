@@ -10,6 +10,7 @@ import rasterio
 import xarray as xr
 from rioxarray.exceptions import NoDataInBounds
 
+import iirspy.photometry as photometry
 import iirspy.utils as utils
 from iirspy.empirical import empirical_frames
 
@@ -899,8 +900,35 @@ class L1(IIRSData):
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
         return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
-    def calibrate(self, inc=None, dem=None, solar_flux=None, thermal_corr=""):
-        """Calibrate to L2 reflectance object (requires SPM file for solar angles)."""
+    def calibrate(
+        self,
+        inc=None,
+        dem=None,
+        solar_flux=None,
+        thermal_corr="",
+        topo=None,
+        photom="lambert",
+        phase=None,
+        min_lit=0.9,
+        mu_min=0.0,
+        sun_az_offset=0.0,
+    ):
+        """Calibrate to L2 reflectance object (requires SPM file for solar angles).
+
+        `topo` (camera-space slope/aspect, see iirspy.photometry.load_topo) and `photom` (a
+        iirspy.photometry model name or callable) select the photometric normalization; the
+        defaults reproduce the flat-surface Lambert I/F this pipeline has always produced.
+
+        `phase` : bool, optional. When True, layers iirspy.photometry.besse_phase on top of
+        `photom`. Default None/False is a no-op (current behaviour).
+
+        `mu_min` floors mu0 and mu individually before they enter the disk function, so grazing
+        incidence/emission pixels don't blow up the I/F division -- Besse's rule, applied at
+        85 deg (mu_min = cos(85deg) ~= 0.0872) is the convention that keeps his corrected
+        reflectance in [0, 1]. Default 0.0 is a no-op (current behaviour). Pixels below the floor
+        are CLAMPED (level capped, pixel kept), not nulled -- the fraction that hit each floor is
+        recorded in refl.attrs["mu0_floor_frac"] / ["mu_floor_frac"] so it can be masked later.
+        """
         if self.spm is None:
             raise FileNotFoundError(
                 f"SPM file required for reflectance calibration. Expected: "
@@ -913,7 +941,21 @@ class L1(IIRSData):
             dem=dem,
             solar_flux=solar_flux,
             thermal_corr=thermal_corr,
+            topo=topo,
+            photom=photom,
+            phase=phase,
+            min_lit=min_lit,
+            mu_min=mu_min,
+            sun_az_offset=sun_az_offset,
         )
+
+
+def _apply_besse_phase(refl, photom, g, wl):
+    """Rescale `refl` from `photom`'s own f=1 normalization onto Besse's RADF(30,0,30) convention."""
+    xl_ref = photometry.get_model(photom)(np.cos(np.radians(30.0)), 1.0, 30.0)
+    g_dims = getattr(g, "dims", ("y",))
+    f_ratio = xr.DataArray(photometry.besse_phase(np.asarray(g), wl.values), dims=("band", *g_dims))
+    return refl * xl_ref * f_ratio
 
 
 class L2(IIRSData):
@@ -977,7 +1019,20 @@ class L2(IIRSData):
         return instance
 
     @classmethod
-    def _from_l1(cls, l1_instance, inc=None, dem=None, solar_flux=None, thermal_corr=""):
+    def _from_l1(
+        cls,
+        l1_instance,
+        inc=None,
+        dem=None,
+        solar_flux=None,
+        thermal_corr="",
+        topo=None,
+        photom="lambert",
+        phase=None,
+        min_lit=0.9,
+        mu_min=0.0,
+        sun_az_offset=0.0,
+    ):
         """Internal method to create L2 from L1 instance."""
         instance = cls.__new__(cls)
         instance.basename = l1_instance.basename
@@ -1000,12 +1055,33 @@ class L2(IIRSData):
             dem=dem,
             solar_flux=solar_flux,
             thermal_corr=thermal_corr,
+            topo=topo,
+            photom=photom,
+            phase=phase,
+            min_lit=min_lit,
+            mu_min=mu_min,
+            sun_az_offset=sun_az_offset,
         )
         instance.img.attrs["calibration_source"] = "user"
 
         return instance
 
-    def _compute_reflectance(self, rad, qub_path, csv_path, inc=None, dem=None, solar_flux=None, thermal_corr=""):
+    def _compute_reflectance(
+        self,
+        rad,
+        qub_path,
+        csv_path,
+        inc=None,
+        dem=None,
+        solar_flux=None,
+        thermal_corr="",
+        topo=None,
+        photom="lambert",
+        phase=None,
+        min_lit=0.9,
+        mu_min=0.0,
+        sun_az_offset=0.0,
+    ):
         """
         Compute I/f reflectance from radiance data and solar geometry.
 
@@ -1031,6 +1107,32 @@ class L2(IIRSData):
             Thermal correction method. Currently supports:
             - "" (empty string): No thermal correction (default)
             - "verma": Apply Verma thermal correction method
+        topo : str, Path, xarray object or tuple, optional
+            Camera-space slope, aspect and (optionally) lit fraction on this cube's grid, as
+            written by iirspy.georef.save_topo. See iirspy.photometry.load_topo. Default None: the
+            surface is the flat local horizontal.
+        photom : str or callable, optional
+            Photometric model, by name from iirspy.photometry.MODELS or as any f(mu0, mu, g)
+            callable. Default "lambert".
+        phase : bool, optional
+            When True, layers iirspy.photometry.besse_phase on top of `photom`. Default
+            None/False is a no-op.
+        min_lit : float, optional
+            Null pixels the terrain leaves less than this fraction of the solar disk illuminated,
+            from the topo product's `lit` band. Default 0.9. No-op without `topo`.
+        mu_min : float, optional
+            Floor applied to mu0 (cosine of local solar incidence) and mu (cosine of local
+            emission) individually, before they enter the disk function, so grazing pixels (mu0
+            or mu -> 0, e.g. near the terminator, on slopes facing away from a low sun, or at
+            steep view angles) don't blow up in the I/F division. This is Besse's rule: clamping
+            both incidence and emission at 85 deg (mu_min = cos(85deg) ~= 0.0872) is what keeps
+            his corrected reflectance in [0, 1]. Default 0.0 is a no-op, matching all existing
+            callers. Pixels below either floor are CLAMPED, not nulled: their reflectance level is
+            capped rather than the pixel being dropped. The fraction of valid pixels that hit each
+            floor is recorded in refl.attrs["mu0_floor_frac"] / ["mu_floor_frac"].
+        sun_az_offset : float, optional
+            Degrees added to the spm solar azimuth, which is measured from local north, to bring
+            it into the grid-north frame the topo product's aspect uses. Default 0.0.
         Returns
         -------
         xarray.DataArray
@@ -1066,13 +1168,58 @@ class L2(IIRSData):
         elif thermal_corr:
             raise ValueError('thermal_corr must be "" or "verma"')
 
-        refl = (rad - trad) / (cos_inc * solar_flux)
+        # Photometric normalization. Without topography the surface is the flat local horizontal:
+        # mu0 is the per-line solar cosine, the view is nadir (mu = 1), phase = incidence. With
+        # `topo`, mu0/mu are the local cosines about each facet.
+        sun_az = (rad.solar_az if "solar_az" in rad.coords else 0.0) + sun_az_offset
+        lit = 1.0
+        if topo is not None:
+            # cos_inc is per-line (y,); the topo fields are (y, x), so match them to the image
+            slope, aspect, lit, sun = photometry.load_topo(topo, like=rad.isel(band=0, drop=True))
+            # Slope/aspect are referenced to the DEM's tangent plane, the spm's angles to each
+            # pixel's local horizontal, so the product's own sun is used whenever it carries one.
+            az, elev = sun if sun is not None else (sun_az, 90 - rad.solar_inc)
+            mu0, mu, g = photometry.topo_angles(slope, aspect, az, elev)
+        else:
+            inc_deg = np.degrees(np.arccos(np.clip(cos_inc, -1.0, 1.0)))
+            mu0, mu, g = cos_inc, xr.ones_like(cos_inc), photometry.phase_angle(sun_az, 90 - inc_deg)
+        mu0_floor_frac = 0.0
+        mu_floor_frac = 0.0
+        if mu_min > 0.0:
+            mu0_floor_frac = float(np.asarray(mu0 < mu_min).mean())
+            mu0 = mu0.clip(min=mu_min) if hasattr(mu0, "clip") else np.clip(mu0, mu_min, None)
+            mu_floor_frac = float(np.asarray(mu < mu_min).mean())
+            mu = mu.clip(min=mu_min) if hasattr(mu, "clip") else np.clip(mu, mu_min, None)
+        # photfn is the disk function times the lit fraction. Facets the sun does not reach have
+        # no direct beam to normalize by, so they are nulled rather than clipped.
+        photfn = photometry.get_model(photom)(mu0, mu, g) * lit
+        if min_lit > 0.0:
+            photfn = photfn.where(np.asarray(lit) >= min_lit) if hasattr(photfn, "where") else photfn
+        photfn = photfn.where(photfn > 0) if hasattr(photfn, "where") else photfn
+
+        refl = (rad - trad) / (photfn * solar_flux)
+        refl = _apply_besse_phase(refl, photom, g, rad.wl) if phase else refl
         # add wl array as coordinate if missing
         if "wl" not in refl.coords:
             refl = refl.assign_coords(wl=rad.wl)
         refl.name = "Reflectance"
         refl.attrs["name"] = "Reflectance"
         refl.attrs["units"] = ""
+
+        inc_deg = np.degrees(np.arccos(np.clip(cos_inc, -1.0, 1.0)))
+        refl.attrs["thermal_corr"] = thermal_corr
+        refl.attrs["photom"] = photom if isinstance(photom, str) else getattr(photom, "__name__", "custom")
+        refl.attrs["phase"] = bool(phase)
+        refl.attrs["min_lit"] = min_lit
+        refl.attrs["mu_min"] = mu_min
+        refl.attrs["mu0_floor_frac"] = mu0_floor_frac
+        refl.attrs["mu_floor_frac"] = mu_floor_frac
+        refl.attrs["sun_az_offset"] = sun_az_offset
+        refl.attrs["topo_used"] = topo is not None
+        refl.attrs["solar_distance_au"] = sdist
+        refl.attrs["inc_min_deg"] = float(inc_deg.min())
+        refl.attrs["inc_max_deg"] = float(inc_deg.max())
+        refl.attrs["inc_mean_deg"] = float(inc_deg.mean())
 
         return refl
 
