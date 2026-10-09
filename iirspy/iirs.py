@@ -12,6 +12,7 @@ from rioxarray.exceptions import NoDataInBounds
 
 import iirspy.photometry as photometry
 import iirspy.utils as utils
+from iirspy import l2config
 from iirspy.empirical import empirical_frames
 
 # Skip div 0 and 0/0 warnings
@@ -900,54 +901,22 @@ class L1(IIRSData):
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
         return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
-    def calibrate(
-        self,
-        inc=None,
-        dem=None,
-        solar_flux=None,
-        thermal_corr="",
-        topo=None,
-        photom="lambert",
-        phase=None,
-        min_lit=0.9,
-        mu_min=0.0,
-        sun_az_offset=0.0,
-    ):
-        """Calibrate to L2 reflectance object (requires SPM file for solar angles).
+    def calibrate(self, config="iirspy", *, inc=None, dem=None, topo=None, sun_az_offset=0.0, **overrides):
+        """Calibrate to an L2 reflectance object (requires the SPM file for solar angles).
 
-        `topo` (camera-space slope/aspect, see iirspy.photometry.load_topo) and `photom` (a
-        iirspy.photometry model name or callable) select the photometric normalization; the
-        defaults reproduce the flat-surface Lambert I/F this pipeline has always produced.
-
-        `phase` : bool, optional. When True, layers iirspy.photometry.besse_phase on top of
-        `photom`. Default None/False is a no-op (current behaviour).
-
-        `mu_min` floors mu0 and mu individually before they enter the disk function, so grazing
-        incidence/emission pixels don't blow up the I/F division -- Besse's rule, applied at
-        85 deg (mu_min = cos(85deg) ~= 0.0872) is the convention that keeps his corrected
-        reflectance in [0, 1]. Default 0.0 is a no-op (current behaviour). Pixels below the floor
-        are CLAMPED (level capped, pixel kept), not nulled -- the fraction that hit each floor is
-        recorded in refl.attrs["mu0_floor_frac"] / ["mu_floor_frac"] so it can be masked later.
+        `config` is an `L2Config` or a preset name (see `iirspy.l2config.PRESETS`); `overrides`
+        replace individual fields, e.g. `calibrate("issdc", polish=None)`. The keywords are
+        per-scene inputs: `inc` (solar incidence [deg], per line or per pixel, default the spm's),
+        `dem`, `topo` (camera-space slope/aspect[/lit], see `photometry.load_topo`) and
+        `sun_az_offset` (deg added to the spm azimuth to reach topo's grid-north frame).
         """
         if self.spm is None:
             raise FileNotFoundError(
                 f"SPM file required for reflectance calibration. Expected: "
                 f"{self.directory}/miscellaneous/calibrated/ch2_iir_nci_{self.basename}_spm.dat"
             )
-
-        return L2._from_l1(
-            self,
-            inc=inc,
-            dem=dem,
-            solar_flux=solar_flux,
-            thermal_corr=thermal_corr,
-            topo=topo,
-            photom=photom,
-            phase=phase,
-            min_lit=min_lit,
-            mu_min=mu_min,
-            sun_az_offset=sun_az_offset,
-        )
+        cfg = l2config.as_config(config, **overrides)
+        return L2._from_l1(self, cfg, inc=inc, dem=dem, topo=topo, sun_az_offset=sun_az_offset)
 
 
 def _apply_besse_phase(refl, photom, g, wl):
@@ -1019,20 +988,7 @@ class L2(IIRSData):
         return instance
 
     @classmethod
-    def _from_l1(
-        cls,
-        l1_instance,
-        inc=None,
-        dem=None,
-        solar_flux=None,
-        thermal_corr="",
-        topo=None,
-        photom="lambert",
-        phase=None,
-        min_lit=0.9,
-        mu_min=0.0,
-        sun_az_offset=0.0,
-    ):
+    def _from_l1(cls, l1_instance, cfg, inc=None, dem=None, topo=None, sun_az_offset=0.0):
         """Internal method to create L2 from L1 instance."""
         instance = cls.__new__(cls)
         instance.basename = l1_instance.basename
@@ -1051,101 +1007,50 @@ class L2(IIRSData):
             l1_instance.img,
             l1_instance.qub if hasattr(l1_instance, "qub") else None,
             l1_instance.csv if hasattr(l1_instance, "csv") else None,
+            cfg,
             inc=inc,
             dem=dem,
-            solar_flux=solar_flux,
-            thermal_corr=thermal_corr,
             topo=topo,
-            photom=photom,
-            phase=phase,
-            min_lit=min_lit,
-            mu_min=mu_min,
             sun_az_offset=sun_az_offset,
         )
         instance.img.attrs["calibration_source"] = "user"
 
         return instance
 
-    def _compute_reflectance(
-        self,
-        rad,
-        qub_path,
-        csv_path,
-        inc=None,
-        dem=None,
-        solar_flux=None,
-        thermal_corr="",
-        topo=None,
-        photom="lambert",
-        phase=None,
-        min_lit=0.9,
-        mu_min=0.0,
-        sun_az_offset=0.0,
-    ):
-        """
-        Compute I/f reflectance from radiance data and solar geometry.
+    def _compute_reflectance(self, rad, qub_path, csv_path, cfg, inc=None, dem=None, topo=None, sun_az_offset=0.0):
+        """I/F reflectance from radiance, with each step chosen by `cfg` (see `iirspy.l2config`).
 
-        Optinally corrects for topographic effects and thermal correction.
+        Steps, in order: solar flux at the scene's distance, thermal removal, clip, polish,
+        photometric normalization, Besse phase, spectral smoothing.
 
         Parameters
         ----------
         rad : xarray.DataArray
-            Radiance data array containing solar_inc, solar_az, and wl attributes.
+            (band, y, x) radiance [W/m^2/sr/um] with `wl` and per-line `solar_inc`/`solar_az` coords.
         qub_path : str or None
-            Path to QUB file for extracting solar distance. If None, assumes solar distance of 1.0 AU.
-        csv_path : str
-            Path to CSV file containing IIRS latitude/longitude information.
+            Label for the scene's epoch (solar distance, monthly flux). None means 1 AU.
+        csv_path : str or None
+            Geometry csv, for the latitudes `dem` needs.
+        cfg : L2Config
+            Method choices.
         inc : float or xarray.DataArray, optional
-            Solar incidence angle in degrees. If None, extracted from rad coordinates.
+            Solar incidence [deg], per line or per pixel. Default `rad.solar_inc`.
         dem : xarray.DataArray or str, optional
-            Digital elevation model as an xarray DataArray or path to DEM file.
-            If provided, topographic effects are corrected using the DEM. Default is None.
-        solar_flux : array-like, optional
-            Solar flux values for each band. If None, computed automatically from solar distance
-            and default solar flux constants. Default is None.
-        thermal_corr : str, optional
-            Thermal correction method. Currently supports:
-            - "" (empty string): No thermal correction (default)
-            - "verma": Apply Verma thermal correction method
+            DEM for a per-pixel incidence.
         topo : str, Path, xarray object or tuple, optional
-            Camera-space slope, aspect and (optionally) lit fraction on this cube's grid, as
-            written by iirspy.georef.save_topo. See iirspy.photometry.load_topo. Default None: the
-            surface is the flat local horizontal.
-        photom : str or callable, optional
-            Photometric model, by name from iirspy.photometry.MODELS or as any f(mu0, mu, g)
-            callable. Default "lambert".
-        phase : bool, optional
-            When True, layers iirspy.photometry.besse_phase on top of `photom`. Default
-            None/False is a no-op.
-        min_lit : float, optional
-            Null pixels the terrain leaves less than this fraction of the solar disk illuminated,
-            from the topo product's `lit` band. Default 0.9. No-op without `topo`.
-        mu_min : float, optional
-            Floor applied to mu0 (cosine of local solar incidence) and mu (cosine of local
-            emission) individually, before they enter the disk function, so grazing pixels (mu0
-            or mu -> 0, e.g. near the terminator, on slopes facing away from a low sun, or at
-            steep view angles) don't blow up in the I/F division. This is Besse's rule: clamping
-            both incidence and emission at 85 deg (mu_min = cos(85deg) ~= 0.0872) is what keeps
-            his corrected reflectance in [0, 1]. Default 0.0 is a no-op, matching all existing
-            callers. Pixels below either floor are CLAMPED, not nulled: their reflectance level is
-            capped rather than the pixel being dropped. The fraction of valid pixels that hit each
-            floor is recorded in refl.attrs["mu0_floor_frac"] / ["mu_floor_frac"].
-        sun_az_offset : float, optional
-            Degrees added to the spm solar azimuth, which is measured from local north, to bring
-            it into the grid-north frame the topo product's aspect uses. Default 0.0.
+            Camera-space slope/aspect[/lit] on this cube's grid (`photometry.load_topo`). Used only
+            when `cfg.topo`.
+        sun_az_offset : float
+            Degrees added to the spm solar azimuth (local north) to reach topo's grid-north frame.
+
         Returns
         -------
         xarray.DataArray
-            Reflectance data array with name "Reflectance" and empty units attribute.
-        Raises
-        ------
-        ValueError
-            If thermal_corr is not "" or "verma".
-        Notes
-        -----
-        The reflectance is calculated as:
-        where trad is the thermal radiance component (if thermal correction is applied).
+            Reflectance, with `cfg` as json in `attrs["l2_config"]`, per-scene diagnostics
+            (`solar_distance_au`, `inc_*_deg`, `mu0_floor_frac`, `mu_floor_frac`, `topo_used`,
+            `sun_az_offset`) in attrs, and the thermal temperature [K] as coord `T` when removed.
         """
+        topo = topo if cfg.topo else None
         cos_inc = np.cos(np.radians(inc)) if inc is not None else np.cos(np.radians(rad.solar_inc))
 
         if dem is not None:
@@ -1155,18 +1060,11 @@ class L2(IIRSData):
             lat = lat.interp_like(rad.solar_inc)
             dem = dem.interp_like(rad.sel(band=dem.band), method="slinear")
             cos_inc = utils.get_cos_inc_dem(dem, rad.solar_inc, rad.solar_az, lat)
-        cos_inc = cos_inc * xr.ones_like(rad.isel(x=0, band=0))
+        cos_inc = cos_inc * xr.ones_like(rad.isel(x=0, band=0, drop=True))
 
-        sdist = utils.get_solar_distance(qub_path) if qub_path else 1.0
-
-        if solar_flux is None:
-            solar_flux = utils.get_solar_flux(sdist, utils.FSOLAR)
-
-        trad = 0.0
-        if thermal_corr == "verma":
-            trad = utils.get_thermal_rad_verma(rad, rad.wl * 1e-9)
-        elif thermal_corr:
-            raise ValueError('thermal_corr must be "" or "verma"')
+        sdist = l2config.sdist(cfg, qub_path)
+        solar_flux = l2config.solar_flux(cfg, sdist, qub_path)
+        trad, temp = l2config.thermal_radiance(cfg, rad)
 
         # Photometric normalization. Without topography the surface is the flat local horizontal:
         # mu0 is the per-line solar cosine, the view is nadir (mu = 1), phase = incidence. With
@@ -1185,43 +1083,51 @@ class L2(IIRSData):
             mu0, mu, g = cos_inc, xr.ones_like(cos_inc), photometry.phase_angle(sun_az, 90 - inc_deg)
         mu0_floor_frac = 0.0
         mu_floor_frac = 0.0
-        if mu_min > 0.0:
-            mu0_floor_frac = float(np.asarray(mu0 < mu_min).mean())
-            mu0 = mu0.clip(min=mu_min) if hasattr(mu0, "clip") else np.clip(mu0, mu_min, None)
-            mu_floor_frac = float(np.asarray(mu < mu_min).mean())
-            mu = mu.clip(min=mu_min) if hasattr(mu, "clip") else np.clip(mu, mu_min, None)
+        if cfg.mu_min > 0.0:
+            mu0_floor_frac = float(np.asarray(mu0 < cfg.mu_min).mean())
+            mu0 = mu0.clip(min=cfg.mu_min) if hasattr(mu0, "clip") else np.clip(mu0, cfg.mu_min, None)
+            mu_floor_frac = float(np.asarray(mu < cfg.mu_min).mean())
+            mu = mu.clip(min=cfg.mu_min) if hasattr(mu, "clip") else np.clip(mu, cfg.mu_min, None)
         # photfn is the disk function times the lit fraction. Facets the sun does not reach have
         # no direct beam to normalize by, so they are nulled rather than clipped.
-        photfn = photometry.get_model(photom)(mu0, mu, g) * lit
-        if min_lit > 0.0:
-            photfn = photfn.where(np.asarray(lit) >= min_lit) if hasattr(photfn, "where") else photfn
+        photfn = photometry.get_model(cfg.photom)(mu0, mu, g) * lit
+        if cfg.min_lit > 0.0:
+            photfn = photfn.where(np.asarray(lit) >= cfg.min_lit) if hasattr(photfn, "where") else photfn
         photfn = photfn.where(photfn > 0) if hasattr(photfn, "where") else photfn
 
-        refl = (rad - trad) / (photfn * solar_flux)
-        refl = _apply_besse_phase(refl, photom, g, rad.wl) if phase else refl
+        # One division: clip and polish commute with the positive photometric/flux divisors
+        num = rad - trad
+        if cfg.clip_negative:
+            num = num.clip(min=0)
+        den = photfn * solar_flux
+        coeff = l2config.polish(cfg, rad.band)
+        if coeff is not None:
+            den = den * coeff
+        refl = num / den
+        refl = _apply_besse_phase(refl, cfg.photom, g, rad.wl) if cfg.phase else refl
+        refl = l2config.smooth(cfg, refl)
         # add wl array as coordinate if missing
         if "wl" not in refl.coords:
             refl = refl.assign_coords(wl=rad.wl)
+        if temp is not None:
+            refl = refl.assign_coords(T=temp)
         refl.name = "Reflectance"
         refl.attrs["name"] = "Reflectance"
         refl.attrs["units"] = ""
 
         inc_deg = np.degrees(np.arccos(np.clip(cos_inc, -1.0, 1.0)))
-        refl.attrs["thermal_corr"] = thermal_corr
-        refl.attrs["photom"] = photom if isinstance(photom, str) else getattr(photom, "__name__", "custom")
-        refl.attrs["phase"] = bool(phase)
-        refl.attrs["min_lit"] = min_lit
-        refl.attrs["mu_min"] = mu_min
-        refl.attrs["mu0_floor_frac"] = mu0_floor_frac
-        refl.attrs["mu_floor_frac"] = mu_floor_frac
-        refl.attrs["sun_az_offset"] = sun_az_offset
-        refl.attrs["topo_used"] = topo is not None
-        refl.attrs["solar_distance_au"] = sdist
-        refl.attrs["inc_min_deg"] = float(inc_deg.min())
-        refl.attrs["inc_max_deg"] = float(inc_deg.max())
-        refl.attrs["inc_mean_deg"] = float(inc_deg.mean())
-
-        return refl
+        return l2config.stamp(
+            refl,
+            cfg,
+            mu0_floor_frac=mu0_floor_frac,
+            mu_floor_frac=mu_floor_frac,
+            sun_az_offset=sun_az_offset,
+            topo_used=topo is not None,
+            solar_distance_au=sdist,
+            inc_min_deg=float(inc_deg.min()),
+            inc_max_deg=float(inc_deg.max()),
+            inc_mean_deg=float(inc_deg.mean()),
+        )
 
     def __init__(
         self,
