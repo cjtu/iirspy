@@ -998,7 +998,7 @@ def get_solar_flux(sdist=1.0, fflux=FSOLAR):
     return xr.DataArray(flux, coords={"band": np.arange(1, 257)}, name="Solar flux [W/m^2/sr/um]")
 
 
-def spice_kernels(day, spice_dir=None):
+def spice_kernels(day, spice_dir=None) -> list[Path]:
     """Generic SPICE kernels plus the orbit SPKs covering `day`, a "YYYYMMDD" string.
 
     `spice_dir` (default env `IIRS_SPICE`) holds lsk/, pck/, sclk/, fk/ and spk/. Raises if it or a
