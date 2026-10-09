@@ -128,6 +128,19 @@ def _row_block(da, sub_rows=None):
 FLAT_SMILE_MIN = 0.2  # clip flat*smile away from 0 before dividing (avoids blow-ups)
 
 
+def _in_wl_ranges(wl, ranges):
+    """True where `wl` falls in any (lo, hi) of `ranges` (inclusive); all False if `ranges` is falsy."""
+    hit = xr.zeros_like(wl, dtype=bool)
+    for lo, hi in ranges or ():
+        hit = hit | ((wl >= lo) & (wl <= hi))
+    return hit
+
+
+def _narrow_bands(rad, output_bands):
+    """`rad` restricted to `output_bands`, or `rad` unchanged if `output_bands` is None."""
+    return rad if output_bands is None else rad.sel(band=output_bands)
+
+
 def _expand_to_full_bands(da):
     """Reindex `da`'s band dim onto the full 1..256 IIRS range, NaN-filling any band not present.
 
@@ -139,6 +152,21 @@ def _expand_to_full_bands(da):
         return da
     da = da.reindex(band=all_bands)
     return da.assign_coords(wl=("band", utils.get_wls()))
+
+
+def _attach_empirical_frames(rad, dark, flat, smile, attach):
+    """Attach dark/flat/smile as (band, x) coords on `rad` when `attach`, for save()'s sidecar.
+
+    dark is (x,)-only zeros when no shadow was found; broadcast to flat's (band, x) so all three
+    sidecar frames share one shape.
+    """
+    if not attach:
+        return rad
+    return rad.assign_coords(
+        empirical_dark=(("band", "x"), dark.broadcast_like(flat).values),
+        empirical_flat=(("band", "x"), flat.values),
+        empirical_smile=(("band", "x"), smile.values),
+    )
 
 
 def _write_camera_product(da, fout, row_block=None, compress="ZSTD", predictor=None):
@@ -497,9 +525,12 @@ class L0(IIRSData):
         interp_bands=None,
         interp_spatial=False,
         attach_snr=True,
+        attach_empirical_frames=False,
         empirical_kws=None,
         bad_pixel_mask=True,
         calib_dir=utils.DCALIB,
+        exclude_wl=None,
+        output_bands=None,
     ):
         """
         Perform IIRS L0 digital number to L1 radiance calibration.
@@ -515,7 +546,7 @@ class L0(IIRSData):
         is poorly correlated with the on-orbit response and injects striping/speckle. With
         empirical=True, derive a per-scene residual dark + sensor flat + band-relative smile (see
         iirspy.empirical) and use the LUT only for the per-band absolute scale. The in-scene dark,
-        when present, anchors the zero point (no longer use the LUT offset):
+        when present, anchors the zero point in place of the LUT offset:
 
           scene with dark rows   : rad = 10 * gain_med * (DN - dark_resid) / (flat * smile)
           scene without dark rows: rad = 10 * (gain_med * DN / (flat * smile) + offset_med)
@@ -550,6 +581,11 @@ class L0(IIRSData):
             downstream users threshold the SNR themselves (a typical cut is empirical.SHADOW_SNR) to
             null, ignore, or study low-signal shadow pixels. save() can write it to a float32 sidecar
             (ENVI coords don't survive the BIL write).
+        attach_empirical_frames : bool
+            When empirical, attach the derived dark/flat/smile (band, x) frames as non-dimension
+            coordinates on the returned DataArray, for diagnosing the empirical correction itself
+            (e.g. comparing flat shape/RMS across scenes). save() writes them to an `.npz` sidecar
+            when present. Off by default -- these are diagnostic, not part of the production output.
         empirical_kws : dict or None
             Extra keyword arguments forwarded to empirical.empirical_frames, e.g.
             dark_yrange=(ylow, yhigh) / flat_yrange=(ylow, yhigh) to override the auto dark-row /
@@ -559,6 +595,18 @@ class L0(IIRSData):
             Mask known bad detector elements (x, band). True (default) uses the packaged mask
             (utils.load_bad_pixel_mask); False skips masking; or pass a custom boolean mask
             (True where bad) to null instead.
+        exclude_wl : list of (lo, hi) or None
+            Extra wavelength [nm] ranges to null, on top of OSF/invalid bands -- e.g. bands that
+            stay noisy no matter the flat/smile derivation. Cut alongside OSF/invalid, so a band
+            in range is excluded from interp_bands' neighbour fill too, not patched over it.
+        output_bands : list of int or None
+            Restrict masking/interpolation/output (steps 3-5) to this band subset after the
+            empirical dark/flat/smile derivation has already used the full cube -- e.g. a caller
+            that only wants one band back can still supply that band's `interp_bands` neighbours
+            (+-6) here instead of paying to mask/interpolate every staged band. None (default):
+            every band `self.img` holds. Only safe to narrow past what `interp_bands`' max_gap=6
+            could reach for the bands you actually want out; empirical_frames itself always sees
+            the unnarrowed `self.img`, so this has no effect on the empirical frames' quality.
 
         Returns
         -------
@@ -580,12 +628,17 @@ class L0(IIRSData):
             else:
                 # No zero reference: the lab offset is the only zero-point info, so keep it
                 rad = 10 * (gain_med * self.img / fs + offset_med)
+            rad = _attach_empirical_frames(rad, dark, flat, smile, attach_empirical_frames)
         else:
             # Apply per-element gain and offset to convert DN -> Radiance
             rad = 10 * (self.img * gain + offset)  # [mW/cm^2/sr/μm] -> [W/m^2/sr/um]
 
-        # Drop OSF and invalid bands. interp if specified
-        rad = rad.where(~rad.band.isin((*utils.OSF, *utils.INVALID)))
+        # Narrow to the requested output bands before the mask/interpolate stage below -- the
+        # empirical frames above already saw every band `self.img` holds, so this can't affect them.
+        rad = _narrow_bands(rad, output_bands)
+
+        # Drop OSF and invalid bands, plus any caller-supplied wavelength ranges. interp if specified
+        rad = rad.where(~(rad.band.isin((*utils.OSF, *utils.INVALID)) | _in_wl_ranges(rad.wl, exclude_wl)))
 
         # Drop known bad detector elements (x, bands)
         if bad_pixel_mask is True:  # Load default bad pixel mask
@@ -611,7 +664,10 @@ class L0(IIRSData):
         out.attrs["name"] = "Radiance"
         out.attrs["units"] = "W/m^2/sr/um"
         out.attrs["calibration_source"] = "empirical" if empirical else "user"
-        out.attrs["iirspy_version"] = metadata.version("iirspy")
+        try:
+            out.attrs["iirspy_version"] = metadata.version("iirspy")
+        except metadata.PackageNotFoundError:  # running from a source tree not pip-installed, e.g. iirspy.coreg
+            out.attrs["iirspy_version"] = "0+source"
         if empirical:
             out.attrs["empirical_notes"] = json.dumps(emp_notes)  # provenance: how the product was made
 
