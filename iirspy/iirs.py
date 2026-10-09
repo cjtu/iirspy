@@ -49,6 +49,49 @@ def _try_load_next_level_metadata(basename, target_level, directory, xyextent):
     return result
 
 
+def _flip(da, flip):
+    """`da` reversed along y and/or x per `flip` = (flip_y, flip_x), keeping its ascending coords."""
+    sl = {d: slice(None, None, -1) for d, f in zip(("y", "x"), flip, strict=True) if f}
+    return da.isel(sl).assign_coords({d: da[d].values for d in sl})
+
+
+def read_issdc_loc(fqub):
+    """ISSDC's ndi `_d_loc_` beside `fqub` as a `backplanes.read_loc` dataset in the nci camera frame
+    (y = Scan, x = Pixel, as the geometry csv and our GLTs index it), and the (flip_y, flip_x) that
+    takes the ndi cube to the same frame, or None if there is no `_d_loc_`.
+
+    ndi products are stored north-up/west-left, not in acquisition order: a descending pass comes
+    column-mirrored, an ascending one row-reversed. The label's Refined upper-left corner is nci
+    Scan 0/Pixel 0, so whichever loc corner sits on it is the origin.
+    """
+    from iirspy.backplanes import read_loc
+
+    floc = next(Path(fqub).parent.glob(f"{Path(fqub).name.split('_d_')[0]}_d_loc_*.img"), None)
+    if floc is None:
+        return None
+    loc = read_loc(floc)
+    ul = pdr.open(fqub).metaget("isda:Refined_Corner_Coordinates")
+    lon0, lat0 = float(ul["isda:upper_left_longitude"]), float(ul["isda:upper_left_latitude"])
+    lon, lat = loc.lon.values[:: -1 or None], loc.lat.values
+    corners = [(i, j) for i in (0, -1) for j in (0, -1)]
+    dlon = [((lon[c] - lon0 + 180) % 360 - 180) * np.cos(np.radians(lat0)) for c in corners]
+    d = np.hypot(dlon, [lat[c] - lat0 for c in corners])
+    flip = tuple(bool(k) for k in corners[int(np.argmin(d))])
+    return _flip(loc, flip), flip
+
+
+def _loc_extent(loc, lonlatextent):
+    """(minx, maxx, miny, maxy) of the rows whose pixels fall in `lonlatextent`, from an ndi bundle's
+    `read_issdc_loc` (it has no geometry csv). Same convention as `utils.parse_geom`: x inclusive,
+    y half-open."""
+    lon, lat = (loc.lon.values + 180) % 360 - 180, loc.lat.values
+    lon0, lon1, lat0, lat1 = (d if e is None else e for e, d in zip(lonlatextent, (-180, 180, -90, 90), strict=True))
+    rows = np.flatnonzero(((lon >= lon0) & (lon <= lon1) & (lat >= lat0) & (lat <= lat1)).any(axis=1))
+    if not rows.size:
+        raise ValueError(f"no pixels of the _d_loc_ inside {lonlatextent}")
+    return (0, lon.shape[1] - 1, int(rows[0]), int(rows[-1]) + 1)
+
+
 def _band_numbers(img):
     """Original IIRS band numbers, from the GeoTIFF band_numbers tag or ENVI band names, else 1..N."""
     for attr in ("band_numbers", "band_names"):
@@ -373,6 +416,125 @@ class IIRSData(ABC):
             x=self.img.x.values,
         )
         return str(fnpz)
+
+    def _cube_scan0(self):
+        """Absolute scan row of this cube's first line.
+
+        `self.img`'s `y` coord is never reset by cropping (`.sel`, not `.isel`), so the first
+        label is already the absolute scan row.
+        """
+        return int(self.img.y.values[0])
+
+    def _read_loc(self, group=None):
+        """This sid's `<sid>_<group>_loc.tif`, loaded via `utils.get_iirs_paths` and cached per group.
+
+        Raises FileNotFoundError if no LOC product exists yet.
+        """
+        cache = self.__dict__.setdefault("_loc_cache", {})
+        if group not in cache:
+            from iirspy import backplanes
+
+            paths = utils.get_iirs_paths(
+                self.directory, level=self.level, basenames=[self.basename], exts=("loc",), group=group
+            )
+            floc = paths.get("loc", {}).get(self.basename)
+            if floc is None:
+                raise FileNotFoundError(f"no {self.basename}_{group or '<group>'}_loc.tif under {self.directory}")
+            cache[group] = backplanes.read_loc(floc)
+        return cache[group]
+
+    def glt(self, crs, res, bounds=None):
+        """(table, transform) GLT for this sid's whole strip on `crs` at `res` m/px.
+
+        `crs` must be one of the three IIRS projected CRSs (`georef.pole_from_crs`), since that
+        ties camera pixels to a group's own TPS. `bounds` defaults to the loc's own finite extent
+        in `crs`.
+        """
+        from iirspy import georef
+
+        group = georef.pole_from_crs(crs)
+        loc = self._read_loc(group)
+        if bounds is None:
+            x, y = georef.to_stereo(group).transform(loc.lon.values, loc.lat.values)
+            x, y = np.asarray(x), np.asarray(y)
+            finite = np.isfinite(x) & np.isfinite(y)
+            if not finite.any():
+                raise ValueError(f"{self.basename}'s loc has no finite (x, y) in {crs}")
+            bounds = (float(x[finite].min()), float(y[finite].min()), float(x[finite].max()), float(y[finite].max()))
+        cfg = georef.GeorefConfig(pole=group, aoi=tuple(bounds), ps=res)
+        return georef.glt_from_loc(loc, group, cfg)
+
+    def _render(self, img, table, tr, crs, row_block=None):
+        """`img` pulled through GLT `table` as a lazy (band, y, x) DataArray, `row_block` map rows
+        per dask chunk, so a write streams it instead of holding the whole map grid."""
+        import dask.array as dsa
+
+        from iirspy import georef
+
+        cube, scan0 = img.values, self._cube_scan0()
+        rows = row_block or max(1, int(utils.CHUNKSIZE / (cube.shape[0] * table.shape[2] * 4)))
+        t = dsa.from_array(table, chunks=(2, rows, -1))
+        warped = t.map_blocks(
+            lambda b: georef.apply_glt(cube, b, cube_scan0=scan0),
+            chunks=((cube.shape[0],), *t.chunks[1:]),
+            dtype="float32",
+        )
+        da = xr.DataArray(warped, dims=("band", "y", "x"), coords={"band": img.band.values})
+        if "wl" in img.coords:
+            da = da.assign_coords(wl=("band", img.wl.values))
+        da.attrs = dict(self.img.attrs)
+        return da.rio.write_crs(crs).rio.write_transform(tr)
+
+    def to_geotiff(self, fout, crs=None, res=None, bounds=None, bands=None, row_block=None, full_bands=True, glt=None):
+        """Render `self.img` onto `crs` at `res` m/px (via `self.glt` + `georef.apply_glt`) and write it.
+
+        `glt` is a saved GLT (`georef.save_glt`, e.g. the solve's `<sid>_<group>_glt.tif`) to use
+        instead of one built from the loc; its own grid and CRS win over `crs`/`res`/`bounds`, and
+        it is cropped to the scans this cube holds. `bands` narrows which band numbers render;
+        `full_bands` reindexes the output to the full 1..256 IIRS band range before writing.
+        """
+        from iirspy import georef
+
+        if glt is not None:
+            with rasterio.open(glt) as src:
+                table, tr, crs = src.read(), src.transform, src.crs
+            table, tr = georef.crop_glt(table, tr, self._cube_scan0(), self.img.sizes["y"])
+        else:
+            table, tr = self.glt(crs, res, bounds)
+        img = self.img if bands is None else self.img.sel(band=list(bands))
+        da = self._render(img, table, tr, crs, row_block)
+        return _write_camera_product(_expand_to_full_bands(da) if full_bands else da, fout, row_block)
+
+    def clip_aoi(self, geometry, crs, res, geom_crs=None, fout=None, row_block=None, full_bands=True):
+        """Render `self.img` clipped to a polygon `geometry`, via a GLT built from this sid's loc.
+
+        `geometry`'s bounding box in `crs` becomes the GLT's bounds to keep the render small, then
+        any GLT cell outside the true polygon (not just its bbox) is nulled before `apply_glt`
+        resamples. Returns the clipped `DataArray` if `fout` is None, else writes it and returns
+        the written path.
+        """
+        from rasterio.features import geometry_mask
+        from rasterio.warp import transform_geom
+
+        from iirspy import georef
+
+        geom_crs = georef.LONLAT if geom_crs is None else geom_crs
+        geom = transform_geom(geom_crs, crs, geometry)
+        xs, ys = zip(*geom["coordinates"][0], strict=False)
+        bounds = (min(xs), min(ys), max(xs), max(ys))
+
+        table, tr = self.glt(crs, res, bounds=bounds)
+        poly_mask = geometry_mask([geom], out_shape=table.shape[1:], transform=tr, invert=True)
+        table = table.copy()
+        table[0][~poly_mask] = georef.NODATA  # outside the true polygon, not just its bbox
+        inside = table[0] >= 0
+        if not inside.any():
+            raise ValueError(f"no camera pixels of {self.basename} fall within the given geometry")
+
+        da = self._render(self.img, table, tr, crs, row_block)
+        if fout is None:
+            return da
+        return _write_camera_product(_expand_to_full_bands(da) if full_bands else da, fout, row_block)
 
     @abstractmethod
     def plot(self, band=12, yrange=(None, None), xrange=(None, None), **kwargs):
@@ -1053,11 +1215,16 @@ class L2(IIRSData):
         self.geomdf = metadata["geometry_df"]
         self.spm = metadata["spm"]
 
+        issdc = None if self.geomdf is not None else read_issdc_loc(self.qub)
+        if issdc is not None:
+            self.img = _flip(self.img, issdc[1])  # into the nci camera frame, like the loc
         if self.geomdf is not None:
             self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, center=False)
             self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent, strict=False))
         elif any(e is not None for e in lonlatextent):
-            raise FileNotFoundError(f"no geometry csv beside {self.qub} to crop by lon/lat")
+            if issdc is None:
+                raise FileNotFoundError(f"no geometry csv or _d_loc_ backplane beside {self.qub} to crop by lon/lat")
+            self.extent = _loc_extent(issdc[0], lonlatextent)
 
         # x extent is an inclusive last-pixel index (249 on a 250-wide cube) against pixel-centre
         # coords, so +1 keeps that last column; y stays half-open.
