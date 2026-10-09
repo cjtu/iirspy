@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pdr
+import rasterio
 import xarray as xr
 from rioxarray.exceptions import NoDataInBounds
 
@@ -45,6 +46,36 @@ def _try_load_next_level_metadata(basename, target_level, directory, xyextent):
     return result
 
 
+def _write_json_atomic(path, obj):
+    """Write `obj` as json via a temp file + rename, so a kill mid-write can't leave a torn file."""
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(obj))
+    tmp.replace(path)
+
+
+def _resume_row(fout, fprog, key):
+    """First row `_save_geotiff` still has to write, from a previous run's progress sidecar.
+
+    0 unless `fout` and its sidecar both exist, the sidecar agrees with `key` (same cube shape and
+    block size -- a different one is a different product, not a resume), and `fout` still opens for
+    update. A file killed mid-flush may not reopen at all, so that case restarts from 0 too.
+    """
+    if not (Path(fout).exists() and Path(fprog).exists()):
+        return 0
+    try:
+        prog = json.loads(Path(fprog).read_text())
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if {k: prog.get(k) for k in key} != key or not prog.get("rows_done"):
+        return 0
+    try:
+        with rasterio.open(fout, "r+"):
+            pass
+    except Exception:
+        return 0
+    return int(prog["rows_done"])
+
+
 def _band_numbers(img):
     """Original IIRS band numbers, from the GeoTIFF band_numbers tag or ENVI band names, else 1..N."""
     for attr in ("band_numbers", "band_names"):
@@ -64,7 +95,140 @@ def _apply_envi_start(da):
     return da
 
 
+def _chunks(nband, ny, nx, chunk=True):
+    """dask chunk dict for a (band, y, x) cube, or None to leave it unchunked.
+
+    `chunk` is a dict to use as-is, or True to split along y at `utils.CHUNKSIZE`. A cube already
+    under one chunk's worth stays whole -- dask would only add graph overhead.
+    """
+    if not chunk:
+        return None
+    if isinstance(chunk, dict):
+        return chunk
+    if nband * ny * nx * 4 <= utils.CHUNKSIZE:
+        return None
+    return {"band": nband, "y": int(utils.CHUNKSIZE / (nband * nx * 4)), "x": nx}
+
+
+def _row_block(da, sub_rows=None):
+    """Rows per write step. Defaults to the array's own y-chunk, so a block is read exactly once.
+
+    An explicit `sub_rows` wins. Unchunked the cube is already resident, so the block only bounds
+    the float32 copy and `utils.CHUNKSIZE` worth of rows is as good a size as any.
+    """
+    if sub_rows:
+        return sub_rows
+    chunks = getattr(da, "chunks", None)
+    if chunks:
+        return max(chunks[da.dims.index("y")])
+    nband, _, nx = da.shape
+    return max(1, int(utils.CHUNKSIZE / (nband * nx * 4)))
+
+
 FLAT_SMILE_MIN = 0.2  # clip flat*smile away from 0 before dividing (avoids blow-ups)
+
+
+def _expand_to_full_bands(da):
+    """Reindex `da`'s band dim onto the full 1..256 IIRS range, NaN-filling any band not present.
+
+    A cube narrowed to a band subset writes only its own bands contiguously, this restores the full
+    1:1 mapping so the dropped/OSF/invalid bands become all-NaN, consistent with IIRS images.
+    """
+    all_bands = np.arange(1, len(utils.get_wls()) + 1)
+    if da.sizes["band"] == len(all_bands) and np.array_equal(da.band.values, all_bands):
+        return da
+    da = da.reindex(band=all_bands)
+    return da.assign_coords(wl=("band", utils.get_wls()))
+
+
+def _write_camera_product(da, fout, row_block=None, compress="ZSTD", predictor=None):
+    """Format dispatch for any camera-space product: `.tif` -> GeoTIFF, else ENVI BIL.
+
+    Module-level (not a method) so callers with just a DataArray -- not a full IIRSData instance
+    -- can write a product too (e.g. `IIRSData.clip_aoi`, which only needs `self.img`).
+    """
+    fout = str(fout)
+    row_block = _row_block(da, row_block)
+    if fout.lower().endswith(".tif"):
+        return _save_geotiff(fout, row_block, da, compress=compress, predictor=predictor)
+    return utils.write_envi_bil(da, fout, row_block, f"IIRS {da.attrs.get('name', '')}".strip())
+
+
+def _save_geotiff(fout, row_block, da, compress="ZSTD", predictor=None):
+    """Write a BigTIFF sequentially in windowed blocks (bounded memory).
+
+    Restartable: each finished block records `rows_done` in a `<fout>.progress` sidecar, and a
+    rerun of the same shape reopens the file and picks up there. A cluster task killed at its
+    wall clock therefore loses one block, not the whole cube -- which for a long strip is the
+    difference between a resumable rerun and starting the scene from zero.
+
+    Integer `da` (e.g. QA's uint16) keeps its own dtype and nodata from `da.attrs["nodata"]` (or
+    none); everything else writes float32 with NaN nodata. `compress`/`predictor` default to ZSTD
+    with predictor 2 (int) or 3 (float) -- not frozen, callers may override either.
+    """
+    from dask.diagnostics import ProgressBar
+    from rasterio.windows import Window
+
+    nband, ny, nx = da.shape
+    is_int = np.issubdtype(da.dtype, np.integer)
+    dtype = str(da.dtype) if is_int else "float32"
+    predictor = predictor if predictor is not None else (2 if is_int else 3)
+    nodata = da.attrs.get("nodata") if is_int else np.nan
+    profile = {
+        "driver": "GTiff",
+        "height": ny,
+        "width": nx,
+        "count": nband,
+        "dtype": dtype,
+        "nodata": nodata,
+        "crs": da.rio.crs if da.rio.crs else None,
+        "transform": da.rio.transform(),
+        "compress": compress,
+        "predictor": predictor,
+        "tiled": True,
+        "interleave": "band",  # per-band planes: viewers read one band without decompressing all 256
+        "BIGTIFF": "YES",
+    }
+    wls = [f"{float(w):.2f}" for w in da.wl.values] if "wl" in da.coords else None
+    band_names = None if wls or "band_name" not in da.coords else da.coords["band_name"].values
+    band_units = None if band_names is None else da.coords["units"].values
+    # Provenance: scalar attrs (incl. empirical_notes JSON) round-trip as GDAL metadata tags.
+    # Drop stale band-count/name tags a source raster may carry in da.attrs (e.g. from GDAL
+    # metadata on read) -- band_numbers/per-band descriptions below are the actual truth and
+    # must not be contradicted by a leftover count/name list from an earlier band selection.
+    tags = {
+        k: str(v)
+        for k, v in da.attrs.items()
+        if isinstance(v, str | int | float | bool) and k not in ("bands", "band_names")
+    }
+    tags["PROVENANCE_IIRSPY_VERSION"] = utils.IIRSPY_VERSION
+    if wls:
+        # Which IIRS bands these planes are: 1..256 on a full cube, arbitrary on a subset
+        tags["band_numbers"] = ",".join(str(int(b)) for b in da.band.values)
+    fprog = Path(str(fout) + ".progress")
+    key = {"shape": [nband, ny, nx], "row_block": int(row_block)}
+    y_start = _resume_row(fout, fprog, key)
+    mode = "r+" if y_start else "w"
+    with rasterio.open(fout, mode, **({} if y_start else profile)) as dst, ProgressBar():
+        if tags:
+            dst.update_tags(**tags)
+        for y0 in range(y_start, ny, row_block):
+            y1 = min(y0 + row_block, ny)
+            block = da.isel(y=slice(y0, y1)).values.astype(dtype, copy=False)
+            dst.write(block, window=Window(0, y0, nx, y1 - y0))
+            _write_json_atomic(fprog, {**key, "rows_done": y1})
+        if wls:
+            for i, wl in enumerate(wls):
+                dst.set_band_description(i + 1, wl)
+                # Per-band "wavelength"/"wavelength_units" is the generic hyperspectral metadata
+                # GDAL/QGIS read for spectral band labels; description alone isn't.
+                dst.update_tags(i + 1, wavelength=wl, wavelength_units="Nanometers")
+        elif band_names is not None and band_units is not None:
+            for i, (name, unit) in enumerate(zip(band_names, band_units, strict=True)):
+                dst.set_band_description(i + 1, str(name))
+                dst.update_tags(i + 1, UNITS=str(unit), DEFINITION=f"{name} [{unit}]")
+    fprog.unlink(missing_ok=True)
+    return fout
 
 
 class IIRSData(ABC):
@@ -96,16 +260,17 @@ class IIRSData(ABC):
             paths = utils.unzip_iirs(self.directory, self.basename, self.level)
         if "qub" not in paths:
             raise FileNotFoundError(f"{self.basename} not found at {self.directory}.")
+        # An ndi (L2) bundle ships no lbr/oat/spm/csv, so every ancillary is optional here
         self.qub = paths["qub"].get(self.basename, "")
-        self.hdr = paths["hdr"].get(self.basename, "")
-        self.xml = paths["xml"].get(self.basename, "")
-        self.lbr = paths["lbr"].get(self.basename, "")
-        self.oat = paths["oat"].get(self.basename, "")
-        self.oath = paths["oath"].get(self.basename, "")
-        self.spm = paths["spm"].get(self.basename, "")
+        self.hdr = paths.get("hdr", {}).get(self.basename, "")
+        self.xml = paths.get("xml", {}).get(self.basename, "")
+        self.lbr = paths.get("lbr", {}).get(self.basename, "")
+        self.oat = paths.get("oat", {}).get(self.basename, "")
+        self.oath = paths.get("oath", {}).get(self.basename, "")
+        self.spm = paths.get("spm", {}).get(self.basename, "")
         if self.level == 1:
-            self.csv = paths["csv"].get(self.basename, "")
-            self.xml_csv = paths["xml-csv"].get(self.basename, "")
+            self.csv = paths.get("csv", {}).get(self.basename, "")
+            self.xml_csv = paths.get("xml-csv", {}).get(self.basename, "")
 
         # Store metadata from the qub file
         self.metadata = self._extract_metadata()
@@ -121,10 +286,8 @@ class IIRSData(ABC):
         self.img = self.img.assign_coords(wl=("band", utils.get_wls()[self.img.band.values - 1]))
 
         # Chunk with dask if needed
-        if chunk and self.nband * self.ny * self.nx * 4 > utils.CHUNKSIZE:
-            if not isinstance(chunk, dict):
-                dy = int(utils.CHUNKSIZE / (self.nband * self.nx * 4))
-                chunk = {"band": self.nband, "y": dy, "x": self.nx}
+        chunk = _chunks(self.nband, self.ny, self.nx, chunk)
+        if chunk:
             self.img = self.img.chunk(chunk)
 
     def _extract_metadata(self):
@@ -158,7 +321,7 @@ class IIRSData(ABC):
         """Mask invalid bands (OSF, bad bands)."""
         self.img = self.img.where(~self.img.band.isin((*utils.OSF, *utils.INVALID)))
 
-    def save(self, fout, sub_rows=1000, snr_sidecar=True):
+    def save(self, fout, sub_rows=None, snr_sidecar=True, empirical_sidecar=True, full_bands=True):
         """
         Stream the image cube to disk with bounded memory.
 
@@ -167,79 +330,71 @@ class IIRSData(ABC):
         regardless of image or machine size. GeoTIFF (.tif): float32 BigTIFF, windowed blocks.
 
         When the cube carries an empirical `snr` coordinate (from calibrate_to_rad with attach_snr),
-        a float32 sidecar `<basename>_snr.img` is written alongside it (ENVI coords don't survive the
-        BIL write), unless snr_sidecar is False.
+        a float32 sidecar `<basename>_snr<ext>` is written alongside it in the same format (ENVI
+        coords don't survive the BIL write), unless snr_sidecar is False.
+
+        When the cube carries `empirical_dark`/`empirical_flat`/`empirical_smile` coordinates (from
+        calibrate_to_rad with attach_empirical_frames), they're written to a single
+        `<basename>_empirical.npz` (keys dark/flat/smile/band/x) beside fout, unless
+        empirical_sidecar is False -- these are (band, x) diagnostic frames, not a raster, so they
+        skip the cube writer entirely.
 
         Parameters
         ----------
         fout : str or Path
             Output path. Extension selects the format (.tif -> GeoTIFF, else ENVI).
-        sub_rows : int
-            Scanlines computed/written per step (bounds peak memory).
+        sub_rows : int, optional
+            Scanlines computed/written per step (bounds peak memory). Default None: the cube's own
+            dask y-chunk, so a write block and a compute block are the same rows.
         snr_sidecar : bool
             Write the broadband `snr` field (if present) to a float32 sidecar next to fout.
+        empirical_sidecar : bool
+            Write the empirical dark/flat/smile frames (if present) to an `.npz` sidecar next to fout.
+        full_bands : bool
+            Reindex the cube onto the full 1..256 IIRS band range before writing, NaN-filling any
+            band a subset dropped (e.g. `output_bands`, OSF/invalid), so band position always
+            matches the real IIRS band number and wavelength. Default True.
 
         Returns
         -------
         str : the path written.
         """
         fout = str(fout)
+        if self.level in (1, 2):
+            self.img.attrs.setdefault("IIRS_PRODUCT", "L1" if self.level == 1 else "L2")
+            self.img.attrs.setdefault("IIRS_FORMAT_VERSION", "1")
+            self.img.attrs.setdefault("IIRS_SID", self.basename)
         if snr_sidecar and "snr" in self.img.coords:
-            self._save_snr_sidecar(fout)
-        if fout.lower().endswith(".tif"):
-            return self._save_geotiff(fout, sub_rows)
-        description = f"IIRS {self.img.attrs.get('name', '')}".strip()
-        return utils.write_envi_bil(self.img, fout, sub_rows, description)
+            self._save_snr_sidecar(fout, sub_rows)
+        if empirical_sidecar and "empirical_flat" in self.img.coords:
+            self._save_empirical_sidecar(fout)
+        img = _expand_to_full_bands(self.img) if full_bands else self.img
+        return self._write(img, fout, sub_rows)
 
-    def _save_snr_sidecar(self, fout):
-        """Write the (y, x) empirical broadband SNR field to a float32 ENVI sidecar next to fout."""
-        import rasterio
+    def _write(self, da, fout, row_block=None, compress="ZSTD", predictor=None):
+        """Format dispatch for any camera-space product: `.tif` -> GeoTIFF, else ENVI BIL."""
+        return _write_camera_product(da, fout, row_block, compress=compress, predictor=predictor)
 
-        snr = self.img.snr.values.astype("float32")
-        ny, nx = snr.shape
-        fsnr = Path(fout).with_name(Path(fout).stem + "_snr.img")
-        with rasterio.open(fsnr, "w", driver="ENVI", height=ny, width=nx, count=1, dtype="float32") as dst:
-            dst.write(snr, 1)
-        return str(fsnr)
+    def _save_snr_sidecar(self, fout, row_block=None):
+        """Write the (y, x) empirical broadband SNR field beside fout, in fout's own format."""
+        snr = self.img.snr.reset_coords(drop=True).expand_dims(band=[1]).astype("float32")
+        snr.attrs = {"name": "SNR", "units": ""}
+        f = Path(fout)
+        return self._write(snr, f.with_name(f.stem + "_snr" + f.suffix), row_block)
 
-    def _save_geotiff(self, fout, row_block):
-        """Write a float32 BigTIFF sequentially in windowed blocks (bounded memory)."""
-        import rasterio
-        from dask.diagnostics import ProgressBar
-        from rasterio.windows import Window
-
-        da = self.img
-        nband, ny, nx = da.shape
-        profile = {
-            "driver": "GTiff",
-            "height": ny,
-            "width": nx,
-            "count": nband,
-            "dtype": "float32",
-            "nodata": np.nan,
-            "crs": da.rio.crs if da.rio.crs else None,
-            "transform": da.rio.transform(),
-            "compress": "LZW",
-            "tiled": True,
-            "interleave": "band",  # per-band planes: viewers read one band without decompressing all 256
-            "BIGTIFF": "YES",
-        }
-        wls = [f"{float(w):.2f}" for w in da.wl.values] if "wl" in da.coords else None
-        # Provenance: scalar attrs (incl. empirical_notes JSON) round-trip as GDAL metadata tags
-        tags = {k: str(v) for k, v in da.attrs.items() if isinstance(v, str | int | float | bool)}
-        # Which IIRS bands these planes are: 1..256 on a full cube, arbitrary on a subset
-        tags["band_numbers"] = ",".join(str(int(b)) for b in da.band.values)
-        with rasterio.open(fout, "w", **profile) as dst, ProgressBar():
-            if tags:
-                dst.update_tags(**tags)
-            for y0 in range(0, ny, row_block):
-                y1 = min(y0 + row_block, ny)
-                block = da.isel(y=slice(y0, y1)).values.astype("float32", copy=False)
-                dst.write(block, window=Window(0, y0, nx, y1 - y0))
-            if wls:
-                for i, wl in enumerate(wls):
-                    dst.set_band_description(i + 1, wl)
-        return fout
+    def _save_empirical_sidecar(self, fout):
+        """Write the (band, x) empirical dark/flat/smile frames beside fout as one .npz."""
+        f = Path(fout)
+        fnpz = f.with_name(f.stem + "_empirical.npz")
+        np.savez_compressed(
+            fnpz,
+            dark=self.img.empirical_dark.values.astype("float32"),
+            flat=self.img.empirical_flat.values.astype("float32"),
+            smile=self.img.empirical_smile.values.astype("float32"),
+            band=self.img.band.values,
+            x=self.img.x.values,
+        )
+        return str(fnpz)
 
     @abstractmethod
     def plot(self, band=12, yrange=(None, None), xrange=(None, None), **kwargs):
@@ -546,6 +701,7 @@ class L1(IIRSData):
             )
             fimg = paths.get("qub", {}).get(instance.basename) or paths.get("xml", {}).get(instance.basename)
             if fimg is not None:
+                instance.qub = fimg
                 # yrange as contiguous absolute line indices matching this cube's y, so the
                 # incidence array lines up exactly (extent min/max int-truncation can be off by 1).
                 y0 = round(float(instance.img.y.min()) - 0.5)
@@ -559,7 +715,7 @@ class L1(IIRSData):
         return instance
 
     @classmethod
-    def from_file(cls, path, basename, directory="."):
+    def from_file(cls, path, basename, directory=".", chunk=True):
         """Load a cropped empirical-L1 GeoTIFF or ENVI cube (native [1000 mW/cm^2/sr/um]) as an L1.
 
         Restores the band numbers, wavelengths and absolute line/sample offset, rescales radiance to
@@ -574,8 +730,14 @@ class L1(IIRSData):
             Image basename (e.g. 20210723T1445053074), used to find spm/geometry in `directory`.
         directory : str
             Directory holding the IIRS bundle (nci ancillary: spm + geometry csv).
+        chunk : bool or dict
+            Chunk image automatically (default: True). Or supply dict of x,y,band chunk sizes (see dask).
         """
         da = _apply_envi_start(xr.open_dataarray(path, engine="rasterio").sortby("y").sortby("x"))
+        nband, ny, nx = da.shape
+        chunk = _chunks(nband, ny, nx, chunk)
+        if chunk:
+            da = da.chunk(chunk)
         bands = np.asarray(_band_numbers(da), dtype=int)
         da = da.assign_coords(band=bands, wl=("band", utils.get_wls()[bands - 1]))
         da = da * utils.RAD_NATIVE_SCALE  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
@@ -623,7 +785,24 @@ class L1(IIRSData):
         self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, xyextent, center=False)
         # replace any None in extent with values from xy_extent
         self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent, strict=False))
-        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
+        # ...but the geometry csv always describes the WHOLE strip, while the cube may be a crop of
+        # it (our own polar L1 products are). Where the caller named no extent, take the line range
+        # from the image itself -- `_apply_envi_start` has already put its y coords into strip
+        # numbering via the ENVI `y start` field, which is what that field is for. Without this,
+        # per-line solar geometry is built for the full strip and collides with the cropped cube:
+        # "conflicting sizes for dimension 'y': length 49013 ... and length 3600".
+        if all(e is None for e in xyextent) and all(e is None for e in lonlatextent):
+            # floor/ceil, not int(): rasterio hands back pixel-CENTRE coords (0.5 .. n-0.5), so
+            # truncating both ends drops a row and a column off the crop.
+            self.extent = (
+                int(np.floor(self.img.x.values[0])),
+                int(np.ceil(self.img.x.values[-1])),
+                int(np.floor(self.img.y.values[0])),
+                int(np.ceil(self.img.y.values[-1])),
+            )
+        # x extent is an inclusive last-pixel index (249 on a 250-wide cube) against pixel-centre
+        # coords, so +1 keeps that last column; y stays half-open to match `solve.build_l1`'s crop.
+        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(self.extent[0], self.extent[1] + 1))
         try:
             self.bounds = self.img.rio.bounds()
         except NoDataInBounds as e:
@@ -638,7 +817,9 @@ class L1(IIRSData):
         self.img.attrs["calibration_source"] = "issdc"
 
         # Assign lat, lon coordinates
-        lon, lat = utils.geom2latlon_coords(self.geomdf, xy_extent, self.shape[2], self.shape[1])
+        # `self.extent`, not `xy_extent`: the latter spans the whole strip even when the cube is a
+        # crop, which put +44 deg latitudes on a south-polar product.
+        lon, lat = utils.geom2latlon_coords(self.geomdf, self.extent, self.shape[2], self.shape[1])
 
         # Get solar incidence for each line of image
         inc, iaz = utils.get_iirs_inc_az(self.qub, self.spm, self.extent[2:])
@@ -860,14 +1041,19 @@ class L2(IIRSData):
         if self.geomdf is not None:
             self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, center=False)
             self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent, strict=False))
+        elif any(e is not None for e in lonlatextent):
+            raise FileNotFoundError(f"no geometry csv beside {self.qub} to crop by lon/lat")
 
-        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(*self.extent[:2]))
+        # x extent is an inclusive last-pixel index (249 on a 250-wide cube) against pixel-centre
+        # coords, so +1 keeps that last column; y stays half-open to match `solve.build_l1`'s crop.
+        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(self.extent[0], self.extent[1] + 1))
         try:
             self.bounds = self.img.rio.bounds()
         except NoDataInBounds as e:
             raise ValueError(f"No data found within extent {self.extent} for {self.basename}.") from e
 
         self.shape = self.img.shape
+        self.img = self.img.where(self.img != 0)  # ISSDC ndi fill is exact 0, not a declared nodata
 
         if self.geomdf is not None:
             lon, lat = utils.geom2latlon_coords(self.geomdf, self.extent, self.shape[2], self.shape[1])
