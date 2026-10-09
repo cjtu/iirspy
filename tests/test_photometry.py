@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 import xarray as xr
@@ -68,10 +70,11 @@ def _synthetic_l1(ny=4, nx=3):
     return rad
 
 
-def _refl(rad, **kw):
+def _refl(rad, topo=None, **kw):
     from iirspy.iirs import L2
+    from iirspy.l2config import L2Config
 
-    return L2.__new__(L2)._compute_reflectance(rad, None, None, solar_flux=1.0, **kw)
+    return L2.__new__(L2)._compute_reflectance(rad, None, None, L2Config(flux=1.0, **kw), topo=topo)
 
 
 def test_flat_topo_matches_the_no_topo_reflectance():
@@ -123,7 +126,7 @@ def test_mu_min_floors_grazing_incidence_without_changing_default():
     clamped = _refl(grazing, min_lit=0.0, mu_min=0.05)
     assert np.all(np.abs(clamped.values) <= np.abs(unclamped.values) + 1e-9)
     assert np.abs(clamped.values).max() <= 1.0 / 0.05 + 1e-6
-    assert clamped.attrs["mu_min"] == 0.05
+    assert json.loads(clamped.attrs["l2_config"])["mu_min"] == 0.05
     assert clamped.attrs["mu0_floor_frac"] == 1.0  # every pixel here is below the floor
     assert clamped.attrs["mu_floor_frac"] == 0.0  # nadir view (no topo view tilt) here
     assert _refl(rad, min_lit=0.0, topo=(flat, flat, xr.ones_like(flat)), mu_min=0.0).attrs["mu0_floor_frac"] == 0.0
