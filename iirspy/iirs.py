@@ -5,6 +5,7 @@ from importlib import metadata
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pdr
 import rasterio
 import xarray as xr
@@ -12,7 +13,7 @@ from rioxarray.exceptions import NoDataInBounds
 
 import iirspy.photometry as photometry
 import iirspy.utils as utils
-from iirspy import l2config
+from iirspy.config import POLISH, L1Config, L2Config
 from iirspy.empirical import empirical_frames
 
 # Skip div 0 and 0/0 warnings
@@ -513,98 +514,48 @@ class L0(IIRSData):
         return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
     def calibrate_to_rad(
-        self,
-        empirical=False,
-        interp_bands=None,
-        interp_spatial=False,
-        attach_snr=True,
-        attach_empirical_frames=False,
-        empirical_kws=None,
-        bad_pixel_mask=True,
-        calib_dir=utils.DCALIB,
-        exclude_wl=None,
-        output_bands=None,
+        self, config="iirspy", *, empirical_kws=None, calib_dir=utils.DCALIB, output_bands=None, **overrides
     ):
         """
-        Perform IIRS L0 digital number to L1 radiance calibration.
+        IIRS L0 digital number -> L1 radiance [W/m^2/sr/um], with method choices from `config`.
 
-          L1_Radiance [mW/cm^2/sr/um] = Gain * L0_DN + Offset
+          L1_Radiance [mW/cm^2/sr/um] = Gain * L0_DN + Offset   (x10 to [W/m^2/sr/um])
 
-        Raw data is already dark subtracted and automatically retrieves correct gain and offset
-        corresponding to the instrument gain / exposure settings used during acquisition.
-
-        Note: Returns radiance in [W/m^2/sr/µm] which is a factor of 10 greater than [mW/cm^2/sr/um].
-
-        The IIRS gain/offset LUT is per detector element (band, x), but its cross-track structure
-        is poorly correlated with the on-orbit response and injects striping/speckle. With
-        empirical=True, derive a per-scene residual dark + sensor flat + band-relative smile (see
-        iirspy.empirical) and use the LUT only for the per-band absolute scale. The in-scene dark,
-        when present, anchors the zero point in place of the LUT offset:
+        Raw counts are already dark subtracted; the gain/offset LUT is picked by the scene's gain
+        and exposure settings. The LUT is per detector element (band, x), but its cross-track
+        structure is poorly correlated with the on-orbit response and injects striping/speckle.
+        With `empirical`, a per-scene residual dark + sensor flat + band-relative smile (see
+        iirspy.empirical) replaces it and the LUT gives only the per-band absolute scale; in-scene
+        shadow, when present, anchors the zero point in place of the LUT offset:
 
           scene with dark rows   : rad = 10 * gain_med * (DN - dark_resid) / (flat * smile)
           scene without dark rows: rad = 10 * (gain_med * DN / (flat * smile) + offset_med)
 
-        Steps
-        -----
-        1) Retrieve the per-element gain/offset LUT for the scene's gain/exposure settings.
-        2) Convert DN -> radiance and scale [mW/cm^2/sr/um] -> [W/m^2/sr/µm] (factor of 10):
-           - empirical=False: apply the per-element LUT directly (rad = 10 * (DN * gain + offset)).
-           - empirical=True: derive per-scene residual dark + sensor flat (+ optional smile) via
-             empirical_frames, take the LUT band-median gain/offset, and divide out flat*smile.
-             Drop the LUT offset when in-scene dark rows anchor the zero point, else keep it.
-             Attach the broadband SNR field when attach_snr and dark rows exist.
-        3) Set invalid data to NaN (bad bands, order sorting filters, known bad pixels, saturated pixels).
-        4) (Optional) Fill NaNs by interpolating across band using strategy in interp_bands (e.g. "linear").
-        5) (NOT IMPLEMENTED) IIRS postprocessing steps (keystone correction, radiance adjustment in OSF and at edges).
+        Then OSF/invalid bands, `exclude_wl`, bad pixels and saturated pixels are nulled, and
+        `interp_bands`/`interp_spatial` fill gaps.
 
         Parameters
         ----------
-        empirical : bool
-            Apply the on-orbit empirical dark/flat (+ optional smile) correction with LUT band-median scale.
-        interp_bands : str or None
-            If set, fill masked bands by interpolating across band (e.g. "linear").
-        interp_spatial : bool
-            After interp_bands, fill isolated single-column NaN gaps (detector columns that are
-            NaN across every band, so band interpolation cannot reach them) by interpolating
-            across x. Only single-column gaps are filled: wider seams (e.g. OSF, multi-column
-            bad-pixel runs) and image-edge columns (no neighbour on one side) are left as NaN.
-        attach_snr : bool
-            When empirical and the scene has shadow, attach the per-pixel broadband SNR field (float32
-            (y, x)) as an `snr` coordinate on the returned DataArray. Radiance is left as measured:
-            downstream users threshold the SNR themselves (a typical cut is empirical.SHADOW_SNR) to
-            null, ignore, or study low-signal shadow pixels. save() can write it to a float32 sidecar
-            (ENVI coords don't survive the BIL write).
-        attach_empirical_frames : bool
-            When empirical, attach the derived dark/flat/smile (band, x) frames as non-dimension
-            coordinates on the returned DataArray, for diagnosing the empirical correction itself
-            (e.g. comparing flat shape/RMS across scenes). save() writes them to an `.npz` sidecar
-            when present. Off by default -- these are diagnostic, not part of the production output.
+        config : str or L1Config
+            Preset name or config (see `iirspy.config.L1Config`); `overrides` replace single fields.
         empirical_kws : dict or None
-            Extra keyword arguments forwarded to empirical.empirical_frames, e.g.
-            dark_yrange=(ylow, yhigh) / flat_yrange=(ylow, yhigh) to override the auto dark-row /
-            flat-region detection with user-picked positional row ranges into this cube.
-            The smile correction is off by default; enable it with apply_smile=True.
-        bad_pixel_mask : bool or array-like
-            Mask known bad detector elements (x, band). True (default) uses the packaged mask
-            (utils.load_bad_pixel_mask); False skips masking; or pass a custom boolean mask
-            (True where bad) to null instead.
-        exclude_wl : list of (lo, hi) or None
-            Extra wavelength [nm] ranges to null, on top of OSF/invalid bands -- e.g. bands that
-            stay noisy no matter the flat/smile derivation. Cut alongside OSF/invalid, so a band
-            in range is excluded from interp_bands' neighbour fill too, not patched over it.
+            Extra keyword arguments for empirical.empirical_frames, e.g. dark_yrange/flat_yrange
+            (positional row ranges into this cube) or apply_smile=True.
+        calib_dir : path
+            Calibration LUT directory.
         output_bands : list of int or None
-            Restrict masking/interpolation/output (steps 3-5) to this band subset after the
-            empirical dark/flat/smile derivation has already used the full cube -- e.g. a caller
-            that only wants one band back can still supply that band's `interp_bands` neighbours
-            (+-6) here instead of paying to mask/interpolate every staged band. None (default):
-            every band `self.img` holds. Only safe to narrow past what `interp_bands`' max_gap=6
-            could reach for the bands you actually want out; empirical_frames itself always sees
-            the unnarrowed `self.img`, so this has no effect on the empirical frames' quality.
+            Band numbers to mask/interpolate/return. The empirical frames always see every band
+            `self.img` holds; only narrow past what `interp_bands`' max_gap=6 can reach.
 
         Returns
         -------
-        (xarray.DataArray): Radiance DataArray in [W/m^2/sr/µm].
+        xarray.DataArray
+            Radiance [W/m^2/sr/um], with the config as json in `attrs["l1_config"]`.
         """
+        cfg = L1Config.resolve(config, **overrides)
+        empirical, interp_bands, interp_spatial = cfg.empirical, cfg.interp_bands, cfg.interp_spatial
+        attach_snr, attach_empirical_frames = cfg.attach_snr, cfg.attach_empirical_frames
+        bad_pixel_mask, exclude_wl = cfg.bad_pixel_mask, cfg.exclude_wl
         gain, offset = utils.get_gain_offset(self.qub, calib_dir=calib_dir)
 
         if empirical:
@@ -661,14 +612,15 @@ class L0(IIRSData):
             out.attrs["iirspy_version"] = metadata.version("iirspy")
         except metadata.PackageNotFoundError:  # not pip-installed (source tree)
             out.attrs["iirspy_version"] = "0+source"
+        out.attrs["l1_config"] = json.dumps(cfg.to_attrs())
         if empirical:
             out.attrs["empirical_notes"] = json.dumps(emp_notes)  # provenance: how the product was made
 
         return out
 
-    def calibrate(self, *args, **kwargs):
-        """Calibrate to L1 radiance using ISSDC calibration files if they exist."""
-        img = self.calibrate_to_rad(*args, **kwargs)
+    def calibrate(self, config="iirspy", **kwargs):
+        """Calibrate to an L1 object (see `calibrate_to_rad`), with ISSDC L1 metadata if it exists."""
+        img = self.calibrate_to_rad(config, **kwargs)
         try:
             out = L1(self.basename, str(self.directory), self.extent)
             out.img = img
@@ -887,34 +839,60 @@ class L1(IIRSData):
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
         return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
-    def calibrate(self, config="iirspy", *, inc=None, dem=None, topo=None, sun_az_offset=0.0, **overrides):
+    def calibrate(self, config="iirspy", *, inc=None, slope_az=None, sun_az_offset=0.0, **overrides):
         """Calibrate to an L2 reflectance object (requires the SPM file for solar angles).
 
-        `config` is an `L2Config` or a preset name (see `iirspy.l2config.PRESETS`); `overrides`
+        `config` is an `L2Config` or a preset name (see `iirspy.config.L2Config`); `overrides`
         replace individual fields, e.g. `calibrate("issdc", polish=None)`. The keywords are
         per-scene inputs: `inc` (solar incidence [deg], per line or per pixel, default the spm's),
-        `dem`, `topo` (camera-space slope/aspect[/lit], see `photometry.load_topo`) and
-        `sun_az_offset` (deg added to the spm azimuth to reach topo's grid-north frame).
+        `slope_az` (camera-space slope/aspect[/lit], see `photometry.load_slope_az`; make one from
+        a DEM with `photometry.slope_az_from_dem`) and `sun_az_offset` (deg added to the spm
+        azimuth to reach slope_az's grid-north frame).
         """
         if self.spm is None:
             raise FileNotFoundError(
                 f"SPM file required for reflectance calibration. Expected: "
                 f"{self.directory}/miscellaneous/calibrated/ch2_iir_nci_{self.basename}_spm.dat"
             )
-        cfg = l2config.as_config(config, **overrides)
-        return L2._from_l1(self, cfg, inc=inc, dem=dem, topo=topo, sun_az_offset=sun_az_offset)
+        cfg = L2Config.resolve(config, **overrides)
+        return L2._from_l1(self, cfg, inc=inc, slope_az=slope_az, sun_az_offset=sun_az_offset)
 
 
-def _apply_besse_phase(refl, photom, g, wl):
-    """Rescale `refl` from `photom`'s own f=1 normalization onto Besse's RADF(30,0,30) convention."""
-    xl_ref = photometry.get_model(photom)(np.cos(np.radians(30.0)), 1.0, 30.0)
-    g_dims = getattr(g, "dims", ("y",))
-    f_ratio = xr.DataArray(photometry.besse_phase(np.asarray(g), wl.values), dims=("band", *g_dims))
-    return refl * xl_ref * f_ratio
+def _sun_distance(cfg, qub):
+    """Sun distance [AU] for `cfg.sdist`; "spice" without a label is 1 AU."""
+    if cfg.sdist == "none":
+        return 1.0
+    if cfg.sdist == "spice":
+        return utils.get_solar_distance(qub) if qub else 1.0
+    return float(cfg.sdist)
+
+
+def _solar_flux(cfg, sdist, qub):
+    """Per-band solar flux [W/m^2/sr/um] at `sdist` for `cfg.flux`."""
+    if isinstance(cfg.flux, tuple):
+        n = len(cfg.flux)
+        return cfg.flux[0] if n == 1 else xr.DataArray(np.asarray(cfg.flux), coords={"band": np.arange(1, n + 1)})
+    if cfg.flux == "noaa_cdr_mean":
+        return utils.get_noaa_flux(sdist)
+    if cfg.flux == "noaa_cdr_monthly":
+        return utils.get_noaa_flux(sdist, pd.Timestamp(pdr.open(qub).metaget("start_date_time")).strftime("%Y-%m"))
+    return utils.get_solar_flux(sdist, utils.FSOLAR if cfg.flux == "pradan" else cfg.flux)
 
 
 class L2(IIRSData):
     """Class for IIRS L2 reflectance data."""
+
+    # Per-scene attrs `_compute_reflectance` records beside `l2_config`
+    DIAGNOSTICS = (
+        "solar_distance_au",
+        "inc_min_deg",
+        "inc_max_deg",
+        "inc_mean_deg",
+        "cos_inc_floor_frac",
+        "cos_view_floor_frac",
+        "slope_az_used",
+        "sun_az_offset",
+    )
 
     @classmethod
     def from_xarray(
@@ -974,7 +952,7 @@ class L2(IIRSData):
         return instance
 
     @classmethod
-    def _from_l1(cls, l1_instance, cfg, inc=None, dem=None, topo=None, sun_az_offset=0.0):
+    def _from_l1(cls, l1_instance, cfg, inc=None, slope_az=None, sun_az_offset=0.0):
         """Internal method to create L2 from L1 instance."""
         instance = cls.__new__(cls)
         instance.basename = l1_instance.basename
@@ -992,22 +970,21 @@ class L2(IIRSData):
         instance.img = instance._compute_reflectance(
             l1_instance.img,
             l1_instance.qub if hasattr(l1_instance, "qub") else None,
-            l1_instance.csv if hasattr(l1_instance, "csv") else None,
             cfg,
             inc=inc,
-            dem=dem,
-            topo=topo,
+            slope_az=slope_az,
             sun_az_offset=sun_az_offset,
         )
         instance.img.attrs["calibration_source"] = "user"
 
         return instance
 
-    def _compute_reflectance(self, rad, qub_path, csv_path, cfg, inc=None, dem=None, topo=None, sun_az_offset=0.0):
-        """I/F reflectance from radiance, with each step chosen by `cfg` (see `iirspy.l2config`).
+    def _compute_reflectance(self, rad, qub_path, cfg, inc=None, slope_az=None, sun_az_offset=0.0):
+        """I/F reflectance from radiance, with each step chosen by `cfg` (see `iirspy.config.L2Config`).
 
         Steps, in order: solar flux at the scene's distance, thermal removal, clip, polish,
-        photometric normalization, Besse phase, spectral smoothing.
+        photometric normalization, Besse phase, spectral smoothing. Clip and polish are folded into
+        one division with the flux and photometric terms; all divisors are positive.
 
         Parameters
         ----------
@@ -1015,84 +992,54 @@ class L2(IIRSData):
             (band, y, x) radiance [W/m^2/sr/um] with `wl` and per-line `solar_inc`/`solar_az` coords.
         qub_path : str or None
             Label for the scene's epoch (solar distance, monthly flux). None means 1 AU.
-        csv_path : str or None
-            Geometry csv, for the latitudes `dem` needs.
         cfg : L2Config
             Method choices.
         inc : float or xarray.DataArray, optional
             Solar incidence [deg], per line or per pixel. Default `rad.solar_inc`.
-        dem : xarray.DataArray or str, optional
-            DEM for a per-pixel incidence.
-        topo : str, Path, xarray object or tuple, optional
-            Camera-space slope/aspect[/lit] on this cube's grid (`photometry.load_topo`). Used only
-            when `cfg.topo`.
+        slope_az : str, Path, xarray object or tuple, optional
+            Camera-space slope/aspect[/lit] on this cube's grid (`photometry.load_slope_az`). Used
+            only when `cfg.use_slope_az`.
         sun_az_offset : float
-            Degrees added to the spm solar azimuth (local north) to reach topo's grid-north frame.
+            Degrees added to the spm solar azimuth (local north) to reach slope_az's grid north.
 
         Returns
         -------
         xarray.DataArray
-            Reflectance, with `cfg` as json in `attrs["l2_config"]`, per-scene diagnostics
-            (`solar_distance_au`, `inc_*_deg`, `mu0_floor_frac`, `mu_floor_frac`, `topo_used`,
-            `sun_az_offset`) in attrs, and the thermal temperature [K] as coord `T` when removed.
+            Reflectance, with `cfg` as json in `attrs["l2_config"]`, the per-scene `L2.DIAGNOSTICS` in
+            attrs, and the thermal temperature [K] as coord `T` when removed.
         """
-        topo = topo if cfg.topo else None
+        slope_az = slope_az if cfg.use_slope_az else None
         cos_inc = np.cos(np.radians(inc)) if inc is not None else np.cos(np.radians(rad.solar_inc))
-
-        if dem is not None:
-            if not hasattr(dem, "sel"):
-                dem = xr.open_dataarray(dem, engine="rasterio")
-            lat, _ = utils.get_iirs_latlon(csv_path)
-            lat = lat.interp_like(rad.solar_inc)
-            dem = dem.interp_like(rad.sel(band=dem.band), method="slinear")
-            cos_inc = utils.get_cos_inc_dem(dem, rad.solar_inc, rad.solar_az, lat)
         cos_inc = cos_inc * xr.ones_like(rad.isel(x=0, band=0, drop=True))
 
-        sdist = l2config.sdist(cfg, qub_path)
-        solar_flux = l2config.solar_flux(cfg, sdist, qub_path)
-        trad, temp = l2config.thermal_radiance(cfg, rad)
+        sdist = _sun_distance(cfg, qub_path)
+        solar_flux = _solar_flux(cfg, sdist, qub_path)
 
-        # Photometric normalization. Without topography the surface is the flat local horizontal:
-        # mu0 is the per-line solar cosine, the view is nadir (mu = 1), phase = incidence. With
-        # `topo`, mu0/mu are the local cosines about each facet.
+        trad, temp = (0.0, None)
+        if cfg.thermal == "isothermal":
+            trad, temp = utils.thermal_radiance(rad, cfg.thermal_eps, cfg.thermal_bands)
+
         sun_az = (rad.solar_az if "solar_az" in rad.coords else 0.0) + sun_az_offset
-        lit = 1.0
-        if topo is not None:
-            # cos_inc is per-line (y,); the topo fields are (y, x), so match them to the image
-            slope, aspect, lit, sun = photometry.load_topo(topo, like=rad.isel(band=0, drop=True))
-            # Slope/aspect are referenced to the DEM's tangent plane, the spm's angles to each
-            # pixel's local horizontal, so the product's own sun is used whenever it carries one.
-            az, elev = sun if sun is not None else (sun_az, 90 - rad.solar_inc)
-            mu0, mu, g = photometry.topo_angles(slope, aspect, az, elev)
-        else:
-            inc_deg = np.degrees(np.arccos(np.clip(cos_inc, -1.0, 1.0)))
-            mu0, mu, g = cos_inc, xr.ones_like(cos_inc), photometry.phase_angle(sun_az, 90 - inc_deg)
-        mu0_floor_frac = 0.0
-        mu_floor_frac = 0.0
-        if cfg.mu_min > 0.0:
-            mu0_floor_frac = float(np.asarray(mu0 < cfg.mu_min).mean())
-            mu0 = mu0.clip(min=cfg.mu_min) if hasattr(mu0, "clip") else np.clip(mu0, cfg.mu_min, None)
-            mu_floor_frac = float(np.asarray(mu < cfg.mu_min).mean())
-            mu = mu.clip(min=cfg.mu_min) if hasattr(mu, "clip") else np.clip(mu, cfg.mu_min, None)
-        # photfn is the disk function times the lit fraction. Facets the sun does not reach have
-        # no direct beam to normalize by, so they are nulled.
-        photfn = photometry.get_model(cfg.photom)(mu0, mu, g) * lit
-        if cfg.min_lit > 0.0:
-            photfn = photfn.where(np.asarray(lit) >= cfg.min_lit) if hasattr(photfn, "where") else photfn
-        photfn = photfn.where(photfn > 0) if hasattr(photfn, "where") else photfn
+        photfn, g, floors = photometry.photometric_factor(
+            cos_inc,
+            rad.solar_inc,
+            sun_az,
+            slope_az,
+            like=rad.isel(band=0, drop=True),
+            photom=cfg.photom,
+            cos_min=cfg.cos_min,
+            min_lit=cfg.min_lit,
+        )
 
-        # One division: clip and polish commute with the positive photometric/flux divisors
         num = rad - trad
         if cfg.clip_negative:
             num = num.clip(min=0)
         den = photfn * solar_flux
-        coeff = l2config.polish(cfg, rad.band)
-        if coeff is not None:
-            den = den * coeff
+        if cfg.polish is not None:
+            den = den * utils.spectral_polish(rad.band, POLISH.get(cfg.polish, cfg.polish))
         refl = num / den
-        refl = _apply_besse_phase(refl, cfg.photom, g, rad.wl) if cfg.phase else refl
-        refl = l2config.smooth(cfg, refl)
-        # add wl array as coordinate if missing
+        refl = photometry.besse_rescale(refl, cfg.photom, g, rad.wl) if cfg.phase else refl
+        refl = utils.moving_average(refl, cfg.smoothing, cfg.smoothing_edges)
         if "wl" not in refl.coords:
             refl = refl.assign_coords(wl=rad.wl)
         if temp is not None:
@@ -1102,18 +1049,17 @@ class L2(IIRSData):
         refl.attrs["units"] = ""
 
         inc_deg = np.degrees(np.arccos(np.clip(cos_inc, -1.0, 1.0)))
-        return l2config.stamp(
-            refl,
-            cfg,
-            mu0_floor_frac=mu0_floor_frac,
-            mu_floor_frac=mu_floor_frac,
+        refl.attrs["l2_config"] = json.dumps(cfg.to_attrs())
+        refl.attrs.update(
+            **floors,
             sun_az_offset=sun_az_offset,
-            topo_used=topo is not None,
+            slope_az_used=slope_az is not None,
             solar_distance_au=sdist,
             inc_min_deg=float(inc_deg.min()),
             inc_max_deg=float(inc_deg.max()),
             inc_mean_deg=float(inc_deg.mean()),
         )
+        return refl
 
     def __init__(
         self,

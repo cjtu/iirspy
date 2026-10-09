@@ -1,21 +1,18 @@
 """
-Photometric models and topographic normalization for the IIRS L1 -> L2 step.
+Photometric models and terrain normalization for the IIRS L1 -> L2 step.
 
-A model is a disk function ``f(mu0, mu, g)``: how the surface's reflectance varies with
-illumination (``mu0 = cos i``), emission (``mu = cos e``) and phase (``g``, degrees). L2 divides
-the measured radiance factor by it,
+A model is a disk function ``f(cos_inc, cos_view, g)``: how the surface's reflectance varies with
+the cosines of incidence and emission and with phase ``g`` [deg]. L2 divides the measured
+radiance factor by it,
 
-    I/F = (rad - trad) / (F_solar * f(mu0, mu, g))
+    I/F = (rad - trad) / (F_solar * f(cos_inc, cos_view, g))
 
 so the output is normalized to the model's own reference geometry (f = 1: overhead sun, nadir
-view, zero phase). Without topography mu0 is the scene's per-line solar cosine; hand it
-slope/aspect and mu0 and mu become the *local* cosines about the tilted facet.
+view, zero phase). Without terrain, cos_inc is the scene's solar cosine and the view is nadir;
+given a camera-space slope/aspect (`slope_az`), both become local cosines about the tilted facet.
 
-Swap models by name (:data:`MODELS`) or by passing any ``f(mu0, mu, g)`` callable as ``photom``:
+Swap models by name (:data:`MODELS`) or pass any ``f(cos_inc, cos_view, g)`` callable as ``photom``.
 
-    >>> l2 = l1.calibrate(topo="ch2_iir_<sid>_topo.tif", photom="lunar_lambert")  # doctest: +SKIP
-
-Slope, aspect and the cast-shadow lit fraction come from the DEM sampled into camera space
 Angle conventions match the IIRS spm:
 
     slope   degrees from the local horizontal (tangent plane), 0 = flat
@@ -33,36 +30,36 @@ from iirspy.utils import PKG_DATA
 M3_DATA = PKG_DATA.joinpath("m3")
 
 
-def lambert(mu0, mu, g):
-    """Lambert disk function: mu0."""
-    return mu0
+def lambert(cos_inc, cos_view, g):
+    """Lambert disk function: cos_inc."""
+    return cos_inc
 
 
-def lommel_seeliger(mu0, mu, g):
-    """Lommel-Seeliger (single-scattering) disk function, normalized to 1 at mu0 = mu = 1."""
-    return 2 * mu0 / (mu0 + mu)
+def lommel_seeliger(cos_inc, cos_view, g):
+    """Lommel-Seeliger (single-scattering) disk function, normalized to 1 at cos_inc = cos_view = 1."""
+    return 2 * cos_inc / (cos_inc + cos_view)
 
 
-def lunar_lambert(mu0, mu, g, coeffs=(1.0, -0.019, 2.42e-4, -1.46e-6)):
+def lunar_lambert(cos_inc, cos_view, g, coeffs=(1.0, -0.019, 2.42e-4, -1.46e-6)):
     """Lunar-Lambert disk function with McEwen's phase-dependent L(g) (McEwen 1991).
 
     L(g) blends Lommel-Seeliger (L=1, limb-darkened) into Lambert (L=0). The default cubic is the
     one ISIS ships; pass `coeffs` for a band- or site-fitted L(g).
     """
-    # Horner by hand: np.polyval drops xarray dims, and g is per-line (y,) while mu0/mu are (y, x).
+    # Horner by hand: np.polyval drops xarray dims, and g may be per-line (y,) against (y, x) cosines.
     L = np.clip(sum(c * g**i for i, c in enumerate(coeffs)), 0.0, 1.0)
-    return L * lommel_seeliger(mu0, mu, g) + (1 - L) * mu0
+    return L * lommel_seeliger(cos_inc, cos_view, g) + (1 - L) * cos_inc
 
 
 MODELS = {"lambert": lambert, "lommel_seeliger": lommel_seeliger, "lunar_lambert": lunar_lambert}
 
 
 def get_model(photom):
-    """Resolve `photom` (a MODELS key or any f(mu0, mu, g) callable) to the model function.
+    """Resolve `photom` (a MODELS key or any f(cos_inc, cos_view, g) callable) to the model function.
 
     >>> get_model("lambert") is lambert
     True
-    >>> get_model(lambda mu0, mu, g: mu0**0.7)(1.0, 1.0, 0.0)
+    >>> get_model(lambda cos_inc, cos_view, g: cos_inc**0.7)(1.0, 1.0, 0.0)
     1.0
     """
     if callable(photom):
@@ -130,16 +127,15 @@ def phase_angle(sun_az, sun_elev, view_az=0.0, view_elev=90.0):
     return np.degrees(np.arccos(np.clip(cg, -1.0, 1.0)))
 
 
-def topo_angles(slope, aspect, sun_az, sun_elev, view_az=0.0, view_elev=90.0):
-    """(mu0, mu, g) for every pixel from local topography and the sun/view directions.
+def local_angles(slope, aspect, sun_az, sun_elev, view_az=0.0, view_elev=90.0):
+    """(cos_inc, cos_view, g) for every pixel from local slope/aspect and the sun/view directions.
 
     slope/aspect are (y, x) camera-space fields; sun_az/sun_elev may be per-line (y) arrays, as
-    the spm supplies them. The view defaults to nadir, which is IIRS to within its 0.8 deg FOV;
-    pass view_az/view_elev when an off-nadir pointing matters.
+    the spm supplies them. The view defaults to nadir, which is IIRS to within its 0.8 deg FOV.
     """
-    mu0 = cos_angle(slope, aspect, sun_az, sun_elev)
-    mu = cos_angle(slope, aspect, view_az, view_elev)
-    return mu0, mu, phase_angle(sun_az, sun_elev, view_az, view_elev)
+    cos_inc = cos_angle(slope, aspect, sun_az, sun_elev)
+    cos_view = cos_angle(slope, aspect, view_az, view_elev)
+    return cos_inc, cos_view, phase_angle(sun_az, sun_elev, view_az, view_elev)
 
 
 def _sun_tags(attrs):
@@ -150,10 +146,10 @@ def _sun_tags(attrs):
         return None
 
 
-def load_topo(topo, like=None):
-    """(slope, aspect, lit, sun) from a camera-space topo product; `lit` is 1.0 when it has none.
+def load_slope_az(slope_az, like=None):
+    """(slope, aspect, lit, sun) from a camera-space slope/aspect product; `lit` is 1.0 when it has none.
 
-    `topo` is a raster with bands slope/aspect[/lit_frac], a tuple of
+    `slope_az` is a raster with bands slope/aspect[/lit_frac], a tuple of
     those DataArrays, or a Dataset carrying them as variables. `lit` is the fraction of the solar
     disk the terrain leaves visible. `sun` is the (azimuth, elevation) the product's tags record,
     in the same tangent-plane frame as its slope and aspect, or None.
@@ -162,30 +158,94 @@ def load_topo(topo, like=None):
     transplant, never a resample.
     """
     sun = None
-    if isinstance(topo, tuple):
+    if isinstance(slope_az, tuple):
         # (slope, aspect[, lit[, sun]]) -- what this function returns, so it round-trips
-        slope, aspect, *rest = topo
+        slope, aspect, *rest = slope_az
         lit = rest[0] if rest else None
         sun = rest[1] if len(rest) > 1 else None
-    elif isinstance(topo, xr.Dataset):
-        slope, aspect = topo["slope"], topo["aspect"]
-        lit = topo.get("lit_frac")
-        sun = _sun_tags(topo.attrs)
+    elif isinstance(slope_az, xr.Dataset):
+        slope, aspect = slope_az["slope"], slope_az["aspect"]
+        lit = slope_az.get("lit_frac")
+        sun = _sun_tags(slope_az.attrs)
     else:
-        da = topo if isinstance(topo, xr.DataArray) else xr.open_dataarray(topo, engine="rasterio")
+        da = slope_az if isinstance(slope_az, xr.DataArray) else xr.open_dataarray(slope_az, engine="rasterio")
         names = [str(n) for n in np.atleast_1d(da.attrs.get("long_name", ["slope", "aspect", "lit_frac"]))]
         pick = lambda n: da.isel(band=names.index(n), drop=True) if n in names else None
         slope, aspect, lit = pick("slope"), pick("aspect"), pick("lit_frac")
         if slope is None or aspect is None:
-            raise ValueError(f"topo product has bands {names}; need at least slope and aspect")
+            raise ValueError(f"slope_az product has bands {names}; need at least slope and aspect")
         sun_az, sun_elev = pick("sun_az"), pick("sun_elev")
         sun = (sun_az, sun_elev) if sun_az is not None and sun_elev is not None else _sun_tags(da.attrs)
     if like is not None:
         if slope.shape != like.shape:
-            raise ValueError(f"topo {slope.shape} does not match the image {like.shape}; regenerate it for this crop")
+            raise ValueError(
+                f"slope_az {slope.shape} does not match the image {like.shape}; regenerate it for this crop"
+            )
         coords = {d: like[d] for d in like.dims if d in like.coords}
         conv = lambda v: None if v is None else xr.DataArray(np.asarray(v), coords=coords, dims=like.dims)
         slope, aspect, lit = conv(slope), conv(aspect), conv(lit)
         if isinstance(sun, tuple) and hasattr(sun[0], "shape"):  # per-row arrays, not an (az, elev) tag pair
             sun = (conv(sun[0]), conv(sun[1]))
     return slope, aspect, 1.0 if lit is None else lit, sun
+
+
+def slope_az_from_dem(dem):
+    """(slope, aspect) [deg] from a DEM [m] already on the camera grid, as `load_slope_az` takes.
+
+    `dem` is a (y, x) DataArray whose x/y coords are in metres, x east and y north (rows may run
+    either way); gradients are Sobel, aspect is the downhill direction clockwise from grid north.
+    """
+    from scipy.ndimage import sobel
+
+    z = np.asarray(dem, dtype=float)
+    dx = float(dem.x[1] - dem.x[0])
+    dy = float(dem.y[1] - dem.y[0])
+    dz_dx = sobel(z, axis=1, mode="nearest") / (8 * dx)
+    dz_dy = sobel(z, axis=0, mode="nearest") / (8 * dy)
+    slope = np.degrees(np.arctan(np.hypot(dz_dx, dz_dy)))
+    aspect = np.degrees(np.arctan2(-dz_dx, -dz_dy)) % 360
+    return xr.DataArray(slope, coords=dem.coords, dims=dem.dims), xr.DataArray(aspect, coords=dem.coords, dims=dem.dims)
+
+
+def photometric_factor(
+    cos_inc, solar_inc, sun_az, slope_az=None, like=None, photom="lambert", cos_min=0.0, min_lit=0.9
+):
+    """(factor, g, floor fractions): the disk function times the lit fraction, NaN where unlit.
+
+    Without `slope_az` the surface is the flat local horizontal: `cos_inc` as given, nadir view,
+    phase = incidence. With it, cosines are local to each facet, using the product's own sun when
+    it records one, else (`sun_az`, 90 - `solar_inc`). `cos_min` floors cos_inc and cos_view
+    before the model (clamped, not nulled); the fraction of pixels below it is returned as
+    {"cos_inc_floor_frac", "cos_view_floor_frac"}. Pixels lit less than `min_lit` (from the
+    product's lit fraction) are nulled.
+    """
+    lit = 1.0
+    if slope_az is not None:
+        slope, aspect, lit, sun = load_slope_az(slope_az, like=like)
+        # slope/aspect are referenced to the DEM's tangent plane, the spm's angles to each pixel's
+        # local horizontal, so the product's own sun is used whenever it carries one.
+        az, elev = sun if sun is not None else (sun_az, 90 - solar_inc)
+        cos_inc, cos_view, g = local_angles(slope, aspect, az, elev)
+    else:
+        inc_deg = np.degrees(np.arccos(np.clip(cos_inc, -1.0, 1.0)))
+        cos_inc, cos_view, g = cos_inc, xr.ones_like(cos_inc), phase_angle(sun_az, 90 - inc_deg)
+    floors = {"cos_inc_floor_frac": 0.0, "cos_view_floor_frac": 0.0}
+    if cos_min > 0.0:
+        floors["cos_inc_floor_frac"] = float(np.asarray(cos_inc < cos_min).mean())
+        cos_inc = cos_inc.clip(min=cos_min) if hasattr(cos_inc, "clip") else np.clip(cos_inc, cos_min, None)
+        floors["cos_view_floor_frac"] = float(np.asarray(cos_view < cos_min).mean())
+        cos_view = cos_view.clip(min=cos_min) if hasattr(cos_view, "clip") else np.clip(cos_view, cos_min, None)
+    # Facets the sun does not reach have no direct beam to normalize by, so they are nulled.
+    factor = get_model(photom)(cos_inc, cos_view, g) * lit
+    if min_lit > 0.0:
+        factor = factor.where(np.asarray(lit) >= min_lit) if hasattr(factor, "where") else factor
+    factor = factor.where(factor > 0) if hasattr(factor, "where") else factor
+    return factor, g, floors
+
+
+def besse_rescale(refl, photom, g, wl):
+    """Rescale `refl` from `photom`'s own f=1 normalization onto Besse's RADF(30, 0, 30) convention."""
+    xl_ref = get_model(photom)(np.cos(np.radians(30.0)), 1.0, 30.0)
+    g_dims = getattr(g, "dims", ("y",))
+    f_ratio = xr.DataArray(besse_phase(np.asarray(g), wl.values), dims=("band", *g_dims))
+    return refl * xl_ref * f_ratio
