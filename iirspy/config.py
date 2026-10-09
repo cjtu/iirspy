@@ -17,7 +17,7 @@ import dataclasses
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Self
 
 import numpy as np
 
@@ -36,14 +36,14 @@ class _Config:
     PRESETS: ClassVar[dict[str, dict]] = {}
 
     @classmethod
-    def preset(cls, name: str, **overrides):
+    def preset(cls, name: str, **overrides) -> Self:
         """The named preset with `overrides` applied. Raises on an unknown preset or field."""
         if name not in cls.PRESETS:
             raise ValueError(f"unknown {cls.__name__} preset {name!r}; choose from {tuple(cls.PRESETS)}")
         return cls(**{**cls.PRESETS[name], **overrides})
 
     @classmethod
-    def resolve(cls, config="iirspy", **overrides):
+    def resolve(cls, config="iirspy", **overrides) -> Self:
         """A preset name or an instance, with `overrides` applied."""
         if isinstance(config, cls):
             return dataclasses.replace(config, **overrides) if overrides else config  # type: ignore[type-var]
