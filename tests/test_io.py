@@ -87,8 +87,7 @@ def test_from_file_preserves_bands_wls_and_absolute_lines(bands, ext, tmp_path):
 def test_snr_sidecar_is_written_by_the_same_driver_as_its_cube(ext, tmp_path):
     """A sidecar written through a different driver than the cube it rides with cannot record where
     it starts -- and a camera-space product that cannot say its first scan is not addressable by a
-    GLT. Derived products (mineral parameters, OHIBD) go out the same way, so the dispatch is
-    shared rather than reimplemented per product."""
+    GLT."""
     inst = make(L1, FULL, tmp_path)
     ny, nx = inst.img.sizes["y"], inst.img.sizes["x"]
     snr = np.arange(ny * nx, dtype="float32").reshape(ny, nx)

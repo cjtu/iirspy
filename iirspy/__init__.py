@@ -8,6 +8,6 @@ from iirspy.iirs import L2 as L2
 
 try:
     __version__ = metadata.version(__package__)
-except metadata.PackageNotFoundError:  # running from a source tree, e.g. iirspy.coreg
+except metadata.PackageNotFoundError:  # not pip-installed (source tree)
     __version__ = "0+source"
 del metadata

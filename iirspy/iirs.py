@@ -101,7 +101,7 @@ def _chunks(nband, ny, nx, chunk=True):
     """dask chunk dict for a (band, y, x) cube, or None to leave it unchunked.
 
     `chunk` is a dict to use as-is, or True to split along y at `utils.CHUNKSIZE`. A cube already
-    under one chunk's worth stays whole -- dask would only add graph overhead.
+    under one chunk's worth stays whole.
     """
     if not chunk:
         return None
@@ -115,8 +115,7 @@ def _chunks(nband, ny, nx, chunk=True):
 def _row_block(da, sub_rows=None):
     """Rows per write step. Defaults to the array's own y-chunk, so a block is read exactly once.
 
-    An explicit `sub_rows` wins. Unchunked the cube is already resident, so the block only bounds
-    the float32 copy and `utils.CHUNKSIZE` worth of rows is as good a size as any.
+    An explicit `sub_rows` wins; unchunked, `utils.CHUNKSIZE` worth of rows.
     """
     if sub_rows:
         return sub_rows
@@ -172,11 +171,7 @@ def _attach_empirical_frames(rad, dark, flat, smile, attach):
 
 
 def _write_camera_product(da, fout, row_block=None, compress="ZSTD", predictor=None):
-    """Format dispatch for any camera-space product: `.tif` -> GeoTIFF, else ENVI BIL.
-
-    Module-level (not a method) so callers with just a DataArray -- not a full IIRSData instance
-    -- can write a product too (e.g. `IIRSData.clip_aoi`, which only needs `self.img`).
-    """
+    """Format dispatch for any camera-space DataArray: `.tif` -> GeoTIFF, else ENVI BIL."""
     fout = str(fout)
     row_block = _row_block(da, row_block)
     if fout.lower().endswith(".tif"):
@@ -188,13 +183,11 @@ def _save_geotiff(fout, row_block, da, compress="ZSTD", predictor=None):
     """Write a BigTIFF sequentially in windowed blocks (bounded memory).
 
     Restartable: each finished block records `rows_done` in a `<fout>.progress` sidecar, and a
-    rerun of the same shape reopens the file and picks up there. A cluster task killed at its
-    wall clock therefore loses one block, not the whole cube -- which for a long strip is the
-    difference between a resumable rerun and starting the scene from zero.
+    rerun of the same shape reopens the file and picks up there.
 
     Integer `da` (e.g. QA's uint16) keeps its own dtype and nodata from `da.attrs["nodata"]` (or
     none); everything else writes float32 with NaN nodata. `compress`/`predictor` default to ZSTD
-    with predictor 2 (int) or 3 (float) -- not frozen, callers may override either.
+    with predictor 2 (int) or 3 (float).
     """
     from dask.diagnostics import ProgressBar
     from rasterio.windows import Window
@@ -223,9 +216,7 @@ def _save_geotiff(fout, row_block, da, compress="ZSTD", predictor=None):
     band_names = None if wls or "band_name" not in da.coords else da.coords["band_name"].values
     band_units = None if band_names is None else da.coords["units"].values
     # Provenance: scalar attrs (incl. empirical_notes JSON) round-trip as GDAL metadata tags.
-    # Drop stale band-count/name tags a source raster may carry in da.attrs (e.g. from GDAL
-    # metadata on read) -- band_numbers/per-band descriptions below are the actual truth and
-    # must not be contradicted by a leftover count/name list from an earlier band selection.
+    # Skip stale bands/band_names attrs; band_numbers and per-band descriptions below are authoritative.
     tags = {
         k: str(v)
         for k, v in da.attrs.items()
@@ -668,7 +659,7 @@ class L0(IIRSData):
         out.attrs["calibration_source"] = "empirical" if empirical else "user"
         try:
             out.attrs["iirspy_version"] = metadata.version("iirspy")
-        except metadata.PackageNotFoundError:  # running from a source tree not pip-installed, e.g. iirspy.coreg
+        except metadata.PackageNotFoundError:  # not pip-installed (source tree)
             out.attrs["iirspy_version"] = "0+source"
         if empirical:
             out.attrs["empirical_notes"] = json.dumps(emp_notes)  # provenance: how the product was made
@@ -843,12 +834,8 @@ class L1(IIRSData):
         self.geomdf, xy_extent = utils.parse_geom(self.csv, lonlatextent, xyextent, center=False)
         # replace any None in extent with values from xy_extent
         self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent, strict=False))
-        # ...but the geometry csv always describes the WHOLE strip, while the cube may be a crop of
-        # it (our own polar L1 products are). Where the caller named no extent, take the line range
-        # from the image itself -- `_apply_envi_start` has already put its y coords into strip
-        # numbering via the ENVI `y start` field, which is what that field is for. Without this,
-        # per-line solar geometry is built for the full strip and collides with the cropped cube:
-        # "conflicting sizes for dimension 'y': length 49013 ... and length 3600".
+        # ...but the geometry csv spans the whole strip and the cube may be a crop: with no extent
+        # given, take the line range from the image (`_apply_envi_start` put y in strip numbering).
         if all(e is None for e in xyextent) and all(e is None for e in lonlatextent):
             # floor/ceil, not int(): rasterio hands back pixel-CENTRE coords (0.5 .. n-0.5), so
             # truncating both ends drops a row and a column off the crop.
@@ -859,7 +846,7 @@ class L1(IIRSData):
                 int(np.ceil(self.img.y.values[-1])),
             )
         # x extent is an inclusive last-pixel index (249 on a 250-wide cube) against pixel-centre
-        # coords, so +1 keeps that last column; y stays half-open to match `solve.build_l1`'s crop.
+        # coords, so +1 keeps that last column; y stays half-open.
         self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(self.extent[0], self.extent[1] + 1))
         try:
             self.bounds = self.img.rio.bounds()
@@ -875,8 +862,7 @@ class L1(IIRSData):
         self.img.attrs["calibration_source"] = "issdc"
 
         # Assign lat, lon coordinates
-        # `self.extent`, not `xy_extent`: the latter spans the whole strip even when the cube is a
-        # crop, which put +44 deg latitudes on a south-polar product.
+        # `self.extent` (the cube's crop), not `xy_extent` (the whole strip).
         lon, lat = utils.geom2latlon_coords(self.geomdf, self.extent, self.shape[2], self.shape[1])
 
         # Get solar incidence for each line of image
@@ -1089,7 +1075,7 @@ class L2(IIRSData):
             mu_floor_frac = float(np.asarray(mu < cfg.mu_min).mean())
             mu = mu.clip(min=cfg.mu_min) if hasattr(mu, "clip") else np.clip(mu, cfg.mu_min, None)
         # photfn is the disk function times the lit fraction. Facets the sun does not reach have
-        # no direct beam to normalize by, so they are nulled rather than clipped.
+        # no direct beam to normalize by, so they are nulled.
         photfn = photometry.get_model(cfg.photom)(mu0, mu, g) * lit
         if cfg.min_lit > 0.0:
             photfn = photfn.where(np.asarray(lit) >= cfg.min_lit) if hasattr(photfn, "where") else photfn
@@ -1154,7 +1140,7 @@ class L2(IIRSData):
             raise FileNotFoundError(f"no geometry csv beside {self.qub} to crop by lon/lat")
 
         # x extent is an inclusive last-pixel index (249 on a 250-wide cube) against pixel-centre
-        # coords, so +1 keeps that last column; y stays half-open to match `solve.build_l1`'s crop.
+        # coords, so +1 keeps that last column; y stays half-open.
         self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(self.extent[0], self.extent[1] + 1))
         try:
             self.bounds = self.img.rio.bounds()

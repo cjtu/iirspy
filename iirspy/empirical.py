@@ -146,9 +146,7 @@ def cross_track_hf(P, win=CROSS_WIN):
 
     The one shadow signature that survives a missing dark subtraction. A shadowed row holds no
     albedo structure, so neighbouring samples differ only by detector noise whatever DN the row
-    sits at, while a merely dim row keeps its terrain contrast. Measured on 20201203T1859574285
-    (e2g2, dark pedestal): shadow rows 1.7 DN against a scene median of 16.3, i.e. 0.6% of level
-    against lit terrain's 3.0%.
+    sits at, while a merely dim row keeps its terrain contrast.
     """
     from scipy.ndimage import uniform_filter1d
 
@@ -160,8 +158,7 @@ def cross_track_hf(P, win=CROSS_WIN):
 def zero_frac(img, block):
     """Fraction of `block`'s rows in the raw cube that are exactly zero: fill/clipped, not measured DN.
 
-    Measured on the cube, not the panchromatic average: fill is zero in some bands and not others,
-    so averaging over PAN_BANDS dilutes an 80%-fill block to a few percent.
+    Measured on the cube: fill is zero in only some bands, so the PAN_BANDS average dilutes it.
     """
     a, b = block
     return float((img.isel(y=slice(a, b)).values == 0).mean())
@@ -170,11 +167,9 @@ def zero_frac(img, block):
 def is_shadow(P, block, hf=None):
     """True when `block` holds no cross-track scene structure - shadow, not merely dim terrain.
 
-    Level cannot decide this. A scene whose onboard dark subtraction never happened puts its
-    shadow at hundreds of DN (20201203T1859574285: 291-347, against 0-10 across every e1g2 scene
-    here), which any absolute or scene-relative level cut reads as "too bright to be shadow" and
-    throws the dark frame away. Structure decides it at any pedestal. Fill/clipped data is also
-    structure-free and passes this test; `zero_frac` rejects that separately, on the raw cube.
+    Decided on cross-track structure, not level, so shadow on an unsubtracted dark pedestal
+    (hundreds of DN) still counts. Fill/clipped data is also structure-free and passes this test;
+    `zero_frac` rejects that separately, on the raw cube.
     """
     hf = cross_track_hf(P) if hf is None else hf
     a, b = block
@@ -448,9 +443,7 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
                 dark_level=round(level, 3),
             )
             if level > DARK_PEDESTAL_DN:
-                # The shadow anchors the zero point either way, so the product is still calibrated
-                # - but a pedestal this large drifts with the detector, and the single frame
-                # derived here only holds near the rows it came from.
+                # A large pedestal drifts with the detector; the derived frame only holds near its rows.
                 warnings.warn(
                     f"shadow rows sit at {level:.0f} DN, not ~0: the onboard dark subtraction looks "
                     f"absent for this scene, so the empirical dark carries the full pedestal",

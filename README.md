@@ -10,6 +10,17 @@ Toolkit for working with ISRO's Chandrayaan-2 IIRS dataset. This is a work in pr
     * This will make a new virtual environment and run the `iirspy` tests
     * You can now use this `venv` from an IDE or `uv run ipython` for an interactive prompt
 
+## Reflectance quick start
+
+```python
+import iirspy
+l1 = iirspy.L1("20210720T2333026105", "/path/to/data/")
+l2 = l1.calibrate()                           # default preset "iirspy"
+l2 = l1.calibrate("issdc", sdist="spice")     # ISSDC NDI method, one field overridden
+```
+
+Presets, fields, the CLI and the recorded metadata are described in [docs/reflectance.md](docs/reflectance.md).
+
 ## Worked example
 
 Check out the fully worked examples notebooks [here](https://github.com/cjtu/iirspy/tree/main/iirspy/examples).
