@@ -20,7 +20,6 @@ import xarray as xr
 from pyproj import CRS
 from rasterio.control import GroundControlPoint
 from scipy.interpolate import RBFInterpolator, make_interp_spline
-from scipy.ndimage import convolve
 from scipy.signal import savgol_filter
 from scipy.stats import norm
 
@@ -31,6 +30,13 @@ PKG_DATA = files("iirspy").joinpath("data")
 DCALIB = PKG_DATA.joinpath("iir/calibration")
 CHUNKSIZE = 128 * 2**20  # [B] dask y-chunk target (dask's array.chunk-size default; profiled fastest + lowest RAM)
 FPOLISH = str(PKG_DATA.joinpath("spectral_polish_verma2022.csv"))
+# Per-band polish inferred from published ISSDC L2 (NDI) products; bands without a fit are 1.0
+FPOLISH_ISSDC_EMPIRICAL = str(PKG_DATA.joinpath("spectral_polish_issdc_empirical.csv"))
+# NOAA SSI CDR v03 monthly irradiance convolved to IIRS bands [mW/cm^2/um at 1 AU]: Coddington, O., Lean,
+# J. L., Lindholm, C., Pilewskie, P. (2024). NOAA Climate Data Record (CDR) of NASA NOAA LASP Spectral
+# Solar Irradiance (NNLSSI), Version 3. Monthly SSI, 2010-01 to 2025-12. NOAA National Centers for
+# Environmental Information. https://doi.org/10.25921/esjz-1w61. Accessed 2026-10-09.
+FNOAA = str(PKG_DATA.joinpath("solar_flux_noaa_cdr_v03.csv"))
 FBADBANDS = str(PKG_DATA.joinpath("iirs_bad_bands.csv"))
 FBADPIXELS = str(PKG_DATA.joinpath("bad_pixel_mask.csv"))
 FSOLAR = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_solar_flux.txt"))
@@ -56,6 +62,65 @@ except metadata.PackageNotFoundError:  # running from a source tree not pip-inst
 
 
 ## Reflectance corr
+def get_noaa_flux(sdist=1.0, month=None, fflux=FNOAA):
+    """NOAA SSI CDR v03 solar flux [W/m^2/sr/um] at `sdist` AU on band 1..256 (see `FNOAA`).
+
+    `month` is "YYYY-MM" for that month's irradiance; None uses the 2010-2019 mean.
+    """
+    df = pd.read_csv(fflux)
+    col = "mean_2010_2019" if month is None else month
+    if col not in df:
+        raise ValueError(f"{fflux} has no {col} column")
+    flux = df[col].to_numpy() * 10 / (np.pi * sdist**2)
+    return xr.DataArray(flux, coords={"band": df["band"].to_numpy()}, name="Solar flux [W/m^2/sr/um]")
+
+
+def thermal_radiance(rad, eps=1.0, bands=(227, 247)):
+    """(eps * B(T), T) for an isothermal surface, T [K] per pixel.
+
+    T is the mean brightness temperature at emissivity `eps` over IIRS band numbers `bands`
+    (1-indexed, inclusive), selected by band number. `rad` is (band, y, x) [W/m^2/sr/um] with a
+    `wl` [nm] coord.
+    """
+    c, h, k = 3e8, 6.626e-34, 1.38e-23
+    wl = rad.wl * 1e-9
+    q = np.log(eps * 2 * h * c**2 * 1e-6 / (rad * wl**5) + 1)
+    bt = h * c / (wl * k * q)
+    t = bt.sel(band=slice(*bands)).mean("band")
+    bbr = 1e-6 * (2 * h * c * c / wl**5) * 1 / (np.exp(h * c / (wl * k * t)) - 1)
+    return eps * bbr, t
+
+
+def spectral_polish(band, fpolish=FPOLISH):
+    """Per-band polish divisor from csv `fpolish` (`band`, `polish` columns), mapped onto `band` by
+    band number; bands the table lacks get 1.0."""
+    df = pd.read_csv(fpolish)
+    band = np.asarray(band)
+    coeff = pd.Series(df["polish"].to_numpy(), index=df["band"].to_numpy()).reindex(band).fillna(1.0)
+    return xr.DataArray(coeff.to_numpy(), coords={"band": band})
+
+
+def moving_average(da, width=3, edges="pair"):
+    """Centred `width`-band moving average along band.
+
+    `edges` sets the end bands: "pair" (width 3 only, the Verma et al. 2022 processing): the first
+    band is the mean of bands 2-3 and the last the mean of the last two; "nan" leaves them NaN;
+    "reflect" pads by reflection.
+    """
+    if width <= 1:
+        return da
+    if edges == "reflect":
+        n = width // 2
+        padded = da.pad(band=n, mode="reflect").rolling(band=width, center=True).mean()
+        return padded.isel(band=slice(n, -n)).assign_coords(da.band.coords)
+    out = da.rolling(band=width, center=True).mean()
+    if edges == "pair":
+        if width != 3:
+            raise ValueError('edges="pair" is only defined for width 3')
+        b = da.band
+        first, last = da.isel(band=[1, 2]).mean("band"), da.isel(band=[-2, -1]).mean("band")
+        out = xr.where(b == b[0], first, xr.where(b == b[-1], last, out)).transpose(*da.dims)
+    return out
 
 
 def apply_smoothing(da, smoothing, swindow):
@@ -82,96 +147,6 @@ def apply_smoothing(da, smoothing, swindow):
     elif smoothing.lower() == "savgol":
         da = smooth_savgol(da, swindow)  # Assumes polyorder=2
     return da
-
-
-def get_cos_inc_dem(dem, inc, iaz, latitudes):
-    """
-    Return cos(inc) relative to a DEM using the dot product, considering local latitude.
-
-    Parameters
-    ----------
-    dem : xr.DataArray
-        DEM data with the same spatial resolution as the image.
-    inc : np.ndarray
-        Solar incidence angle (degrees) for each row of data.
-    iaz : np.ndarray
-        Solar azimuth angle (degrees) for each row of data.
-    latitudes : np.ndarray
-        1D array of latitude values corresponding to each row of the DEM.
-
-    Returns
-    -------
-    cos_inc : np.ndarray
-        2D array of cos(inc) values adjusted for the DEM and local latitude.
-    """
-    # Calculate local illumination using dot product method between surface normal and sun vector
-
-    res_x = abs(float(dem.x[1] - dem.x[0]))
-    res_y = abs(float(dem.y[1] - dem.y[0]))
-
-    # Calculate surface gradients using kernel convolution
-    kernel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]) / (8 * res_x)
-    kernel_y = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]]) / (8 * res_y)
-
-    # Calculate derivatives
-    dz_dx = xr.apply_ufunc(
-        convolve,
-        dem,
-        input_core_dims=[["y", "x"]],
-        kwargs={"weights": kernel_x, "mode": "nearest"},
-        output_core_dims=[["y", "x"]],
-        vectorize=True,
-    )
-    dz_dy = xr.apply_ufunc(
-        convolve,
-        dem,
-        input_core_dims=[["y", "x"]],
-        kwargs={"weights": kernel_y, "mode": "nearest"},
-        output_core_dims=[["y", "x"]],
-        vectorize=True,
-    )
-    # Create surface normal vectors [nx, ny, nz]
-    # For each pixel: n = [-dz/dx, -dz/dy, 1] (unnormalized)
-    nx = -dz_dx
-    ny = -dz_dy
-    nz = np.ones_like(dz_dx)
-
-    # Normalize the normal vectors
-    norm_factor = np.sqrt(nx**2 + ny**2 + nz**2)
-    nx = nx / norm_factor
-    ny = ny / norm_factor
-    nz = nz / norm_factor
-
-    # Convert incidence and azimuth to radians
-    inc_rad = np.radians(inc)
-    iaz_rad = np.radians(iaz)
-
-    # Calculate sun vector components [sx, sy, sz] for each row
-    sx = np.sin(inc_rad) * np.sin(iaz_rad)  # East component
-    sy = np.sin(inc_rad) * np.cos(iaz_rad)  # North component
-    sz = np.cos(inc_rad)  # Up component
-
-    # Adjust sun vector for local latitude
-    lat_rad = np.radians(latitudes)
-    sy_adj = sy * np.cos(lat_rad) - sz * np.sin(lat_rad)
-    sz_adj = sy * np.sin(lat_rad) + sz * np.cos(lat_rad)
-
-    # Replace original sy and sz with adjusted values
-    sy = sy_adj
-    sz = sz_adj
-
-    # Compute dot product between normal and sun vector for each pixel
-    cos_inc = nx * sx + ny * sy + nz * sz
-
-    # Debugging: Print intermediate values for testing
-    if np.any(np.isnan(cos_inc)):
-        print("NaN values detected in cos_inc. Check inputs and calculations.")
-    if np.min(cos_inc) < 0:
-        print("Negative cos_inc values detected. Verify sun vector and surface normal calculations.")
-
-    # Handle negative values (local shadows)
-    # cos_inc = np.clip(cos_inc, 0, 1)
-    return cos_inc
 
 
 def get_iirs_inc_az(fimg, fspm, yrange):
@@ -1023,21 +998,45 @@ def get_solar_flux(sdist=1.0, fflux=FSOLAR):
     return xr.DataArray(flux, coords={"band": np.arange(1, 257)}, name="Solar flux [W/m^2/sr/um]")
 
 
+def spice_kernels(day, spice_dir=None):
+    """Generic SPICE kernels plus the orbit SPKs covering `day`, a "YYYYMMDD" string.
+
+    `spice_dir` (default env `IIRS_SPICE`) holds lsk/, pck/, sclk/, fk/ and spk/. Raises if it or a
+    covering SPK is missing.
+    """
+    import os
+
+    spice_dir = spice_dir or os.environ.get("IIRS_SPICE")
+    if not spice_dir or not Path(spice_dir).is_dir():
+        raise FileNotFoundError(f"SPICE kernel tree not found at {spice_dir!r} -- set IIRS_SPICE")
+    spice_dir = Path(spice_dir)
+    ks = [spice_dir / p for p in ("lsk/naif0012.tls", "pck/pck00010.tpc", "sclk/ch2_sclk_v1.tsc", "fk/ch2_v01.tf")]
+    ks = [p for p in ks if p.exists()]
+    d = pd.to_datetime(day, format="%Y%m%d")
+    for f in sorted(spice_dir.glob("spk/*.bsp")):
+        m = re.findall(r"(\d{2}[A-Za-z]{3}\d{4})", f.name)
+        if (
+            len(m) == 2 and pd.to_datetime(m[0], format="%d%b%Y") <= d <= pd.to_datetime(m[1], format="%d%b%Y")
+        ) or f.name.startswith("de4"):
+            ks.append(f)
+    if not any(f.suffix == ".bsp" for f in ks):
+        raise FileNotFoundError(f"no SPK in {spice_dir / 'spk'} covers {day}")
+    return ks
+
+
 def get_solar_distance(fimg, kernels=None):
     """Return the Sun-Moon distance in AU at the scene's mid-line epoch, from SPICE.
 
-    `kernels=None` resolves the kernel set via `spice.kernels(day)`. Warns and returns 1.0 AU if
+    `kernels=None` resolves the kernel set via `spice_kernels(day)`. Warns and returns 1.0 AU if
     the label or kernels can't be found.
     """
     import spiceypy as sp
-
-    from iirspy import spice
 
     fimg = Path(fimg)
     try:
         line_times = get_line_times(fimg)
         t = pd.Timestamp(line_times[len(line_times) // 2], unit="s")
-        ks = kernels if kernels is not None else spice.kernels(t.strftime("%Y%m%d"))
+        ks = kernels if kernels is not None else spice_kernels(t.strftime("%Y%m%d"))
         for k in ks:
             sp.furnsh(str(k))
         et = sp.str2et(t.strftime("%Y-%m-%dT%H:%M:%S.%f"))

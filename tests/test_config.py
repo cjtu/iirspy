@@ -5,26 +5,30 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from iirspy import l2config, utils
-from iirspy.l2config import L2Config
+from iirspy import utils
+from iirspy.config import L1Config, L2Config
 
-L2_REPRO = Path(os.environ.get("IIRS_L2_REPRO", Path.home() / "data/moon/ch2_iirs/l2_repro"))
+L2_REPRO = os.environ.get("IIRS_L2_REPRO")  # cached NCI/NDI windows, see test_issdc_preset_reproduces_ndi
 
 
 def test_polish_maps_by_band_number_not_position():
     """A cube with bands dropped must still get each band's own coefficient."""
-    table = l2config.polish(L2Config(polish="verma2022"), np.arange(1, 257))
+    table = utils.spectral_polish(np.arange(1, 257))
     kept = np.setdiff1d(np.arange(1, 257), [*utils.OSF, *utils.INVALID, 100, 101])
-    sub = l2config.polish(L2Config(polish="verma2022"), kept)
-    np.testing.assert_array_equal(sub.values, table.sel(band=kept).values)
+    np.testing.assert_array_equal(utils.spectral_polish(kept).values, table.sel(band=kept).values)
     assert float(table.sel(band=1)) == 1.0  # verma2022 starts at band 8
 
 
-@pytest.mark.parametrize("name", sorted(l2config.PRESETS))
-def test_every_field_survives_to_attrs(name):
-    cfg = L2Config.preset(name, flux=np.linspace(1, 2, 256), sdist=0.99)
-    assert L2Config(**cfg.to_attrs()) == cfg
-    assert L2Config.preset("iirspy", **cfg.to_attrs()) == cfg
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        *(L2Config.preset(n, flux=np.linspace(1, 2, 256), sdist=0.99) for n in L2Config.PRESETS),
+        *(L1Config.preset(n, exclude_wl=[(1800, 1900)]) for n in L1Config.PRESETS),
+    ],
+)
+def test_every_field_survives_to_attrs(cfg):
+    assert type(cfg)(**cfg.to_attrs()) == cfg
+    assert type(cfg).preset("iirspy", **cfg.to_attrs()) == cfg
 
 
 @pytest.mark.parametrize(
@@ -38,6 +42,8 @@ def test_every_field_survives_to_attrs(name):
         lambda: L2Config(sdist="spcie"),
         lambda: L2Config(photom="hapke"),
         lambda: L2Config(smoothing_edges="pairs"),
+        lambda: L1Config.preset("issdc", empircal=True),
+        lambda: L1Config.preset("nci"),
     ],
 )
 def test_unknown_preset_field_or_key_raises(make):
@@ -59,15 +65,20 @@ def _align(ndi, cands, pad, n, band=48):
     return best[1]
 
 
-@pytest.mark.skipif(not L2_REPRO.is_dir(), reason="needs the local l2_repro NCI/NDI window cache")
+@pytest.mark.skipif(not L2_REPRO, reason="set IIRS_L2_REPRO to the cached NCI/NDI window dir")
 def test_issdc_preset_reproduces_ndi():
+    """The issdc preset on official NCI radiance matches ISSDC NDI reflectance within 1% per window.
+
+    IIRS_L2_REPRO holds <sid>/nci.npz (rad[, rad_flip]) and <sid>/ndi.npz (rfl, obs) windows of
+    256 lines plus 8 padding lines each side.
+    """
     from iirspy.iirs import L2
 
     pad, n = 8, 256
     wl = utils.get_wls()
     short = (wl > 750) & (wl < 2300)
     meds = []
-    for d in sorted(p for p in L2_REPRO.iterdir() if (p / "nci.npz").exists() and (p / "ndi.npz").exists()):
+    for d in sorted(p for p in Path(L2_REPRO).iterdir() if (p / "nci.npz").exists() and (p / "ndi.npz").exists()):
         nci, ndi = np.load(d / "nci.npz"), np.load(d / "ndi.npz")
         rfl, sunzen = ndi["rfl"], ndi["obs"][:, 1]  # each npz key access re-reads the whole array
         rads = [nci[k] for k in ("rad", "rad_flip") if k in nci]
@@ -79,7 +90,7 @@ def test_issdc_preset_reproduces_ndi():
             da = xr.DataArray(rad * utils.RAD_NATIVE_SCALE, dims=("band", "y", "x"), coords=coords)
             da = da.assign_coords(solar_inc=("y", np.zeros(ny)), solar_az=("y", np.zeros(ny)))
             inc = xr.DataArray(sunzen[w, pad : pad + n], dims=("y", "x"))
-            refl = L2.__new__(L2)._compute_reflectance(da, None, None, L2Config.preset("issdc"), inc=inc).values
+            refl = L2.__new__(L2)._compute_reflectance(da, None, L2Config.preset("issdc"), inc=inc).values
             ok = np.isfinite(refl) & np.isfinite(ref) & (ref > 0.01)
             ratio = np.where(ok, refl / np.where(ok, ref, 1), np.nan)
             meds.append(np.nanmedian(np.nanmedian(ratio.reshape(256, -1), 1)[short]))

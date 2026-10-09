@@ -1,126 +1,84 @@
-# L2 reflectance configuration
+# Calibration configs
 
-`L1.calibrate` converts L1 radiance to L2 reflectance (I/F, radiance divided by the solar flux and a photometric term). Each processing step is chosen by one field of `iirspy.l2config.L2Config`, and named presets bundle the fields for common methods. This page lists the steps, the presets, how to select and override them, and what is recorded on the output.
+`L0.calibrate` converts raw counts to L1 radiance and `L1.calibrate` converts L1 radiance to L2 reflectance (I/F). Each method choice is one field of a frozen config, `iirspy.config.L1Config` or `iirspy.config.L2Config`. Named presets bundle the fields, and keyword overrides replace single fields.
 
-## Steps
+```python
+import iirspy
 
-The steps run in this order. Band numbers are IIRS band numbers, 1-indexed (band 1 is 712.3 nm, band 256 the last).
+l0 = iirspy.L0("20210720T2333026105", "/path/to/data/")
+l1 = l0.calibrate()                              # L1Config preset "iirspy"
+l2 = l1.calibrate()                              # L2Config preset "iirspy"
+l2 = l1.calibrate("issdc")                       # reproduce the ISSDC L2 product
+l2 = l1.calibrate("issdc", sdist="spice")        # ...with one field overridden
+```
+
+## L1: radiance
+
+Table 1: L1 presets.
+
+| Preset | Fields | Purpose |
+|---|---|---|
+| `iirspy` (default) | `empirical=True`, `interp_bands="linear"`, `interp_spatial=True` | Per-scene empirical dark and flat, with the LUT giving only the per-band scale; band and single-column gaps filled. |
+| `issdc` | defaults | The per-element LUT gain and offset. |
+
+Per-scene inputs are keyword arguments, not config fields: `empirical_kws` (for example user-picked dark rows), `calib_dir` and `output_bands`.
+
+## L2: reflectance
+
+The steps run in this order. Band numbers are IIRS band numbers, 1-indexed.
 
 1. Solar flux: `flux` selects the solar spectrum and `sdist` scales it by the squared Sun distance.
-2. Thermal removal: `thermal` selects the model, `thermal_eps` is the emissivity, and `thermal_bands` is the inclusive `(first, last)` band-number range whose mean brightness temperature sets the pixel temperature. The emitted radiance `thermal_eps * B(T)` is subtracted at every band.
+2. Thermal removal: `thermal`, `thermal_eps` (emissivity) and `thermal_bands`, the inclusive `(first, last)` band range whose mean brightness temperature is the pixel temperature. `thermal_eps * B(T)` is subtracted at every band.
 3. Clip: `clip_negative` sets negative thermal-removed radiance to zero.
 4. Polish: `polish` divides each band by a per-band factor, mapped by band number. Bands absent from the table get 1.0.
-5. Photometric normalization: `photom` is the disk function, `topo` enables the per-scene topography product, `mu_min` floors the cosines of the incidence and emission angles, `min_lit` nulls pixels with a lit fraction below it (needs topo), and `phase` rescales onto Besse's 30 degree phase reference.
-6. Spectral smoothing: `smoothing` is the moving-average width in bands (0 is off) and `smoothing_edges` sets the end bands. The value `"pair"` follows the CH2IIRS QGIS plugin and is defined for width 3 only. The first band is the mean of bands 2 and 3, and the last band is the mean of the last two bands. The other values are `"nan"` and `"reflect"`.
+5. Photometric normalization: `photom` is the disk function f(cos_inc, cos_view, g); `use_slope_az` applies a supplied terrain product; `cos_min` floors both cosines; `min_lit` nulls pixels less lit than it; `phase` rescales onto the Besse et al. (2013) 30° phase reference.
+6. Spectral smoothing: `smoothing` is the moving-average width in bands and `smoothing_edges` sets the end bands. `"pair"` (width 3 only) sets the first band to the mean of bands 2–3 and the last to the mean of the last two.
 
-`L2._compute_reflectance` folds steps 1, 3, 4 and 5 into one division, `clip(rad - thermal) / (photometric * flux * polish)`. This is mathematically identical to applying them in the plugin's order, because clip and polish commute with the positive divisors.
-
-## Presets
-
-Table 1: The L2 presets and their field values. Fields not listed keep the `L2Config` defaults.
+Table 2: L2 presets. Unlisted fields keep the `L2Config` defaults.
 
 | Preset | Non-default fields | Purpose |
 |---|---|---|
-| `iirspy` (default) | `thermal="isothermal"` | Current best method of this package. Sun distance from SPICE, isothermal thermal removal at emissivity 1 over bands 227-247, Lambert disk function, topography used when supplied. |
-| `issdc` | `sdist="none"`, `thermal="isothermal"`, `clip_negative=True`, `polish="issdc_ndi"`, `topo=False`, `smoothing=3` | Reproduces the ISSDC PRADAN NDI L2 product: no distance scaling, emissivity 1 thermal removal over bands 227-247, clip, `issdc_ndi` polish, no topography, 3-band smoothing. |
-| `verma_plugin` | `sdist="none"`, `thermal="isothermal"`, `thermal_eps=0.95`, `clip_negative=True`, `polish="verma2022"`, `topo=False`, `smoothing=3` | The CH2IIRS QGIS plugin settings of Verma et al. (2022), for comparison with plugin output. |
+| `iirspy` (default) | `thermal="isothermal"` | Sun distance from SPICE, isothermal thermal removal at emissivity 1 over bands 227–247, Lambert disk function, terrain used when supplied. |
+| `issdc` | `sdist="none"`, `thermal="isothermal"`, `clip_negative=True`, `polish="issdc_empirical"`, `use_slope_az=False`, `smoothing=3` | Reproduces the ISSDC PRADAN L2 reflectance product. |
+| `verma2022` | as `issdc`, but `thermal_eps=0.95`, `polish="verma2022"` | The Verma et al. (2022) thermal correction and polish. |
 
-The `issdc` preset was compared with NDI on 9 windows from 3 scenes. The median ratio to NDI over 750-2300 nm was within 0.2% in each window, and the per-band RMS difference was about 1.1% to 1.4%. The test `tests/test_l2config.py::test_issdc_preset_reproduces_ndi` asserts a 1% tolerance per window and is skipped when the local `l2_repro` window cache is absent. Three scenes do not establish agreement for other scenes, illumination or terrain.
+The spectral polish of the `issdc` preset was inferred empirically from published ISSDC L2 products. On 9 windows from 3 scenes, `issdc` matches them to within 0.2% median over 750–2300 nm.
 
-## Usage
+### Per-scene inputs
 
-A preset name is the first argument of `calibrate`. The call needs an L1 object with its SPM file.
+These are keyword arguments of `L1.calibrate`, not config fields, so they are not recorded in `l2_config`:
 
-```python
->>> import iirspy
->>> l1 = iirspy.L1("20210720T2333026105", "/path/to/data/")  # doctest: +SKIP
->>> l2 = l1.calibrate()  # default preset "iirspy"  # doctest: +SKIP
->>> l2 = l1.calibrate("issdc")  # doctest: +SKIP
-```
-
-Keyword arguments other than `inc`, `dem`, `topo` and `sun_az_offset` override single fields of the preset.
+- `inc`: solar incidence [deg], per line or per pixel. Default: the SPM file's per-line value.
+- `slope_az`: camera-space slope and aspect [deg], optionally with a lit fraction, on the cube's grid. It is a raster, a `(slope, aspect[, lit])` tuple or a Dataset (`photometry.load_slope_az`). Make one from a DEM already on the camera grid with `photometry.slope_az_from_dem`.
+- `sun_az_offset`: degrees added to the SPM solar azimuth to reach the grid-north frame of `slope_az`.
 
 ```python
->>> l2 = l1.calibrate("issdc", sdist="spice")  # doctest: +SKIP
->>> l2 = l1.calibrate("issdc", flux="noaa_cdr_monthly")  # doctest: +SKIP
+from iirspy import photometry
+from iirspy.config import L2Config
+
+slope, aspect = photometry.slope_az_from_dem(dem)
+l2 = l1.calibrate("iirspy", photom="lunar_lambert", cos_min=0.0872, slope_az=(slope, aspect))
+l2 = l1.calibrate(L2Config.preset("issdc", use_slope_az=True), slope_az=(slope, aspect))
 ```
-
-The name `topo` is both an `L2Config` field and a `calibrate` keyword, and the keyword takes it. To enable topography with another disk function, build the config explicitly and pass the topography file as the keyword.
-
-```python
->>> from iirspy.l2config import L2Config
->>> cfg = L2Config.preset("issdc", topo=True, photom="lunar_lambert")
->>> l2 = l1.calibrate(cfg, topo="topo.tif")  # doctest: +SKIP
-```
-
-Per-scene inputs are keyword arguments of `calibrate`. They are `inc` (solar incidence in degrees, per line or per pixel, default from the SPM file), `dem`, `topo` (camera-space slope, aspect and optionally lit fraction, see `iirspy.photometry.load_topo`), and `sun_az_offset` (degrees added to the SPM solar azimuth to reach the topography grid-north frame). They are not config fields, so they are not recorded in `l2_config`.
-
-A config can be built without data. Presets are plain dictionaries applied over the defaults.
-
-```python
->>> L2Config.preset("issdc").to_attrs()["smoothing"]
-3
->>> L2Config.preset("issdc", polish=None).polish is None
-True
->>> L2Config().thermal_bands
-(227, 247)
->>> from iirspy.l2config import PRESETS
->>> sorted(PRESETS)
-['iirspy', 'issdc', 'verma_plugin']
-
-```
-
-An unknown preset, field or field value raises `ValueError` or `TypeError` when the config is built.
-
-## Command line
-
-The command `iirs-compute-refl <sid> --group <g> --l2 PRESET --l2-<field> VALUE ...` computes reflectance for a scene. There is one `--l2-<field>` flag per `L2Config` field, with underscores replaced by hyphens. Each value is parsed as JSON and, if that fails, used as a string.
-
-```
-iirs-compute-refl 20210720T2333026105 --group g1 --l2 issdc \
-    --l2-thermal-bands [225,246] --l2-polish null --l2-topo false
-```
-
-This command ships with the georeferencing tools on the `georef` branch.
 
 ## Recorded metadata
 
-Each product carries the configuration that made it, so a result can be reproduced from the file alone.
+- `l1.img.attrs["l1_config"]` and `l2.img.attrs["l2_config"]` are JSON strings of every field. `L2Config(**json.loads(l2.img.attrs["l2_config"]))` rebuilds the config. A callable `photom` is recorded by function name only.
+- `l2.img.attrs` also holds the per-scene `L2.DIAGNOSTICS`: `solar_distance_au`, `inc_min_deg`, `inc_max_deg`, `inc_mean_deg`, `cos_inc_floor_frac`, `cos_view_floor_frac`, `slope_az_used` and `sun_az_offset`.
+- Coordinate `T` [K] is the per-pixel temperature when thermal removal is on.
 
-- `refl.attrs["l2_config"]` is a JSON string of every `L2Config` field. A callable `photom` is recorded by its function name only, so such a config cannot be rebuilt.
-- Per-scene diagnostics in `refl.attrs`: `solar_distance_au`, `inc_min_deg`, `inc_max_deg`, `inc_mean_deg`, `mu0_floor_frac` and `mu_floor_frac` (fractions of pixels below `mu_min`), `topo_used`, and `sun_az_offset`.
-- Coordinate `T` [K] is the per-pixel temperature, present when `thermal` is not `"none"`.
-- The CLI writes `refl_summary.json` with the keys `l2_preset`, `l2_config` and `l2_diagnostics`.
+## Data files
 
-```python
->>> import json
->>> cfg = L2Config(**json.loads(l2.attrs["l2_config"]))  # doctest: +SKIP
->>> l2.attrs["solar_distance_au"], l2.attrs["inc_mean_deg"]  # doctest: +SKIP
->>> l2["T"].median().item()  # median pixel temperature [K]  # doctest: +SKIP
-```
-
-The round trip also works for any config without data, because `to_attrs` returns JSON-safe values.
-
-```python
->>> cfg = L2Config.preset("verma_plugin")
->>> L2Config(**json.loads(json.dumps(cfg.to_attrs()))) == cfg
-True
-
-```
-
-## Shipped data files
-
-Table 2: Data files read by the L2 steps, both under `iirspy/data/`.
+Table 3: Data files read by the L2 steps, under `iirspy/data/`.
 
 | File | Used by | Content |
 |---|---|---|
-| `spectral_polish_issdc_ndi.csv` | `polish="issdc_ndi"` | Columns `band`, `polish`, `ci95_lo`, `ci95_hi`, `n_scenes`, `source`, one row per band. |
-| `solar_flux_noaa_cdr_v03.csv` | `flux="noaa_cdr_mean"`, `"noaa_cdr_monthly"` | Column `band`, `mean_2010_2019`, and one `YYYY-MM` column per month. Units are mW/cm^2/um at 1 AU, convolved to the IIRS bands. |
+| `spectral_polish_verma2022.csv` | `polish="verma2022"` | Per-band polish, bands 8–254. |
+| `spectral_polish_issdc_empirical.csv` | `polish="issdc_empirical"` | Per-band polish inferred from ISSDC L2 products; `ci95_lo`, `ci95_hi`, `n_scenes` give the fit's spread. |
+| `solar_flux_noaa_cdr_v03.csv` | `flux="noaa_cdr_mean"`, `"noaa_cdr_monthly"` | `mean_2010_2019` and one `YYYY-MM` column per month, mW/cm²/µm at 1 AU, convolved to the IIRS bands. The monthly lookup uses the scene label's start time. |
 
-The NOAA monthly lookup takes the month from the start time in the scene label. A month absent from the table raises `ValueError`. The table's last column is 2025-12.
+## References
 
-### Untrusted bands in the issdc_ndi table
-
-A band with `n_scenes` 0 and `polish` 1.0 is untrusted. It has no measured correction, so it receives no polish. In `issdc_ndi` the untrusted bands are 1 to 5 and 167 to 256 (3509.8 nm and longer). This includes the thermal bands 227 to 247. The 161 trusted bands, 6 to 166, have a median polish of 1.113 (range 1.044 to 1.183).
-
-The trusted bands are divided by about 1.11 and the untrusted bands are not. The product therefore has a step of about 11% at the boundary between band 166 (3493.0 nm) and band 167, near 3.5 um. Reflectance should not be compared across that boundary, for example in band ratios or spectral slopes spanning it.
+- Besse, S., et al. (2013). A visible and near-infrared photometric correction for Moon Mineralogy Mapper (M3). Icarus, 222, 229–242. https://doi.org/10.1016/j.icarus.2012.10.036
+- Coddington, O., Lean, J. L., Lindholm, C., Pilewskie, P. (2024). NOAA Climate Data Record (CDR) of NASA NOAA LASP Spectral Solar Irradiance (NNLSSI), Version 3. Monthly SSI, 2010-01 to 2025-12. NOAA National Centers for Environmental Information. https://doi.org/10.25921/esjz-1w61. Accessed 2026-10-09.
+- Verma, Chauhan & Chauhan (2022). Lunar surface temperature estimation and thermal emission correction using Chandrayaan-2 imaging infrared spectrometer data for H2O & OH detection using 3 μm hydration feature. Icarus, 383, 115075. https://doi.org/10.1016/j.icarus.2022.115075
