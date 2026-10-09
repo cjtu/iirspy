@@ -229,8 +229,22 @@ def smooth(cfg: L2Config, refl):
     return out
 
 
+DIAGNOSTICS = (
+    "solar_distance_au",
+    "inc_min_deg",
+    "inc_max_deg",
+    "inc_mean_deg",
+    "mu0_floor_frac",
+    "mu_floor_frac",
+    "topo_used",
+    "sun_az_offset",
+)
+
+
 def stamp(refl, cfg: L2Config, **diagnostics):
-    """Record `cfg` (json) and per-scene diagnostics on `refl.attrs`."""
+    """Record `cfg` (json) and the per-scene `DIAGNOSTICS` on `refl.attrs`."""
+    if set(diagnostics) != set(DIAGNOSTICS):
+        raise ValueError(f"diagnostics {sorted(diagnostics)} != {sorted(DIAGNOSTICS)}")
     refl.attrs["l2_config"] = json.dumps(cfg.to_attrs())
     refl.attrs.update(diagnostics)
     return refl
