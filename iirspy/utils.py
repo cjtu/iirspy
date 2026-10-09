@@ -423,7 +423,7 @@ def read_gcps(fgcps):
 def extract(fzip, out_dir, **kw):
     """`issdc_iirs.fetch` on one local bundle (`kw`: include/exclude/bands), md5-verified against its
     PDS4 labels. Raises on failure, where `fetch` itself only prints and returns an empty list."""
-    # Local import: the coreg subprocess imports this module from the arosics env, which lacks issdc.
+    # Local import: this module is also imported in envs without issdc.
     from issdc_iirs import fetch
 
     paths = fetch([str(fzip)], str(out_dir), **kw)[str(fzip)]
@@ -563,9 +563,8 @@ def get_iirs_paths(
 def read_geom_csv(fgeom) -> pd.DataFrame:
     """IIRS geometry csv, minus the (0, 0) fill rows some bundles pad the tail with.
 
-    Seen on real scenes (e.g. 20240523T1600301891): trailing rows with Pixel=Scan=0 and
-    Longitude=Latitude=0.0 exactly, duplicating the legit Scan=0 row. No lunar limb sample lands
-    on (0.0, 0.0) to full float precision, so safe to drop.
+    The fill rows have Pixel=Scan=0 and Longitude=Latitude=0.0 exactly, duplicating the real Scan=0
+    row; no real sample lands on (0.0, 0.0) to full float precision.
     """
     df = pd.read_csv(fgeom)
     return df[(df.Longitude != 0.0) | (df.Latitude != 0.0)]
@@ -1028,7 +1027,7 @@ def get_solar_distance(fimg, kernels=None):
     """Return the Sun-Moon distance in AU at the scene's mid-line epoch, from SPICE.
 
     `kernels=None` resolves the kernel set via `spice.kernels(day)`. Warns and returns 1.0 AU if
-    the label or kernels can't be found, rather than failing the whole calibration.
+    the label or kernels can't be found.
     """
     import spiceypy as sp
 
@@ -1095,12 +1094,12 @@ def write_envi_hdr(
 
     `bands` are the IIRS band numbers of the planes (default 1..nband); they go in `band names` so
     a band subset reads back as itself rather than 1..N, unless `band_names` (arbitrary strings,
-    e.g. a backplane's own per-band names) overrides them -- that also drops the wavelength lines,
+    e.g. non-spectral per-band names) overrides them -- that also drops the wavelength lines,
     since a non-wavelength product has none. `x_start`/`y_start` are the 1-indexed sample/line of
     this crop in the parent scene: ENVI carries no transform, so they are the only place a crop's
     absolute position survives (GeoTIFF uses the geotransform instead). `extra_tags` (scalar
     provenance attrs) are written as extra header keys; GDAL surfaces unknown ENVI header keys as
-    dataset metadata, so this keeps ENVI output as provenance-rich as GeoTIFF tags.
+    dataset metadata.
     """
     dtype_code = ENVI_DTYPE_CODES[str(np.dtype(dtype))]
     if band_names is not None:
@@ -1139,8 +1138,7 @@ def write_envi_bil(da, fout, sub_rows, description="IIRS"):
     """Sequentially stream a (band, y, x) DataArray to an ENVI BIL file (bounded memory).
 
     Integer dtypes are written as-is (e.g. QA's uint16); everything else is written float32.
-    `sub_rows` is required: it is resolved once in `IIRSData._write`, so no second default can
-    drift away from the cube's dask chunking.
+    `sub_rows` (rows per write step) is required.
     """
     fout = str(fout)
     nband, ny, nx = da.shape

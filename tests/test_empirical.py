@@ -27,7 +27,7 @@ def synth_cube(nband=7, ny=600, nx=250, bands=None, dark_rows=200, seed=0, textu
     `texture` adds cross-track albedo contrast to the lit rows only - the scene's own sine is
     smooth enough that a CROSS_WIN high-pass removes it, so a shadow/terrain test needs real
     high-frequency structure to bite. `pedestal` lifts every row, standing in for a scene whose
-    onboard dark subtraction never ran (20201203T1859574285 sits ~290 DN up).
+    onboard dark subtraction never ran.
     """
     rng = np.random.default_rng(seed)
     bands = FIXTURE_BANDS[:nband] if bands is None else bands
@@ -102,8 +102,7 @@ def test_fill_block_is_rejected_even_when_the_panchromatic_average_hides_it():
     """A mostly-exact-zero block is fill/clipped data, not shadow, and must not anchor the dark.
 
     Fill is zero in some bands and not others, so the PAN_BANDS average dilutes it to a few
-    percent: measuring on the cube is what makes the test bite (real blocks read 72-84% zero on
-    the cube and under 5% on the panchromatic).
+    percent: measuring on the cube is what makes the test bite.
     """
     cube = synth_cube()
     block = (0, 200)
@@ -121,7 +120,7 @@ def test_fill_block_is_rejected_even_when_the_panchromatic_average_hides_it():
 
 
 def test_shadow_is_found_through_an_unsubtracted_dark_pedestal():
-    """The failure 20201203T1859574285 shows: shadow at ~290 DN, which any level cut calls lit.
+    """Shadow on a ~290 DN pedestal must still be found; any level cut would call it lit.
 
     Structure, not level, has to make the call - and the derived dark must carry the pedestal so
     the radiance still comes out zero-anchored.

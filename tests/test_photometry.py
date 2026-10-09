@@ -175,7 +175,7 @@ def test_grazing_incidence_and_emission_together_stay_bounded():
 
 
 def test_besse_phase_table_parses_known_value():
-    """Spot-check against the notes: ch19/950.06 nm, f(75)/f(30) ~ 0.6462 (Besse's own table)."""
+    """Spot-check against Besse's table: ch19/950.06 nm, f(75)/f(30) ~ 0.6462 ."""
     _, wl, f = ph._m3_phase_table()
     i = int(np.argmin(np.abs(wl - 950.06)))
     assert f[30, i] == pytest.approx(0.255755, abs=1e-6)
@@ -188,7 +188,7 @@ def test_besse_phase_ratio_matches_spot_check_and_is_identity_at_30():
 
 
 def test_besse_phase_clamps_beyond_the_85deg_domain():
-    """Past 85 deg the table is quartic-rollover garbage (notes S4); usage must clamp there."""
+    """Past 85 deg the table's quartic fit rolls over; usage must clamp there."""
     at_edge = ph.besse_phase(85.0, 950.06)
     assert ph.besse_phase(90.0, 950.06) == pytest.approx(at_edge)
     assert ph.besse_phase(150.0, 950.06) == pytest.approx(at_edge)

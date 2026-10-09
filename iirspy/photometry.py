@@ -16,7 +16,7 @@ Swap models by name (:data:`MODELS`) or by passing any ``f(mu0, mu, g)`` callabl
     >>> l2 = l1.calibrate(topo="ch2_iir_<sid>_topo.tif", photom="lunar_lambert")  # doctest: +SKIP
 
 Slope, aspect and the cast-shadow lit fraction come from the DEM sampled into camera space
-(``iirspy.georef.camera_topo``). Angle conventions match that renderer and the IIRS spm:
+Angle conventions match the IIRS spm:
 
     slope   degrees from the local horizontal (tangent plane), 0 = flat
     aspect  degrees clockwise from grid north, direction the facet faces (downhill)
@@ -153,7 +153,7 @@ def _sun_tags(attrs):
 def load_topo(topo, like=None):
     """(slope, aspect, lit, sun) from a camera-space topo product; `lit` is 1.0 when it has none.
 
-    `topo` is a raster written by iirspy.georef.save_topo (bands slope/aspect[/lit_frac]), a tuple of
+    `topo` is a raster with bands slope/aspect[/lit_frac], a tuple of
     those DataArrays, or a Dataset carrying them as variables. `lit` is the fraction of the solar
     disk the terrain leaves visible. `sun` is the (azimuth, elevation) the product's tags record,
     in the same tangent-plane frame as its slope and aspect, or None.
