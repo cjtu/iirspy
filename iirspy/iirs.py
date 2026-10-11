@@ -11,6 +11,7 @@ import rasterio
 import xarray as xr
 from rioxarray.exceptions import NoDataInBounds
 
+import iirspy.frames as frames
 import iirspy.photometry as photometry
 import iirspy.utils as utils
 from iirspy.config import POLISH, L1Config, L2Config
@@ -154,6 +155,25 @@ def _expand_to_full_bands(da):
         return da
     da = da.reindex(band=all_bands)
     return da.assign_coords(wl=("band", utils.get_wls()))
+
+
+def _retime(rad, fix, frame_offsets, qub):
+    """(`rad` on true frames, (band, y) lost-frame mask) via `iirspy.frames.apply`, or (`rad`, None) when off.
+
+    No `frame_offsets` builds the table from the full cube `qub` and caches it beside it as
+    `<qub stem>_frames_offsets.csv`.
+    """
+    if not fix:
+        return rad, None
+    if frame_offsets is None:
+        frame_offsets = Path(qub).with_name(f"{Path(qub).stem}_frames_offsets.csv")
+        if not frame_offsets.exists():
+            try:
+                frames.build_table(qub, frame_offsets)
+            except ValueError as e:
+                warnings.warn(f"fix_frames skipped: {e}", UserWarning, stacklevel=3)
+                return rad, None
+    return frames.apply(rad, frame_offsets)
 
 
 def _attach_empirical_frames(rad, dark, flat, smile, attach):
@@ -514,7 +534,14 @@ class L0(IIRSData):
         return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
     def calibrate_to_rad(
-        self, config="iirspy", *, empirical_kws=None, calib_dir=utils.DCALIB, output_bands=None, **overrides
+        self,
+        config="iirspy",
+        *,
+        empirical_kws=None,
+        calib_dir=utils.DCALIB,
+        output_bands=None,
+        frame_offsets=None,
+        **overrides,
     ):
         """
         IIRS L0 digital number -> L1 radiance [W/m^2/sr/um], with method choices from `config`.
@@ -531,7 +558,9 @@ class L0(IIRSData):
           scene with dark rows   : rad = 10 * gain_med * (DN - dark_resid) / (flat * smile)
           scene without dark rows: rad = 10 * (gain_med * DN / (flat * smile) + offset_med)
 
-        Then OSF/invalid bands, `exclude_wl`, bad pixels and saturated pixels are nulled, and
+        With `fix_frames`, each 4-band group is moved onto true frames by the `frame_offsets` table
+        and its lost frames nulled (see iirspy.frames); `fill_frames` rebuilds them. Then OSF/invalid
+        bands, `exclude_wl`, bad pixels and saturated pixels are nulled, and
         `interp_bands`/`interp_spatial` fill gaps.
 
         Parameters
@@ -546,6 +575,10 @@ class L0(IIRSData):
         output_bands : list of int or None
             Band numbers to mask/interpolate/return. The empirical frames always see every band
             `self.img` holds; only narrow past what `interp_bands`' max_gap=6 can reach.
+        frame_offsets : path or None
+            Frame table from `iirspy.frames.build_table`, for `fix_frames`. None builds it from this
+            cube (all 256 bands, ~1 min) and caches it beside the .qub; a band-subset cube can't be
+            scanned, so its rows stay in raw order, with a warning.
 
         Returns
         -------
@@ -581,6 +614,9 @@ class L0(IIRSData):
         # empirical frames above already saw every band `self.img` holds, so this can't affect them.
         rad = _narrow_bands(rad, output_bands)
 
+        # Re-time each 4-band group onto true frames; its lost frames go NaN until `fill_frames`
+        rad, lost = _retime(rad, cfg.fix_frames, frame_offsets, self.qub)
+
         # Drop OSF and invalid bands, plus any caller-supplied wavelength ranges. interp if specified
         rad = rad.where(~(rad.band.isin((*utils.OSF, *utils.INVALID)) | _in_wl_ranges(rad.wl, exclude_wl)))
 
@@ -592,6 +628,9 @@ class L0(IIRSData):
 
         # Drop saturated pixels
         rad = rad.where(rad < utils.get_saturation_radiance(self.qub, calib_dir))
+
+        # Rebuild lost frames from each pixel's own spectrum before any generic band interpolation
+        rad = frames.fill(rad, lost) if lost is not None and cfg.fill_frames else rad
 
         # Interpolate across bands
         if interp_bands is not None:

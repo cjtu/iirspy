@@ -18,10 +18,10 @@ Table 1: L1 presets.
 
 | Preset | Fields | Purpose |
 |---|---|---|
-| `iirspy` (default) | `empirical=True`, `interp_bands="linear"`, `interp_spatial=True` | Per-scene empirical dark and flat, with the LUT giving only the per-band scale; band and single-column gaps filled. |
+| `iirspy` (default) | `empirical=True`, `interp_bands="linear"`, `interp_spatial=True`, `fix_frames=True`, `fill_frames=True` | Per-scene empirical dark and flat, with the LUT giving only the per-band scale; band and single-column gaps filled; band groups re-timed onto true frames and lost frames rebuilt, see [Frame defects](frames.md). |
 | `issdc` | defaults | The per-element LUT gain and offset. |
 
-Per-scene inputs are keyword arguments, not config fields: `empirical_kws` (for example user-picked dark rows), `calib_dir` and `output_bands`.
+Per-scene inputs are keyword arguments, not config fields: `empirical_kws` (for example user-picked dark rows), `calib_dir`, `output_bands` and `frame_offsets` (the scene's frame table).
 
 ## L2: reflectance
 
