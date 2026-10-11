@@ -185,6 +185,9 @@ def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeyp
     monkeypatch.setattr(solve.utils, "extract", lambda *a, **k: [])
     monkeypatch.setattr(solve, "_stage_inputs", boom)
 
+    ffr = tmp_path / "frames.csv"
+    ffr.write_text("kind,line,group,bands,value\n")
+    monkeypatch.setattr(solve, "FRAMES", ffr)
     ftif = tmp_path / "l1.tif"
     ftif.write_bytes(b"stub")
     fmeta = ftif.with_suffix(".meta.json")
@@ -193,7 +196,8 @@ def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeyp
             "scan0": 0,
             "lat_range": [10.0, 20.0],
             "bands": [1, 2],
-            "calibrate_kwargs": {**solve.CALIBRATE_KWS, "empirical": True},
+            "calibrate_kwargs": {**solve.CALIBRATE_KWS, "frame_offsets": str(ffr), "empirical": True},
+            "frames": solve._frames_key(),
         })
     )
 
@@ -203,6 +207,11 @@ def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeyp
     # Different calibrate_kwargs to the same path -> cache miss, must not return the stale cube.
     with pytest.raises(RuntimeError, match="rebuild-attempted"):
         solve.build_l1((10.0, 20.0), [1, 2], ftif, calibrate_kwargs={"empirical": False})
+
+    # A different frame table -> cache miss.
+    ffr.write_text("kind,line,group,bands,value\ndrop,5,3,13-16,1\n")
+    with pytest.raises(RuntimeError, match="rebuild-attempted"):
+        solve.build_l1((10.0, 20.0), [1, 2], ftif)
 
     # Pre-existing meta.json with no recorded calibrate_kwargs (written before this check existed)
     # is treated as unknown, not as "assume production defaults" -> also rebuilds.

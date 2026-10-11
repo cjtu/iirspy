@@ -75,6 +75,8 @@ LOG = Path()
 STAGE = Path()
 # When this run must be finished by (`time.monotonic()`), or None for no limit. See `_time_left`.
 DEADLINE: float | None = None
+# The scene's frame table (`iirspy.frames`), set by `main` / `refl.main` before any L1 is built.
+FRAMES = Path()
 
 
 def _time_left() -> float:
@@ -194,7 +196,7 @@ def _dem_key(path: str) -> str:
 def _cached_chunk(out: Path, c: dict, good_corr: float, decay_m: float, tweaks: dict):
     """The prior solve of chunk `c['i']` if it is still valid, else None.
 
-    Valid means its band, DEM pair, row bounds, aoi, decay_m, tweaks and the iirspy version that
+    Valid means its band, DEM pair, row bounds, aoi, decay_m, frame table, tweaks and the iirspy version that
     wrote it all match `c` and it wasn't rejected, at corr >= `good_corr`. The version is in the key
     because none of the other fields say anything about the *code* that solved the chunk, so without
     it a rerun after an algorithm change mixes old and new solves in one
@@ -221,6 +223,7 @@ def _cached_chunk(out: Path, c: dict, good_corr: float, decay_m: float, tweaks: 
         and fit.get("row0") == c["row0"]
         and fit.get("row1") == c["row1"]
         and fit.get("decay_m") == decay_m
+        and fit.get("frames") == _frames_key()
         and all(fit.get(k, TWEAK_DEFAULTS[k]) == v for k, v in tweaks.items())
         and all(abs(a - b) < 1.0 for a, b in zip(fit.get("aoi", []), c["aoi"], strict=True))
     )
@@ -342,7 +345,7 @@ def build_l1(
                 shutil.copyfile(fsrc, dst_dir / fsrc.name)
 
     saved_bands = out_bands if out_bands is not None else bands
-    effective_calibrate_kws = {**CALIBRATE_KWS, **(calibrate_kwargs or {})}
+    effective_calibrate_kws = {**CALIBRATE_KWS, "frame_offsets": str(FRAMES), **(calibrate_kwargs or {})}
     fmeta = ftif_out.with_suffix(".meta.json")
     if ftif_out.exists() and fmeta.exists():
         meta = json.loads(fmeta.read_text())
@@ -353,6 +356,7 @@ def build_l1(
             and meta.get("bands") == saved_bands
             and "calibrate_kwargs" in meta
             and meta["calibrate_kwargs"] == effective_calibrate_kws
+            and meta.get("frames") == _frames_key()
         ):
             log(f"L1 already built: {ftif_out} (covers {cached_range}, requested {lat_range})")
             return ftif_out, meta["scan0"], cached_range
@@ -386,6 +390,7 @@ def build_l1(
             "lat_range": list(lat_range),
             "bands": saved_bands,
             "calibrate_kwargs": effective_calibrate_kws,
+            "frames": _frames_key(),
         })
     )
     if not keep_raw:
@@ -393,6 +398,39 @@ def build_l1(
         raw_qub.with_suffix(".hdr").unlink(missing_ok=True)
     log(f"L1 saved: {ftif_out}")
     return ftif_out, int(ymin), lat_range
+
+
+def frame_offsets_path(sid: str, dest: Path | None = None) -> Path:
+    """`sid`'s frame table: one per strip, beside its GCPs and `_L1_b*.tif` in `dest` (default `ck.recal_dir`)."""
+    return Path(dest or ck.recal_dir(sid)) / f"{sid}_frames_offsets.csv"
+
+
+def ensure_frame_offsets(dest: Path | None = None) -> Path:
+    """`SID`'s frame table, built from the whole zip on first use and cached for every later task and group.
+
+    It needs every band of every line once (~1 min); nothing else in a run does, so it streams the zip rather than
+    staging it.
+    """
+    from iirspy import frames
+
+    f = frame_offsets_path(SID, dest)
+    if not f.exists():
+        log(f"frame table missing, building from {ZIP.name} -> {f}")
+        with phase("frame table"):
+            frames.build_table(ZIP, f)
+    return f
+
+
+def _frames_key() -> str:
+    """Content hash of `FRAMES`, so a cache built on another (or no) table never matches."""
+    import hashlib
+
+    return hashlib.sha256(FRAMES.read_bytes()).hexdigest()[:12]
+
+
+def predates_frames(fgcps: Path, fframes: Path) -> bool:
+    """Whether `fgcps` was solved before `fframes` existed, i.e. on a cube whose groups were not re-timed."""
+    return not fframes.exists() or fgcps.stat().st_mtime < fframes.stat().st_mtime
 
 
 def _merged_gcps_paths(keep: str | None) -> list[Path]:
@@ -408,11 +446,11 @@ def merged_gcps_path(sid: str, group: str) -> Path:
 
 
 def already_solved(sid: str, group: str) -> bool:
-    """Whether `sid`/`group` has a non-empty merged-GCPs file -- what a submission script checks
-    before deciding a scene needs a solve job at all (job-count control belongs there, not in a
+    """Whether `sid`/`group` has non-empty merged GCPs solved after its frame table -- what a submission script
+    checks before deciding a scene needs a solve job at all (job-count control belongs there, not in a
     job that's already been spawned)."""
     f = merged_gcps_path(sid, group)
-    return f.is_file() and f.stat().st_size > 0
+    return f.is_file() and f.stat().st_size > 0 and not predates_frames(f, frame_offsets_path(sid))
 
 
 def keep_products(out: Path, dest: Path) -> list[Path]:
@@ -502,6 +540,9 @@ def _glt_only(args, cfg0, fgeom, lat_range) -> bool:
     """Already solved: build the GLT (and LOC, if missing) from the saved GCPs instead of restaging and re-solving."""
     fdone = next((f for f in _merged_gcps_paths(args.keep) if f.exists()), None)
     if fdone is None or args.resolve or args.chunks or args.hillshade_only:
+        return False
+    if predates_frames(fdone, FRAMES):
+        log(f"{fdone} predates {FRAMES.name} -- re-solving on the re-timed cube")
         return False
     if fgeom is None:
         sys.exit(f"missing geometry csv for {SID}")
@@ -806,10 +847,14 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=F
     # above 70 deg ever matched one) and the scene reads as albedo, which is what WAC shows.
     _, elev, _ = sun_geometry(fgeom, flabel, cfg, kernels)
     wac = use_wac(elev, cfg)
-    ref, hs_info = (render_wac if wac else render_reference)(fgeom, flabel, cfg, kernels)
+    hit = _cached_reference(c, "wac" if wac else "hillshade")
+    if hit is None:
+        ref, hs_info = (render_wac if wac else render_reference)(fgeom, flabel, cfg, kernels)
+        _save_reference(c, cfg, ref, hs_info, "wac" if wac else "hillshade")
+    else:
+        ref, hs_info = hit
     hs_s = time.time() - t0
-    save_grid(_work(f"chunk{i}_hs.tif"), ref, cfg)
-    log(f"chunk {i}: {'wac' if wac else 'hillshade'} ref {hs_s:.1f}s, shape {ref.shape}")
+    log(f"chunk {i}: {'wac' if wac else 'hillshade'} ref {hs_s:.1f}s{' (cached)' if hit else ''}, shape {ref.shape}")
 
     with phase(f"chunk {i} register") as ph:
         try:
@@ -840,6 +885,7 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=F
         "row0": c["row0"],
         "row1": c["row1"],
         "decay_m": decay_m,
+        "frames": _frames_key(),
         **tweaks,
         "hillshade_s": round(hs_s, 2),
         "az_grid": round(hs_info["az_grid"], 2),
@@ -869,15 +915,55 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=F
     return {"chunk": c, "gcps": gcps_by_rc, "fit": fit}
 
 
+def _reference_key(c: dict, reference: str) -> dict:
+    return {
+        "reference": reference,
+        "aoi": list(c["aoi"]),
+        "dem_near": _dem_key(c["dem_near"]),
+        "dem_far": _dem_key(c["dem_far"]),
+    }
+
+
+def _save_reference(c: dict, cfg, ref, hs_info: dict, reference: str) -> None:
+    """Write chunk `c`'s reference image and the key `_cached_reference` reads it back by."""
+    from iirspy.georef import save_grid
+
+    save_grid(_work(f"chunk{c['i']}_hs.tif"), ref, cfg)
+    info = {k: hs_info[k] for k in ("az_grid", "elev", "lit_frac")}
+    _work(f"chunk{c['i']}_hs.json").write_text(json.dumps({**_reference_key(c, reference), **info}))
+
+
+def _cached_reference(c: dict, reference: str):
+    """(image, info) of chunk `c`'s reference from an earlier run in this work dir, or None.
+
+    A reference depends on the DEMs, the sun and the chunk's grid, never on the cube, so a re-solve on a re-timed
+    cube or a new iirspy version reads it back. Its key is the `_hs.json` sidecar, else (runs before the sidecar)
+    the chunk's fit, which records the same fields.
+    """
+    import rasterio
+
+    fhs = _work(f"chunk{c['i']}_hs.tif")
+    finfo = next((f for f in (_work(f"chunk{c['i']}_hs.json"), _work(f"chunk{c['i']}_fit.json")) if f.exists()), None)
+    if not fhs.exists() or finfo is None:
+        return None
+    info = json.loads(finfo.read_text())
+    seen = {**info, "dem_near": _dem_key(info.get("dem_near", "")), "dem_far": _dem_key(info.get("dem_far", ""))}
+    key = _reference_key(c, reference)
+    if "az_grid" not in info or any(seen.get(k) != v for k, v in key.items()):
+        return None
+    with rasterio.open(fhs) as src:
+        return src.read(1), info
+
+
 def _solve_chunks_hillshade(chunks, cfg0, fgeom, flabel):
     """Render and save each chunk's reference hillshade only, no registration."""
-    from iirspy.georef import render_reference, save_grid
+    from iirspy.georef import render_reference
 
     for c in chunks:
         cfg = replace(cfg0, aoi=c["aoi"], dem_near=c["dem_near"], dem_far=c["dem_far"])
         t0 = time.time()
         ref, hs_info = render_reference(fgeom, flabel, cfg, ck.kernels(SID[:8]))
-        save_grid(_work(f"chunk{c['i']}_hs.tif"), ref, cfg)
+        _save_reference(c, cfg, ref, hs_info, "hillshade")
         log(
             f"chunk {c['i']} [{c['band']}] hillshade {time.time() - t0:.1f}s shape={ref.shape} "
             f"near={Path(c['dem_near']).name} far={Path(c['dem_far']).name} "
@@ -1245,7 +1331,7 @@ def main(argv: list[str] | None = None) -> None:
 
     args = _parser().parse_args(argv)
 
-    global SID, GROUP, DEADLINE
+    global SID, GROUP, DEADLINE, FRAMES
     SID, GROUP = args.sid, args.group
     DEADLINE = time.monotonic() + args.max_seconds if args.max_seconds else None
 
@@ -1263,6 +1349,7 @@ def main(argv: list[str] | None = None) -> None:
     anc = ck.ancillary(SID)
     fgeom = anc["geometry/calibrated"]
 
+    FRAMES = ensure_frame_offsets(Path(args.keep) if args.keep else None)
     lat_range0 = ck.l1_lat_range(GROUP)
     if _glt_only(args, cfg0, fgeom, lat_range0):
         return

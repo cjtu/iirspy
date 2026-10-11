@@ -172,6 +172,9 @@ def main(argv: list[str] | None = None) -> None:
     dask.config.set(scheduler="threads", num_workers=solve.ncpu())
 
     solve.SID, solve.GROUP = sid, group
+    solve.FRAMES = solve.frame_offsets_path(sid, fgcps.parent)
+    if solve.predates_frames(fgcps, solve.FRAMES):
+        sys.exit(f"{fgcps} was solved before {solve.FRAMES.name} existed -- re-run iirs-solve-scene first")
     solve._open_run(args.out, "refl")
     t_start = time.time()
     solve._log_provenance()
