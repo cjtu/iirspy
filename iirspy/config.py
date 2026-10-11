@@ -69,6 +69,9 @@ class L1Config(_Config):
             instead of the per-element LUT gain/offset.
         interp_bands: Fill masked bands by interpolating across band (e.g. "linear"), or None.
         interp_spatial: Fill single-column all-band NaN gaps across x.
+        fix_frames: Move each 4-band group onto true frames and null its lost frames (needs the
+            scene's frame table, see `iirspy.frames`).
+        fill_frames: Rebuild the nulled frames from each pixel's own spectrum (`iirspy.frames.fill`).
         bad_pixel_mask: Null the packaged bad detector elements.
         exclude_wl: Extra (lo, hi) wavelength ranges [nm] to null, or None.
         attach_snr: Attach the empirical broadband SNR as an `snr` coord (empirical scenes with shadow).
@@ -78,6 +81,8 @@ class L1Config(_Config):
     empirical: bool = False
     interp_bands: str | None = None
     interp_spatial: bool = False
+    fix_frames: bool = False
+    fill_frames: bool = False
     bad_pixel_mask: bool = True
     exclude_wl: tuple[tuple[float, float], ...] | None = None
     attach_snr: bool = True
@@ -156,7 +161,13 @@ class L2Config(_Config):
 
 
 L1Config.PRESETS = {
-    "iirspy": {"empirical": True, "interp_bands": "linear", "interp_spatial": True},
+    "iirspy": {
+        "empirical": True,
+        "interp_bands": "linear",
+        "interp_spatial": True,
+        "fix_frames": True,
+        "fill_frames": True,
+    },
     "issdc": {},
 }
 
