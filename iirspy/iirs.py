@@ -50,36 +50,6 @@ def _try_load_next_level_metadata(basename, target_level, directory, xyextent):
     return result
 
 
-def _write_json_atomic(path, obj):
-    """Write `obj` as json via a temp file + rename, so a kill mid-write can't leave a torn file."""
-    tmp = Path(str(path) + ".tmp")
-    tmp.write_text(json.dumps(obj))
-    tmp.replace(path)
-
-
-def _resume_row(fout, fprog, key):
-    """First row `_save_geotiff` still has to write, from a previous run's progress sidecar.
-
-    0 unless `fout` and its sidecar both exist, the sidecar agrees with `key` (same cube shape and
-    block size -- a different one is a different product, not a resume), and `fout` still opens for
-    update. A file killed mid-flush may not reopen at all, so that case restarts from 0 too.
-    """
-    if not (Path(fout).exists() and Path(fprog).exists()):
-        return 0
-    try:
-        prog = json.loads(Path(fprog).read_text())
-    except (OSError, json.JSONDecodeError):
-        return 0
-    if {k: prog.get(k) for k in key} != key or not prog.get("rows_done"):
-        return 0
-    try:
-        with rasterio.open(fout, "r+"):
-            pass
-    except Exception:
-        return 0
-    return int(prog["rows_done"])
-
-
 def _band_numbers(img):
     """Original IIRS band numbers, from the GeoTIFF band_numbers tag or ENVI band names, else 1..N."""
     for attr in ("band_numbers", "band_names"):
@@ -203,9 +173,6 @@ def _write_camera_product(da, fout, row_block=None, compress="ZSTD", predictor=N
 def _save_geotiff(fout, row_block, da, compress="ZSTD", predictor=None):
     """Write a BigTIFF sequentially in windowed blocks (bounded memory).
 
-    Restartable: each finished block records `rows_done` in a `<fout>.progress` sidecar, and a
-    rerun of the same shape reopens the file and picks up there.
-
     Integer `da` (e.g. QA's uint16) keeps its own dtype and nodata from `da.attrs["nodata"]` (or
     none); everything else writes float32 with NaN nodata. `compress`/`predictor` default to ZSTD
     with predictor 2 (int) or 3 (float).
@@ -247,18 +214,13 @@ def _save_geotiff(fout, row_block, da, compress="ZSTD", predictor=None):
     if wls:
         # Which IIRS bands these planes are: 1..256 on a full cube, arbitrary on a subset
         tags["band_numbers"] = ",".join(str(int(b)) for b in da.band.values)
-    fprog = Path(str(fout) + ".progress")
-    key = {"shape": [nband, ny, nx], "row_block": int(row_block)}
-    y_start = _resume_row(fout, fprog, key)
-    mode = "r+" if y_start else "w"
-    with rasterio.open(fout, mode, **({} if y_start else profile)) as dst, ProgressBar():
+    with rasterio.open(fout, "w", **profile) as dst, ProgressBar():
         if tags:
             dst.update_tags(**tags)
-        for y0 in range(y_start, ny, row_block):
+        for y0 in range(0, ny, row_block):
             y1 = min(y0 + row_block, ny)
             block = da.isel(y=slice(y0, y1)).values.astype(dtype, copy=False)
             dst.write(block, window=Window(0, y0, nx, y1 - y0))
-            _write_json_atomic(fprog, {**key, "rows_done": y1})
         if wls:
             for i, wl in enumerate(wls):
                 dst.set_band_description(i + 1, wl)
@@ -269,7 +231,6 @@ def _save_geotiff(fout, row_block, da, compress="ZSTD", predictor=None):
             for i, (name, unit) in enumerate(zip(band_names, band_units, strict=True)):
                 dst.set_band_description(i + 1, str(name))
                 dst.update_tags(i + 1, UNITS=str(unit), DEFINITION=f"{name} [{unit}]")
-    fprog.unlink(missing_ok=True)
     return fout
 
 
@@ -838,7 +799,8 @@ class L1(IIRSData):
             )
         # x extent is an inclusive last-pixel index (249 on a 250-wide cube) against pixel-centre
         # coords, so +1 keeps that last column; y stays half-open.
-        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(self.extent[0], self.extent[1] + 1))
+        x1 = None if self.extent[1] is None else self.extent[1] + 1
+        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(self.extent[0], x1))
         try:
             self.bounds = self.img.rio.bounds()
         except NoDataInBounds as e:
@@ -1048,20 +1010,22 @@ class L2(IIRSData):
             attrs, and the thermal temperature [K] as coord `T` when removed.
         """
         slope_az = slope_az if cfg.use_slope_az else None
-        cos_inc = np.cos(np.radians(inc)) if inc is not None else np.cos(np.radians(rad.solar_inc))
-        cos_inc = cos_inc * xr.ones_like(rad.isel(x=0, band=0, drop=True))
+        inc = (rad.solar_inc if inc is None else inc) * xr.ones_like(rad.isel(x=0, band=0, drop=True))
+        cos_inc = np.cos(np.radians(inc))
 
         sdist = _sun_distance(cfg, qub_path)
         solar_flux = _solar_flux(cfg, sdist, qub_path)
 
         trad, temp = (0.0, None)
         if cfg.thermal == "isothermal":
-            trad, temp = utils.thermal_radiance(rad, cfg.thermal_eps, cfg.thermal_bands)
+            trad, temp = utils.thermal_radiance(
+                rad, cfg.thermal_eps, cfg.thermal_bands, inc=inc, sdist=sdist, t_min=cfg.thermal_t_min
+            )
 
         sun_az = (rad.solar_az if "solar_az" in rad.coords else 0.0) + sun_az_offset
         photfn, g, floors = photometry.photometric_factor(
             cos_inc,
-            rad.solar_inc,
+            inc,
             sun_az,
             slope_az,
             like=rad.isel(band=0, drop=True),
@@ -1126,7 +1090,8 @@ class L2(IIRSData):
 
         # x extent is an inclusive last-pixel index (249 on a 250-wide cube) against pixel-centre
         # coords, so +1 keeps that last column; y stays half-open.
-        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(self.extent[0], self.extent[1] + 1))
+        x1 = None if self.extent[1] is None else self.extent[1] + 1
+        self.img = self.img.sel(y=slice(*self.extent[-2:]), x=slice(self.extent[0], x1))
         try:
             self.bounds = self.img.rio.bounds()
         except NoDataInBounds as e:

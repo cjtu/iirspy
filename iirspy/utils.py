@@ -75,18 +75,46 @@ def get_noaa_flux(sdist=1.0, month=None, fflux=FNOAA):
     return xr.DataArray(flux, coords={"band": df["band"].to_numpy()}, name="Solar flux [W/m^2/sr/um]")
 
 
-def thermal_radiance(rad, eps=1.0, bands=(227, 247)):
+def flat_surface_temperature(inc, sdist=1.0, s0=1370.0, eps=0.95, a0=0.08, a=0.045, b=0.14):
+    """Radiative-equilibrium dayside temperature [K] of a flat surface at solar incidence `inc` [deg].
+
+    T = [S (1 - A) cos(i) / (eps sigma)]^(1/4), Williams et al. (2017) Eq. 1, with the incidence-dependent
+    albedo A(i) = A0 + a (i/45)^3 + b (i/90)^8 of Vasavada et al. (2012); the defaults are Williams' fit to
+    the Diviner zonal-mean noon temperatures (where i = latitude). S = `s0` / `sdist`^2. 0 K where i >= 90.
+
+    Williams, J.-P., Paige, D. A., Greenhagen, B. T., & Sefton-Nash, E. (2017). The global surface temperatures
+    of the Moon as measured by the Diviner Lunar Radiometer Experiment. Icarus, 283, 300-325.
+    Vasavada, A. R., et al. (2012). Lunar equatorial surface temperatures and regolith properties from the
+    Diviner Lunar Radiometer Experiment. JGR Planets, 117, E00H18.
+
+    >>> [round(float(flat_surface_temperature(i)), 1) for i in (0, 60, 90)]
+    [391.1, 318.4, 0.0]
+    """
+    albedo = a0 + a * (inc / 45) ** 3 + b * (inc / 90) ** 8
+    cos_i = np.clip(np.cos(np.radians(inc)), 0, None)
+    return (s0 / sdist**2 * (1 - albedo) * cos_i / (eps * 5.670374e-8)) ** 0.25
+
+
+def thermal_radiance(rad, eps=1.0, bands=(227, 247), inc=None, sdist=1.0, t_min=0.0):
     """(eps * B(T), T) for an isothermal surface, T [K] per pixel.
 
     T is the mean brightness temperature at emissivity `eps` over IIRS band numbers `bands`
     (1-indexed, inclusive), selected by band number. `rad` is (band, y, x) [W/m^2/sr/um] with a
-    `wl` [nm] coord.
+    `wl` [nm] coord. Where T is not above `t_min` (or not finite) and `inc` [deg] is given, T falls
+    back to `flat_surface_temperature(inc, sdist)`. A cube with none of `bands` has no thermal
+    term: (0.0, None).
     """
+    tb = rad.sel(band=slice(*bands))
+    if not tb.sizes["band"]:
+        warnings.warn(f"no thermal bands {bands} in the cube, thermal removal skipped", UserWarning, stacklevel=2)
+        return 0.0, None
     c, h, k = 3e8, 6.626e-34, 1.38e-23
+    wl_t = tb.wl * 1e-9
+    q = np.log(eps * 2 * h * c**2 * 1e-6 / (tb * wl_t**5) + 1)
+    t = (h * c / (wl_t * k * q)).mean("band")
+    if inc is not None:
+        t = t.where(t > t_min, flat_surface_temperature(inc, sdist))
     wl = rad.wl * 1e-9
-    q = np.log(eps * 2 * h * c**2 * 1e-6 / (rad * wl**5) + 1)
-    bt = h * c / (wl * k * q)
-    t = bt.sel(band=slice(*bands)).mean("band")
     bbr = 1e-6 * (2 * h * c * c / wl**5) * 1 / (np.exp(h * c / (wl * k * t)) - 1)
     return eps * bbr, t
 
@@ -1151,7 +1179,11 @@ def write_envi_bil(da, fout, sub_rows, description="IIRS"):
         band_names = [str(n) for n in band_names.values]
     # Pixel centres (n + 0.5) -> ENVI's 1-indexed sample/line of the crop's upper-left pixel
     x_start, y_start = (int(np.floor(float(da[d].min()))) + 1 for d in ("x", "y"))
-    extra_tags = {k: v for k, v in da.attrs.items() if isinstance(v, str | int | float | bool)}
+    extra_tags = {
+        k: v
+        for k, v in da.attrs.items()
+        if isinstance(v, str | int | float | bool) and k not in ("bands", "band_names", "description")
+    }
     write_envi_hdr(
         Path(fout).with_suffix(".hdr"),
         nx,
