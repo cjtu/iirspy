@@ -164,14 +164,14 @@ def zero_frac(img, block):
     return float((img.isel(y=slice(a, b)).values == 0).mean())
 
 
-def is_shadow(P, block, hf=None):
+def is_shadow(P, block):
     """True when `block` holds no cross-track scene structure - shadow, not merely dim terrain.
 
     Decided on cross-track structure, not level, so shadow on an unsubtracted dark pedestal
     (hundreds of DN) still counts. Fill/clipped data is also structure-free and passes this test;
     `zero_frac` rejects that separately, on the raw cube.
     """
-    hf = cross_track_hf(P) if hf is None else hf
+    hf = cross_track_hf(P)
     a, b = block
     return bool(np.nanmedian(hf[a:b]) < DARK_SMOOTH_FRAC * np.nanmedian(hf[np.isfinite(hf)]))
 

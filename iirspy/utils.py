@@ -11,13 +11,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pdr
-import rasterio
 
 # import xarray_regrid
 import xarray as xr
 
 # import xesmf as xe
-from pyproj import CRS
 from rasterio.control import GroundControlPoint
 from scipy.interpolate import RBFInterpolator, make_interp_spline
 from scipy.signal import savgol_filter
@@ -202,105 +200,6 @@ def get_spm_interpolator(fspm, col="sun_elev"):
     return make_interp_spline(spm_times, spm_vals, k=1)
 
 
-def warp2grid(da, ext, gridlon, gridlat, method="bilinear"):
-    """Warp da to supplied grid and write crs."""
-    src = da.sel(x=slice(ext[0] - 0.5, ext[1] + 0.5), y=slice(ext[2] - 0.5, ext[3] + 0.5))
-    src = src.assign_coords(lon=(["y", "x"], gridlon), lat=(["y", "x"], gridlat))
-
-    # Generate output grid
-    minlon, maxlon = np.min(gridlon), np.max(gridlon)
-    minlat, maxlat = np.min(gridlat), np.max(gridlat)
-    dlat = (maxlat - minlat) / len(src.y)
-    dlon = (maxlon - minlon) / len(src.x)
-    target_grid = {
-        "lon": np.arange(minlon, maxlon + dlon, dlon, dtype="float32"),
-        "lat": np.arange(minlat, maxlat + dlat, dlat, dtype="float32"),
-    }
-    # TODO: need to replace regridder
-    # regridder = xe.Regridder(src, target_grid, method, unmapped_to_nan=True)
-    # out = regridder(src)
-    out = target_grid
-
-    # Write crs (Moon unprojected)
-    # NOTE: WIP — regridder above is disabled, so `out` is currently a dict and
-    # these .rio calls will fail at runtime until the regridder is restored.
-    out.rio.write_crs(CRS.from_authority("IAU", "30100"), inplace=True)  # type: ignore[attr-defined]
-    out.rio.set_spatial_dims("lon", "lat", inplace=True)  # type: ignore[attr-defined]
-    out.rio.write_coordinate_system(inplace=True)  # type: ignore[attr-defined]
-    return out
-
-
-def warp2gcps(fqub, da, gcps, gcps_crs, fout, method="bilinear"):
-    """Warp and project the image based on the provided GCPs."""
-    import rasterio
-    from rasterio.warp import Resampling, calculate_default_transform, reproject
-
-    # Create a temporary file to store the warped image
-    with rasterio.open(fqub) as src:
-        # Create a VRT dataset with GCPs
-        vrt_options = {
-            "crs": da.rio.crs,
-            "src_crs": gcps_crs,
-            "src_transform": rasterio.transform.from_gcps(gcps),
-            "src_method": "GCP_TPS",
-        }
-        with rasterio.vrt.WarpedVRT(src, **vrt_options) as vrt:
-            transform, width, height = calculate_default_transform(
-                gcps_crs, da.rio.crs, da.rio.width, da.rio.height, gcps=gcps
-            )
-            print(transform, "\n", width, height)
-            kwargs = da.rio.profile
-            kwargs.update({"crs": gcps_crs, "transform": transform, "width": width, "height": height})
-
-            with rasterio.open(fout, "w", **kwargs) as dst:
-                for i in range(1, da.rio.count + 1):
-                    reproject(
-                        source=rasterio.band(vrt, i),
-                        destination=rasterio.band(dst, i),
-                        src_transform=da.rio.transform,
-                        src_crs=da.rio.crs,
-                        gcps=gcps,
-                        dst_transform=transform,
-                        dst_crs=gcps_crs,
-                        resampling=getattr(Resampling, method),
-                    )
-
-        # Read the warped image back into an xarray DataArray
-        warped_da = xr.open_dataarray(fout, engine="rasterio")
-
-    return warped_da
-
-
-def fix_metadata(fout, wls):
-    """Fix metadata for geotiff to match original qub."""
-    with rasterio.open(fout, "r+", driver="GTiff") as dst:
-        dst.descriptions = tuple([str(wl) for wl in wls])
-
-    # ds = rioxarray.open_rasterio(fout, band_as_variable=True, engine='rasterio')
-    # ds.attrs["name"] = "radiance"  # 'reflectance'
-    # ds.attrs["longname"] = "radiance (µW/cm^2/sr/µm)"  # 'reflectance'
-    # # ds.attrs['lines'] = ds.sizes['lat']
-    # # ds.attrs['samples'] = ds.sizes['lon']
-
-    # # Assign wavelength labels
-    # ds = ds.rename({f"band_{i + 1}": wl for i, wl in enumerate(wls)})
-    # ds.rio.to_raster(fout)
-
-    # for band in ds.band.values:
-    #     # TODO: Compute and store band stats?
-    #     ds[band].attrs['x'] = 'y'
-    return
-
-
-def get_iirs_proj(fqub):
-    """Return the projection as WKT from the qub xml metadata."""
-    img = pdr.open(fqub)
-    proj_name = img.metaget("isda:projection") or "equatorial"
-    pole = img.metaget("isda:area") or ""
-    proj_name = f"{proj_name}{pole}".lower().replace(" ", "")
-    return IIRS_PROJ_DICT[proj_name]
-
-
 def geom2grid(fgeom, extent, xs=None, ys=None):
     """Interpolate sparse geometry csv to full 2D lat and lon grids."""
     df_buf, xyext = parse_geom(fgeom, extent)
@@ -381,46 +280,7 @@ def geom2latlon_coords(df_geom, xyext, nx, ny):
     return lon_1d, lat_1d
 
 
-def iirs2gcps(fqub, fgeom, fout=None, extent=(None, None, None, None), corners_only=False):
-    """
-    Write iirs qub subset to latlon as geotiff with GCPs. Optionally check MD5 checksum.
-
-    Parameters
-    ----------
-    extent: (minlon, maxlon, minlat, maxlat)
-    """
-    # Get GCPs and ext in pixel coordinates
-    gcps, xyext = parse_geom(fgeom, extent, as_gcps=True, corners_only=corners_only)
-
-    # Read the hyperspectral data cube
-    ds = xr.open_dataarray(fqub, engine="rasterio").sel(
-        x=slice(xyext[0] - 0.5, xyext[1] + 0.5), y=slice(xyext[2] - 0.5, xyext[3] + 0.5)
-    )
-
-    # Set the GCPs and CRS (Moon unprojected)
-    ds.rio.write_gcps(gcps, CRS.from_authority("IAU", "30100"), inplace=True)
-    if fout is not None:
-        ds.rio.to_raster(fout, dtype="float32")
-        print(f"Wrote {fout}")
-    return ds
-
-
-def points2gcps(fqub, fpoints, fout, extent=(None, None, None, None)):
-    """Attach tie-points from a GIS .points file to fqub."""
-    # TODO
-    pass
-
-
 ## File I/O
-def read_gcps(fgcps):
-    """Parse gcps and CRS from a QGIS georeferencer .points file."""
-    with open(fgcps) as f:
-        crs = CRS.from_wkt(f.readline().lstrip("#CRS: "))
-    df = pd.read_csv(fgcps, skiprows=1, header=0)
-    # df['sourceY'] = len(da.y) + df.sourceY
-    # df['sourceY'] =  abs(df.sourceY)
-    gcps = [GroundControlPoint(row["sourceX"], row["sourceY"], row["mapX"], row["mapY"]) for _, row in df.iterrows()]
-    return gcps, crs
 
 
 def extract(fzip, out_dir, **kw):
@@ -590,23 +450,6 @@ def get_wl_labels(fname):
     """Return labels for wavelegnths in str format, e.g. for an ENVI header."""
     wls = get_wls(fname)
     return [f"{wl} nm" for wl in wls]
-
-
-def get_iirs_latlon(fgeom, center=False):
-    """Return lat and lon grids from iirs geometry csv file as DataArrays.
-
-    Note: Provided lat/lon are reported for every 50th line/sample, not every pixel.
-    """
-    df = read_geom_csv(fgeom).rename(columns={"Pixel": "x", "Scan": "y"})
-    df["Longitude"] = (df["Longitude"] + 180) % 360 - 180  # lon in [-180, 180]
-    # set coords from 1 to max(coord) unless center coords, which start at 0.5
-    df["x"] = df.x + 1 - 0.5 * center
-    df["y"] = df.y + 1 - 0.5 * center
-    df2d = df.set_index(["y", "x"])
-    lat = xr.DataArray(df2d.Latitude.unstack())
-    lon = xr.DataArray(df2d.Longitude.unstack())
-
-    return lat, lon
 
 
 def parse_geom(
@@ -1073,30 +916,6 @@ def get_solar_distance(fimg, kernels=None):
         warnings.warn(f"get_solar_distance: could not compute from SPICE for {fimg} ({e}); using 1.0 AU", stacklevel=2)
         return 1.0
     return float(np.linalg.norm(v) / AU_KM)
-
-
-def write_envi(da, fout):
-    """Write dataarray cube to fout using rasterio."""
-
-    wls = [f"{wl:.2f}" for wl in da.wl]
-    nz, ny, nx = da.shape
-    transform = da.rio.transform
-
-    with rasterio.open(
-        fout,
-        "w",
-        driver="ENVI",
-        height=ny,
-        width=nx,
-        count=nz,
-        dtype=da.dtype,
-        transform=transform,
-        crs=da.rio.crs if da.rio.crs else None,
-    ) as dst:
-        for i in range(nz):
-            dst.write(da.isel(band=i).values, i + 1)
-            dst.set_band_description(i + 1, wls[i])
-            # TODO fix wavelength metadata
 
 
 ## ENVI BIL streaming writer
