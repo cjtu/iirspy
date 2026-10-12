@@ -318,7 +318,7 @@ def build_l1(
     calibration settings into the same `ftif_out` never returns the other run's cube. A cached
     file with no recorded `calibrate_kwargs` (written before this check existed) is treated as
     unknown, not as "assume production defaults", and rebuilt once to backfill the tag. `chunk_y`
-    is the dask y-chunk the cube is read and written in, and so also the write/resume block size.
+    is the dask y-chunk the cube is read and written in, and so also the write block size.
 
     keep_raw : bool
         Skip deleting the extracted raw `.qub`/`.hdr` after calibration. Default False (production
@@ -370,7 +370,7 @@ def build_l1(
     with phase("staging"):
         raw_qub = _stage_inputs(day, bands)
 
-    # `chunk_y` sets both the dask y-chunk and, through `_row_block`, the write/resume block.
+    # `chunk_y` sets both the dask y-chunk and, through `_row_block`, the write block.
     with phase("L0 read + calibrate (graph build; the compute lands in the write)"):
         l1 = L0(SID, STAGE, chunk={"band": -1, "y": chunk_y, "x": -1}).calibrate(**effective_calibrate_kws)
     # l1.img already holds exactly `bands` -- that's what _stage_inputs staged.
@@ -1202,7 +1202,7 @@ def _parser():
         "--chunk-y",
         type=int,
         default=int(os.environ.get("IIRS_CHUNK_Y", 1024)),
-        help="dask y-chunk for the L1 read/calibrate/write, and so the write/resume block size "
+        help="dask y-chunk for the L1 read/calibrate/write, and so the write block size "
         "(env IIRS_CHUNK_Y; default 1024 rows)",
     )
     ap.add_argument(
