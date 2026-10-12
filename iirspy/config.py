@@ -110,6 +110,8 @@ class L2Config(_Config):
         thermal_eps: Emissivity, used both to estimate T and to remove eps * B(T).
         thermal_bands: (first, last) IIRS band numbers, 1-indexed and inclusive, whose mean
             brightness temperature is T.
+        thermal_t_min: T [K] at or below which (or NaN) a pixel's T falls back to the flat-surface
+            equilibrium temperature at its incidence (`utils.flat_surface_temperature`).
         clip_negative: Zero negative thermal-removed radiance before polish.
         polish: Per-band divisor: None, "verma2022", "issdc_empirical", or a csv path with `band`
             and `polish` columns. Mapped by band number; bands the table lacks get 1.0.
@@ -127,6 +129,7 @@ class L2Config(_Config):
     thermal: str = "none"
     thermal_eps: float = 1.0
     thermal_bands: tuple[int, int] = (227, 247)
+    thermal_t_min: float = 0.0
     clip_negative: bool = False
     polish: str | None = None
     photom: str | Callable = "lambert"
@@ -186,6 +189,7 @@ L2Config.PRESETS = {
         "sdist": "none",
         "thermal": "isothermal",
         "thermal_eps": 0.95,
+        "thermal_bands": (225, 246),
         "clip_negative": True,
         "polish": "verma2022",
         "use_slope_az": False,
