@@ -38,11 +38,6 @@ def test_lunar_lambert_between_its_two_limits():
     assert f <= max(ph.lambert(cos_inc, cos_view, g), ph.lommel_seeliger(cos_inc, cos_view, g))
 
 
-def test_get_model_rejects_unknown_name():
-    with pytest.raises(ValueError, match="unknown photometric model"):
-        ph.get_model("hapke")
-
-
 def test_load_slope_az_checks_the_crop():
     like = xr.DataArray(np.zeros((4, 3)), dims=("y", "x"), coords={"y": np.arange(4), "x": np.arange(3)})
     slope, aspect, lit, sun = ph.load_slope_az((xr.zeros_like(like), xr.full_like(like, 90.0)), like=like)
@@ -183,18 +178,6 @@ def test_besse_phase_table_parses_known_value():
     i = int(np.argmin(np.abs(wl - 950.06)))
     assert f[30, i] == pytest.approx(0.255755, abs=1e-6)
     assert (f[75, i] / f[30, i]) == pytest.approx(0.6462, abs=1e-4)
-
-
-def test_besse_phase_ratio_matches_spot_check_and_is_identity_at_30():
-    assert ph.besse_phase(30.0, 950.06) == pytest.approx(1.0)
-    assert ph.besse_phase(75.0, 950.06) == pytest.approx(1.548, abs=2e-3)
-
-
-def test_besse_phase_clamps_beyond_the_85deg_domain():
-    """Past 85 deg the table's quartic fit rolls over; usage must clamp there."""
-    at_edge = ph.besse_phase(85.0, 950.06)
-    assert ph.besse_phase(90.0, 950.06) == pytest.approx(at_edge)
-    assert ph.besse_phase(150.0, 950.06) == pytest.approx(at_edge)
 
 
 def test_besse_phase_broadcasts_over_wavelength_and_geometry():

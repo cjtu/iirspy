@@ -207,13 +207,11 @@ def slope_az_from_dem(dem):
     return xr.DataArray(slope, coords=dem.coords, dims=dem.dims), xr.DataArray(aspect, coords=dem.coords, dims=dem.dims)
 
 
-def photometric_factor(
-    cos_inc, solar_inc, sun_az, slope_az=None, like=None, photom="lambert", cos_min=0.0, min_lit=0.9
-):
+def photometric_factor(solar_inc, sun_az, slope_az=None, like=None, photom="lambert", cos_min=0.0, min_lit=0.9):
     """(factor, g, floor fractions): the disk function times the lit fraction, NaN where unlit.
 
-    Without `slope_az` the surface is the flat local horizontal: `cos_inc` as given, nadir view,
-    phase = incidence. With it, cosines are local to each facet, using the product's own sun when
+    Without `slope_az` the surface is the flat local horizontal at incidence `solar_inc` [deg], nadir
+    view, phase = incidence. With it, cosines are local to each facet, using the product's own sun when
     it records one, else (`sun_az`, 90 - `solar_inc`). `cos_min` floors cos_inc and cos_view
     before the model (clamped, not nulled); the fraction of pixels below it is returned as
     {"cos_inc_floor_frac", "cos_view_floor_frac"}. Pixels lit less than `min_lit` (from the
@@ -227,8 +225,8 @@ def photometric_factor(
         az, elev = sun if sun is not None else (sun_az, 90 - solar_inc)
         cos_inc, cos_view, g = local_angles(slope, aspect, az, elev)
     else:
-        inc_deg = np.degrees(np.arccos(np.clip(cos_inc, -1.0, 1.0)))
-        cos_inc, cos_view, g = cos_inc, xr.ones_like(cos_inc), phase_angle(sun_az, 90 - inc_deg)
+        cos_inc = np.cos(np.radians(solar_inc))
+        cos_view, g = xr.ones_like(cos_inc), phase_angle(sun_az, 90 - solar_inc)
     floors = {"cos_inc_floor_frac": 0.0, "cos_view_floor_frac": 0.0}
     if cos_min > 0.0:
         floors["cos_inc_floor_frac"] = float(np.asarray(cos_inc < cos_min).mean())

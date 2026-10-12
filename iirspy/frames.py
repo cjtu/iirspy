@@ -128,8 +128,7 @@ def _window_levels(rows, g, ref):
 
 def _soft_step(corr, a, b):
     """Index where level a before and level b after score highest together."""
-    ca, cb = corr[:, a + K], corr[:, b + K]
-    return int(np.argmax(np.r_[0, np.cumsum(ca)] + np.r_[np.cumsum(cb[::-1])[::-1], 0]))
+    return int(np.argmax(_step_scores(corr, a, b)))
 
 
 def _levels(a, b):
@@ -137,13 +136,13 @@ def _levels(a, b):
     return list(range(a + step, b + step, step))
 
 
-def detect(rows, prof, passes=3):
+def detect(rows, passes=3):
     """Per-group events [(line, group, delta)]; line 0 is the starting lag, delta None where it is undetermined.
 
     Re-runs on the re-timed rows until no residual step is left.
     """
     nl = rows.shape[1]
-    ev, _ = _detect_once(rows)
+    ev = _detect_once(rows)
     for _ in range(passes - 1):
         lag = lag_table(ev, nl)
         fr = np.zeros_like(rows)
@@ -151,7 +150,7 @@ def detect(rows, prof, passes=3):
             f = np.arange(nl) + lag[g]
             ok = (f >= 0) & (f < nl)
             fr[g, f[ok]] = rows[g, ok]
-        new, _ = _detect_once(fr, starts_known=True)
+        new = _detect_once(fr, starts_known=True)
         new = [(int(y - lag[g, min(y, nl - 1)]), g, d) for y, g, d in new if y > 0 and d]
         if not new:
             break
@@ -193,8 +192,8 @@ def _detect_once(rows, starts_known=False):
                 cur += k
         rel[g] = ev
     if starts_known:
-        return sorted((y, g, d) for g, ev in rel.items() for y, d in ev), refs
-    return _assemble(rows, refs, rel, starts), refs
+        return sorted((y, g, d) for g, ev in rel.items() for y, d in ev)
+    return _assemble(rows, refs, rel, starts)
 
 
 def _delta(rows, g, ref, y, tol=3, half=400):
@@ -321,7 +320,7 @@ def build_table(src, fcsv) -> Path:
     The write is atomic, so tasks racing on one strip never read a partial table.
     """
     rows, prof, dup, zero = scan(src)
-    events = detect(rows, prof)
+    events = detect(rows)
     lines = ["kind,line,group,bands,value"]
     lines += [f"{'start' if y == 0 else 'drop'},{y},{g},{4 * g + 1}-{4 * g + 4},{d}" for y, g, d in events]
     lines += [f"{k},{y},{g},{4 * g + 1}-{4 * g + 4},{n}" for k, y, g, n in _fills(dup, zero, prof)]

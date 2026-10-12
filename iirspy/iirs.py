@@ -1,7 +1,6 @@
 import json
 import warnings
 from abc import ABC, abstractmethod
-from importlib import metadata
 from pathlib import Path
 
 import numpy as np
@@ -109,11 +108,6 @@ def _in_wl_ranges(wl, ranges):
     return hit
 
 
-def _narrow_bands(rad, output_bands):
-    """`rad` restricted to `output_bands`, or `rad` unchanged if `output_bands` is None."""
-    return rad if output_bands is None else rad.sel(band=output_bands)
-
-
 def _expand_to_full_bands(da):
     """Reindex `da`'s band dim onto the full 1..256 IIRS range, NaN-filling any band not present.
 
@@ -144,21 +138,6 @@ def _retime(rad, fix, frame_offsets, qub):
                 warnings.warn(f"fix_frames skipped: {e}", UserWarning, stacklevel=3)
                 return rad, None
     return frames.apply(rad, frame_offsets)
-
-
-def _attach_empirical_frames(rad, dark, flat, smile, attach):
-    """Attach dark/flat/smile as (band, x) coords on `rad` when `attach`, for save()'s sidecar.
-
-    dark is (x,)-only zeros when no shadow was found; broadcast to flat's (band, x) so all three
-    sidecar frames share one shape.
-    """
-    if not attach:
-        return rad
-    return rad.assign_coords(
-        empirical_dark=(("band", "x"), dark.broadcast_like(flat).values),
-        empirical_flat=(("band", "x"), flat.values),
-        empirical_smile=(("band", "x"), smile.values),
-    )
 
 
 def _write_camera_product(da, fout, row_block=None, compress="ZSTD", predictor=None):
@@ -372,18 +351,14 @@ class IIRSData(ABC):
         if empirical_sidecar and "empirical_flat" in self.img.coords:
             self._save_empirical_sidecar(fout)
         img = _expand_to_full_bands(self.img) if full_bands else self.img
-        return self._write(img, fout, sub_rows)
-
-    def _write(self, da, fout, row_block=None, compress="ZSTD", predictor=None):
-        """Format dispatch for any camera-space product: `.tif` -> GeoTIFF, else ENVI BIL."""
-        return _write_camera_product(da, fout, row_block, compress=compress, predictor=predictor)
+        return _write_camera_product(img, fout, sub_rows)
 
     def _save_snr_sidecar(self, fout, row_block=None):
         """Write the (y, x) empirical broadband SNR field beside fout, in fout's own format."""
         snr = self.img.snr.reset_coords(drop=True).expand_dims(band=[1]).astype("float32")
         snr.attrs = {"name": "SNR", "units": ""}
         f = Path(fout)
-        return self._write(snr, f.with_name(f.stem + "_snr" + f.suffix), row_block)
+        return _write_camera_product(snr, f.with_name(f.stem + "_snr" + f.suffix), row_block)
 
     def _save_empirical_sidecar(self, fout):
         """Write the (band, x) empirical dark/flat/smile frames beside fout as one .npz."""
@@ -448,7 +423,7 @@ class IIRSData(ABC):
         return utils.detect_stripes(self.img, sigma_threshold)
 
     def apply_smoothing(self, **kwargs):
-        return utils.apply_smoothing(**kwargs)
+        return utils.apply_smoothing(self.img, **kwargs)
 
 
 class L0(IIRSData):
@@ -547,12 +522,9 @@ class L0(IIRSData):
             Radiance [W/m^2/sr/um], with the config as json in `attrs["l1_config"]`.
         """
         cfg = L1Config.resolve(config, **overrides)
-        empirical, interp_bands, interp_spatial = cfg.empirical, cfg.interp_bands, cfg.interp_spatial
-        attach_snr, attach_empirical_frames = cfg.attach_snr, cfg.attach_empirical_frames
-        bad_pixel_mask, exclude_wl = cfg.bad_pixel_mask, cfg.exclude_wl
         gain, offset = utils.get_gain_offset(self.qub, calib_dir=calib_dir)
 
-        if empirical:
+        if cfg.empirical:
             # Empirical correction: LUT gives per-band absolute scale, flat/smile handle cross-track
             ref_flat = utils.load_reference_flat(self.qub, calib_dir=calib_dir)
             dark, flat, smile, snr, emp_notes = empirical_frames(self.img, ref_flat, **(empirical_kws or {}))
@@ -561,29 +533,34 @@ class L0(IIRSData):
             if snr is not None:
                 # Shadow scene: the in-scene zero anchors the zero point, so drop the LUT offset
                 rad = 10 * gain_med * (self.img - dark) / fs
-                if attach_snr:
+                if cfg.attach_snr:
                     rad = rad.assign_coords(snr=(("y", "x"), snr.values))
             else:
                 # No zero reference: the lab offset is the only zero-point info, so keep it
                 rad = 10 * (gain_med * self.img / fs + offset_med)
-            rad = _attach_empirical_frames(rad, dark, flat, smile, attach_empirical_frames)
+            if cfg.attach_empirical_frames:
+                # dark is (x,)-only zeros when no shadow was found; broadcast so all three frames share a shape
+                rad = rad.assign_coords(
+                    empirical_dark=(("band", "x"), dark.broadcast_like(flat).values),
+                    empirical_flat=(("band", "x"), flat.values),
+                    empirical_smile=(("band", "x"), smile.values),
+                )
         else:
             # Apply per-element gain and offset to convert DN -> Radiance
             rad = 10 * (self.img * gain + offset)  # [mW/cm^2/sr/μm] -> [W/m^2/sr/um]
 
         # Narrow to the requested output bands before the mask/interpolate stage below -- the
         # empirical frames above already saw every band `self.img` holds, so this can't affect them.
-        rad = _narrow_bands(rad, output_bands)
+        rad = rad if output_bands is None else rad.sel(band=output_bands)
 
         # Re-time each 4-band group onto true frames; its lost frames go NaN until `fill_frames`
         rad, lost = _retime(rad, cfg.fix_frames, frame_offsets, self.qub)
 
         # Drop OSF and invalid bands, plus any caller-supplied wavelength ranges. interp if specified
-        rad = rad.where(~(rad.band.isin((*utils.OSF, *utils.INVALID)) | _in_wl_ranges(rad.wl, exclude_wl)))
+        rad = rad.where(~(rad.band.isin((*utils.OSF, *utils.INVALID)) | _in_wl_ranges(rad.wl, cfg.exclude_wl)))
 
         # Drop known bad detector elements (x, bands)
-        if bad_pixel_mask is True:  # Load default bad pixel mask
-            bad_pixel_mask = utils.load_bad_pixel_mask()
+        bad_pixel_mask = utils.load_bad_pixel_mask() if cfg.bad_pixel_mask is True else cfg.bad_pixel_mask
         if bad_pixel_mask is not False:  # Apply user-supplied mask
             rad = rad.where(~bad_pixel_mask)
 
@@ -594,12 +571,12 @@ class L0(IIRSData):
         rad = frames.fill(rad, lost) if lost is not None and cfg.fill_frames else rad
 
         # Interpolate across bands
-        if interp_bands is not None:
-            rad = rad.interpolate_na("band", max_gap=6, keep_attrs=True, method=interp_bands)
+        if cfg.interp_bands is not None:
+            rad = rad.interpolate_na("band", max_gap=6, keep_attrs=True, method=cfg.interp_bands)
 
         # Fill single-column all-band NaN gaps across x (max_gap=2 in 0.5-based x coords spans
         # exactly one missing column; wider seams and edge columns have no bounded gap to fill)
-        if interp_spatial:
+        if cfg.interp_spatial:
             rad = rad.interpolate_na("x", max_gap=2, keep_attrs=True, method="linear")
 
         # Format and output Radiance DataArray (float32: gain/offset LUTs are float32, keep graph float32)
@@ -607,13 +584,10 @@ class L0(IIRSData):
         out.name = "Radiance [W/m^2/sr/µm]"
         out.attrs["name"] = "Radiance"
         out.attrs["units"] = "W/m^2/sr/um"
-        out.attrs["calibration_source"] = "empirical" if empirical else "user"
-        try:
-            out.attrs["iirspy_version"] = metadata.version("iirspy")
-        except metadata.PackageNotFoundError:  # not pip-installed (source tree)
-            out.attrs["iirspy_version"] = "0+source"
+        out.attrs["calibration_source"] = "empirical" if cfg.empirical else "user"
+        out.attrs["iirspy_version"] = utils.IIRSPY_VERSION
         out.attrs["l1_config"] = json.dumps(cfg.to_attrs())
-        if empirical:
+        if cfg.empirical:
             out.attrs["empirical_notes"] = json.dumps(emp_notes)  # provenance: how the product was made
 
         return out
@@ -1011,7 +985,6 @@ class L2(IIRSData):
         """
         slope_az = slope_az if cfg.use_slope_az else None
         inc = (rad.solar_inc if inc is None else inc) * xr.ones_like(rad.isel(x=0, band=0, drop=True))
-        cos_inc = np.cos(np.radians(inc))
 
         sdist = _sun_distance(cfg, qub_path)
         solar_flux = _solar_flux(cfg, sdist, qub_path)
@@ -1024,7 +997,6 @@ class L2(IIRSData):
 
         sun_az = (rad.solar_az if "solar_az" in rad.coords else 0.0) + sun_az_offset
         photfn, g, floors = photometry.photometric_factor(
-            cos_inc,
             inc,
             sun_az,
             slope_az,
@@ -1051,16 +1023,15 @@ class L2(IIRSData):
         refl.attrs["name"] = "Reflectance"
         refl.attrs["units"] = ""
 
-        inc_deg = np.degrees(np.arccos(np.clip(cos_inc, -1.0, 1.0)))
         refl.attrs["l2_config"] = json.dumps(cfg.to_attrs())
         refl.attrs.update(
             **floors,
             sun_az_offset=sun_az_offset,
             slope_az_used=slope_az is not None,
             solar_distance_au=sdist,
-            inc_min_deg=float(inc_deg.min()),
-            inc_max_deg=float(inc_deg.max()),
-            inc_mean_deg=float(inc_deg.mean()),
+            inc_min_deg=float(inc.min()),
+            inc_max_deg=float(inc.max()),
+            inc_mean_deg=float(inc.mean()),
         )
         return refl
 
