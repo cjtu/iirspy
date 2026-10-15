@@ -400,6 +400,17 @@ def build_l1(
     return ftif_out, int(ymin), lat_range
 
 
+def _write_reversed_csv(fgeom: Path) -> Path:
+    """`fgeom` with Scan renumbered max - Scan, in the recal tree where `ck.ancillary` prefers it."""
+    df = utils.read_geom_csv(fgeom)
+    df["Scan"] = df["Scan"].max() - df["Scan"]
+    dst = ck.recal_dir(SID) / fgeom.name
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    df.sort_values(["Scan", "Pixel"]).to_csv(dst, index=False, float_format="%.9g")
+    log(f"csv Scan runs against time (matches SPICE only reversed): using {dst}")
+    return dst
+
+
 def frame_offsets_path(sid: str, dest: Path | None = None) -> Path:
     """`sid`'s frame table: one per strip, beside its GCPs and `_L1_b*.tif` in `dest` (default `ck.recal_dir`)."""
     return Path(dest or ck.recal_dir(sid)) / f"{sid}_frames_offsets.csv"
@@ -1327,7 +1338,7 @@ def _open_run(out: str | None, step: str = "solve") -> None:
 def main(argv: list[str] | None = None) -> None:
 
     from iirspy import georef
-    from iirspy.georef import read_band
+    from iirspy.georef import read_band, scan_order_reversed
 
     args = _parser().parse_args(argv)
 
@@ -1376,6 +1387,9 @@ def main(argv: list[str] | None = None) -> None:
     ny, nx = band.shape
     del band
     log(f"L1 cube ({GROUP} group, lat {lat_range}): {ny} rows x {nx} cols, scan0={scan0}")
+
+    if scan_order_reversed(fgeom, flabel, ck.kernels(SID[:8])):
+        fgeom = _write_reversed_csv(fgeom)
 
     chunks = _plan_group_chunks(fgeom, scan0, ny, args.chunks, cfg0.niter)
 

@@ -425,6 +425,41 @@ def sun_geometry(fgeom, flabel, cfg, kernels=None):
     return float(az_grid), float(el), float(r_sun)
 
 
+def scan_order_reversed(fgeom, flabel, kernels=None) -> bool:
+    """Whether the csv's `Scan` runs against time: Scan 0 is the end of the pass.
+
+    Compares the csv's central line with SPICE's nadir track at the label times, as is and with Scan reversed.
+    Reversed when that fit is within the 20 km coarse capture and under half the forward misfit. A scene whose
+    SPK is off (both misfits km-scale) is never called reversed.
+    """
+    import spiceypy as sp
+
+    for k in kernels or []:
+        sp.furnsh(str(k))
+    df = utils.read_geom_csv(fgeom)
+    c = (
+        df[df.Pixel.isin(sorted(df.Pixel.unique())[2:4])]
+        .groupby("Scan")[["Longitude", "Latitude"]]
+        .mean()
+        .reset_index()
+    )
+    c = c.iloc[np.linspace(0, len(c) - 1, min(len(c), 40)).astype(int)]
+    lo, la = np.radians(c.Longitude.to_numpy()), np.radians(c.Latitude.to_numpy())
+    u = np.c_[np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)]
+    scans = c.Scan.to_numpy()
+
+    def misfit_km(at):
+        n = np.array([
+            sp.subpnt("NEAR POINT/ELLIPSOID", "MOON", sp.str2et(t), "IAU_MOON", "NONE", "-152")[0]
+            for t in utils.scan_utc(flabel, at)
+        ])
+        n /= np.linalg.norm(n, axis=1, keepdims=True)
+        return float(np.median(MOON_RADIUS_M / 1e3 * np.arccos(np.clip(np.sum(u * n, axis=1), -1, 1))))
+
+    fwd, rev = misfit_km(scans), misfit_km(df.Scan.max() - scans)
+    return bool(rev < fwd / 2 and rev < 20.0)
+
+
 def sun_geometry_rows(gcps, shape, flabel, cfg, scan0, kernels=None):
     """(az_grid, elev) at every camera *pixel*. Exact sun angle on the solved geometry.
 
