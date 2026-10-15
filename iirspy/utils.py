@@ -85,8 +85,8 @@ def flat_surface_temperature(inc, sdist=1.0, s0=1370.0, eps=0.95, a0=0.08, a=0.0
     Vasavada, A. R., et al. (2012). Lunar equatorial surface temperatures and regolith properties from the
     Diviner Lunar Radiometer Experiment. JGR Planets, 117, E00H18.
 
-    >>> [round(float(flat_surface_temperature(i)), 1) for i in (0, 60, 90)]
-    [391.1, 318.4, 0.0]
+    >>> tuple(round(float(flat_surface_temperature(i)), 1) for i in (0, 60, 90))
+    (391.1, 318.4, 0.0)
     """
     albedo = a0 + a * (inc / 45) ** 3 + b * (inc / 90) ** 8
     cos_i = np.clip(np.cos(np.radians(inc)), 0, None)
