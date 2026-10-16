@@ -97,8 +97,8 @@ class L1Config(_Config):
 class L2Config(_Config):
     """L1 radiance -> L2 reflectance choices (see `L2._compute_reflectance`).
 
-    Steps run in order: solar flux, thermal removal, clip, polish, photometric normalization,
-    Besse phase, spectral smoothing.
+    Steps run in order: solar flux, thermal removal, polish, photometric normalization,
+    Besse phase, spectral smoothing, clip.
 
     Attributes:
         flux: Solar spectrum. "pradan" (the PRADAN flux file), "noaa_cdr_mean" (NOAA SSI CDR v03,
@@ -112,7 +112,7 @@ class L2Config(_Config):
             brightness temperature is T.
         thermal_t_min: T [K] at or below which (or NaN) a pixel's T falls back to the flat-surface
             equilibrium temperature at its incidence (`utils.flat_surface_temperature`).
-        clip_negative: Zero negative thermal-removed radiance before polish.
+        clip_negative: Zero negative reflectance as the last step, after smoothing.
         polish: Per-band divisor: None, "verma2022", "issdc_empirical", or a csv path with `band`
             and `polish` columns. Mapped by band number; bands the table lacks get 1.0.
         photom: Disk function, a `photometry.MODELS` key or any f(cos_inc, cos_view, g) callable.
@@ -196,3 +196,5 @@ L2Config.PRESETS = {
         "smoothing": 3,
     },
 }
+# Same L2 params as "issdc"; `iirs-compute-refl` reads the ISSDC nci L1 for this name instead of calibrating nri.
+L2Config.PRESETS["issdc-nci"] = L2Config.PRESETS["issdc"]

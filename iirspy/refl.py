@@ -7,7 +7,9 @@ group's CRS. No re-registration -- if the scene isn't solved yet, this refuses t
     iirs-compute-refl <sid> --group south|north|equatorial [--out WORKDIR] [--keep DIR]
         [--keep-l1 DIR] [--clean] [--gcps PATH] [--l2 PRESET] [--l2-<field> VALUE ...]
 
-`--l2` picks an `iirspy.config.L2Config` preset (default iirspy); each `--l2-<field>` overrides one
+`--l2` picks an `iirspy.config.L2Config` preset (default iirspy); `issdc-nci` is the `issdc` L2 on ISSDC's own
+L1 (the nci cube under `IIRS_ARCHIVE/zips/nci`, unzipped into the archive's ISSDC tree on first use) instead of our
+nri calibration -- same GCPs, GLT and OBS. Each `--l2-<field>` overrides one
 `L2Config` field, e.g. `--l2-photom lunar_lambert --l2-cos-min 0.0872 --l2-thermal none`. Values
 parse as JSON (`--l2-thermal-bands [225,246]`, `--l2-polish null`), else as a string.
 `--l2-use-slope-az false` skips rendering the DEM slope/aspect product.
@@ -28,6 +30,9 @@ import sys
 import time
 from dataclasses import fields, replace
 from pathlib import Path
+
+import numpy as np
+import xarray as xr
 
 from iirspy import chunks as ck
 from iirspy import solve
@@ -199,8 +204,10 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
     solve.log(f"aoi from {len(gcps)} merged gcps: {[round(v / 1000, 1) for v in aoi]} km")
 
     bands = _full_bands()
-    ftif, scan0, lat_range = solve.build_l1(lat_range, bands, solve._work("l1_rad.tif"))
-    solve.log(f"L1 built: {ftif} ({len(bands)} bands), scan0={scan0}")
+    nci = args.l2 == "issdc-nci"
+    build = solve.build_l1_nci if nci else solve.build_l1
+    ftif, scan0, lat_range = build(lat_range, bands, solve._work("l1_rad.tif"))
+    solve.log(f"L1 built ({'ISSDC nci' if nci else 'iirspy'}): {ftif} ({len(bands)} bands), scan0={scan0}")
 
     anc = ck.ancillary(sid)
     fgeom, flabel = anc["geometry/calibrated"], ck.label(sid, solve.STAGE)
@@ -210,7 +217,9 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
     az, elev, r_sun = georef.sun_geometry(fgeom, flabel, cfg, kernels)
     solve.log(f"sun (grid frame): az={az:.1f} elev={elev:.2f} r_sun={r_sun:.4f} deg")
 
-    l1 = L1.from_file(ftif, sid, str(solve.STAGE))
+    l1 = L1.from_file(ftif, sid, str(ck.ARCHIVE if nci else solve.STAGE))
+    if nci:
+        l1.img.attrs["calibration_source"] = "issdc"
     solve.log(_chunk_report(l1.img))
 
     l2cfg = args.l2_config
@@ -221,7 +230,13 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
     )
     solve.log(f"topo: {ftopo or 'skipped (--l2-use-slope-az false)'}")
 
-    l2 = l1.calibrate(l2cfg, slope_az=str(ftopo) if ftopo else None)
+    # No topo product to carry the per-pixel sun: give L2 the exact per-pixel incidence instead of the spm's one
+    # value per line, which misses the up-to-2% cross-track cos(i) change ISSDC's own L2 divides by.
+    inc = None
+    if not ftopo:
+        _, el = georef.sun_geometry_rows(gcps, l1.img.shape[-2:], flabel, cfg, scan0, kernels)
+        inc = xr.DataArray(90 - np.abs(el), dims=("y", "x"))
+    l2 = l1.calibrate(l2cfg, inc=inc, slope_az=str(ftopo) if ftopo else None)
     solve.log(f"L2 computed ({args.l2}: {json.dumps(l2cfg.to_attrs())})")
 
     # Camera space keeps one unblended spectrum per pixel; the GLT projects on demand and the
@@ -259,6 +274,7 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
         "lat_range": list(lat_range),
         "bands": bands,
         "l2_preset": args.l2,
+        "l1_source": "issdc-nci" if nci else "iirspy",
         "l2_config": l2cfg.to_attrs(),
         "topo": _topo_info(ftopo),
         "aoi_m": list(cfg.aoi),

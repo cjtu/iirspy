@@ -1119,8 +1119,8 @@ class L2(IIRSData):
     def _compute_reflectance(self, rad, qub_path, cfg, inc=None, slope_az=None, sun_az_offset=0.0):
         """I/F reflectance from radiance, with each step chosen by `cfg` (see `iirspy.config.L2Config`).
 
-        Steps, in order: solar flux at the scene's distance, thermal removal, clip, polish,
-        photometric normalization, Besse phase, spectral smoothing. Clip and polish are folded into
+        Steps, in order: solar flux at the scene's distance, thermal removal, polish,
+        photometric normalization, Besse phase, spectral smoothing, clip. Polish is folded into
         one division with the flux and photometric terms; all divisors are positive.
 
         Parameters
@@ -1169,14 +1169,16 @@ class L2(IIRSData):
         )
 
         num = rad - trad
-        if cfg.clip_negative:
-            num = num.clip(min=0)
         den = photfn * solar_flux
         if cfg.polish is not None:
             den = den * utils.spectral_polish(rad.band, POLISH.get(cfg.polish, cfg.polish))
         refl = num / den
         refl = photometry.besse_rescale(refl, cfg.photom, g, rad.wl) if cfg.phase else refl
         refl = utils.moving_average(refl, cfg.smoothing, cfg.smoothing_edges)
+        if (
+            cfg.clip_negative
+        ):  # last, like ISSDC's range validation: it zeroes pixels the smoothed spectrum leaves negative
+            refl = refl.clip(min=0)
         if "wl" not in refl.coords:
             refl = refl.assign_coords(wl=rad.wl)
         if temp is not None:

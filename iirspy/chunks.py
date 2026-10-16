@@ -285,6 +285,30 @@ def nri_zip(sid: str) -> Path | None:
     return hits[0] if hits else None
 
 
+NCI_MEMBERS = ("*.qub", "*.hdr", "*.xml", "*.csv", "*.spm", "*.oat", "*.oath", "*.lbr")
+
+
+def nci_zip(sid: str) -> Path | None:
+    """The nci (ISSDC L1) bundle for `sid` under `ARCHIVE/zips`, searched recursively."""
+    hits = sorted((ARCHIVE / "zips").rglob(f"ch2_iir_nci_{sid}_d_img_*.zip"))
+    return hits[0] if hits else None
+
+
+def ensure_nci(sid: str) -> Path:
+    """`sid`'s nci qub under `ARCHIVE/data/calibrated`, unzipping its bundle into the ISSDC tree under `ARCHIVE` first if absent."""
+    pat = f"data/calibrated/{sid[:8]}/ch2_iir_nci_{sid}_d_img_*.qub"
+    if found := _one(pat, [ARCHIVE]):
+        return found
+    if (fzip := nci_zip(sid)) is None:
+        raise FileNotFoundError(
+            f"no nci cube or zip for {sid} under {ARCHIVE} (zips/nci/ch2_iir_nci_{sid}_d_img_*.zip)"
+        )
+    utils.extract(fzip, ARCHIVE, include=NCI_MEMBERS, exclude=())
+    if not (found := _one(pat, [ARCHIVE])):
+        raise RuntimeError(f"{fzip} extracted, but no {pat} appeared under {ARCHIVE}")
+    return found
+
+
 def _nri_file(pat: str, sid: str, stage: Path | None) -> Path | None:
     """`pat` under `ANC_ROOTS`, then `stage`, else extracted (that file type only) from the nri zip into `stage`.
 
