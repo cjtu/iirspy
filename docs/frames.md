@@ -40,7 +40,7 @@ Overwrites and black stripes come from exact or near-exact row repeats and all-z
 
 ### Offsets table
 
-The table is `<sid>_frames_offsets.csv`, one per strip. `L0.calibrate_to_rad` with `fix_frames` builds it from the full cube on first use and caches it beside the `.qub`, or takes an existing table as `frame_offsets`. A band-subset cube cannot be scanned; pass a table built from the full cube or zip with `iirspy.frames.build_table`.
+The table is `<sid>_frames_offsets.csv`, one per strip. `L0.calibrate_to_rad` with `fix_frames` builds it from the full cube on first use and caches it beside the `.qub`, or takes an existing table as `frame_offsets`. A band-subset cube cannot be scanned; pass a table built from the full cube or zip with `iirspy.frames.build_table`. `iirs-solve-scene` keeps it beside the strip's GCPs and `_L1_b54.tif` in the geometry/recalibrated day directory, shared by all CRS groups.
 
 Table 1: Columns of `<sid>_frames_offsets.csv`.
 
@@ -95,4 +95,7 @@ Figure 6: Band 78 at line 26856 against reference band 118, same layout as Figur
 
 ## Pipeline behaviour
 
-- L1 from `calibrate_to_rad` with `fix_frames` is in true-frame coordinates. ISSDC products (`nri`, `nci`, `ndi`) still carry the defects.
+- `iirs-solve-scene` builds the table once per strip before any other processing if it is missing. It streams the `nri` zip with no staging, since the staged cube holds only the solve's bands, and caches the table. Every later task and CRS group reuses it.
+- A solve whose merged GCPs are older than the table is re-solved on the re-timed cube. The L1 cache and the per-chunk solve cache are keyed on the table's content hash. The chunk reference hillshades and WAC images do not depend on the cube and are reused from the work dir.
+- `iirs-compute-refl` refuses to run on GCPs that predate the table. Re-run the solve first.
+- GLT, LOC and L2 products are in true-frame coordinates. ISSDC products (`nri`, `nci`, `ndi`) still carry the defects.

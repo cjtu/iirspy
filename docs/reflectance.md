@@ -29,10 +29,10 @@ The steps run in this order. Band numbers are IIRS band numbers, 1-indexed.
 
 1. Solar flux: `flux` selects the solar spectrum and `sdist` scales it by the squared Sun distance.
 2. Thermal removal: `thermal`, `thermal_eps` (emissivity) and `thermal_bands`, the inclusive `(first, last)` band range whose mean brightness temperature is the pixel temperature. `thermal_eps * B(T)` is subtracted at every band.
-3. Clip: `clip_negative` sets negative thermal-removed radiance to zero.
-4. Polish: `polish` divides each band by a per-band factor, mapped by band number. Bands absent from the table get 1.0.
-5. Photometric normalization: `photom` is the disk function f(cos_inc, cos_view, g); `use_slope_az` applies a supplied terrain product; `cos_min` floors both cosines; `min_lit` nulls pixels less lit than it; `phase` rescales onto the Besse et al. (2013) 30° phase reference.
-6. Spectral smoothing: `smoothing` is the moving-average width in bands and `smoothing_edges` sets the end bands. `"pair"` (width 3 only) sets the first band to the mean of bands 2–3 and the last to the mean of the last two.
+3. Polish: `polish` divides each band by a per-band factor, mapped by band number. Bands absent from the table get 1.0.
+4. Photometric normalization: `photom` is the disk function f(cos_inc, cos_view, g); `use_slope_az` applies a supplied terrain product; `cos_min` floors both cosines; `min_lit` nulls pixels less lit than it; `phase` rescales onto the Besse et al. (2013) 30° phase reference.
+5. Spectral smoothing: `smoothing` is the moving-average width in bands and `smoothing_edges` sets the end bands. `"pair"` (width 3 only) sets the first band to the mean of bands 2–3 and the last to the mean of the last two.
+6. Clip: `clip_negative` sets negative reflectance to zero. It runs last, after smoothing, as range validation does in the ISSDC product. Past about 4.4 µm, where the signal is almost all thermal, this zeroes about half of the pixels of an ISSDC NDI band.
 
 Table 2: L2 presets. Unlisted fields keep the `L2Config` defaults.
 
@@ -42,13 +42,13 @@ Table 2: L2 presets. Unlisted fields keep the `L2Config` defaults.
 | `issdc` | `sdist="none"`, `thermal="isothermal"`, `clip_negative=True`, `polish="issdc_empirical"`, `use_slope_az=False`, `smoothing=3` | Reproduces the ISSDC PRADAN L2 reflectance product. |
 | `verma2022` | as `issdc`, but `thermal_eps=0.95`, `polish="verma2022"` | The Verma et al. (2022) thermal correction and polish. |
 
-The spectral polish of the `issdc` preset was inferred empirically from published ISSDC L2 products. On 9 windows from 3 scenes, `issdc` matches them to within 0.2% median over 750–2300 nm.
+The spectral polish of the `issdc` preset was inferred empirically from published ISSDC L2 products. On 9 windows from 3 scenes, `issdc` matches them to within 0.2% median over 750–2300 nm. Bands 172 and above (3.6–4.9 µm) were fitted from ISSDC NCI against NDI on five pixel-aligned scenes (hw1 and d18). For each band the polish is the sum of our reflectance divided by the sum of NDI's, over the pixels where both are positive, averaged over the scenes: 1.0 to 3.4 µm (so the existing table is consistent), 1.05–1.19 across 3.6–4.2 µm, 0.90 near 4.25 µm, and 1.3–1.6 at 4.4–4.6 µm. Above about 4.4 µm NDI is clipped to zero in half the pixels, so those values are biased by the positivity selection and are provisional; bands 172 and 251–256 had no estimate and take their nearest neighbour. The fit used the clip before the smoothing and should be refit now that the clip runs last.
 
 ### Per-scene inputs
 
 These are keyword arguments of `L1.calibrate`, not config fields, so they are not recorded in `l2_config`:
 
-- `inc`: solar incidence [deg], per line or per pixel. Default: the SPM file's per-line value.
+- `inc`: solar incidence [deg], per line or per pixel. Default: the SPM file's per-line value, which misses the up-to-2 % cross-track cos(i) change at high incidence. `iirs-compute-refl` passes the exact per-pixel value (solved GCPs plus SPICE) when no topo product is used.
 - `slope_az`: camera-space slope and aspect [deg], optionally with a lit fraction, on the cube's grid. It is a raster, a `(slope, aspect[, lit])` tuple or a Dataset (`photometry.load_slope_az`). Make one from a DEM already on the camera grid with `photometry.slope_az_from_dem`.
 - `sun_az_offset`: degrees added to the SPM solar azimuth to reach the grid-north frame of `slope_az`.
 
