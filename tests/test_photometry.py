@@ -130,6 +130,20 @@ def test_cos_min_floors_grazing_incidence_without_changing_default():
     )
 
 
+def test_inc_max_nulls_grazing_pixels_only_and_default_is_a_noop():
+    from iirspy.config import L2Config
+
+    rad = _synthetic_l1()
+    rad["solar_inc"] = ("y", np.array([80.0, 87.0, 80.0, 87.0]))
+    off = _refl(rad, min_lit=0.0)
+    np.testing.assert_array_equal(off.values, _refl(rad, min_lit=0.0, inc_max=90.0).values)
+    on = _refl(rad, min_lit=0.0, inc_max=85.0)
+    assert np.isnan(on.values[:, [1, 3]]).all() and np.isfinite(off.values).all()
+    np.testing.assert_array_equal(on.values[:, [0, 2]], off.values[:, [0, 2]])
+    assert on.attrs["inc_max_null_frac"] == 0.5 and off.attrs["inc_max_null_frac"] == 0.0
+    assert L2Config.preset("iirspy").inc_max == 85.0 and L2Config.preset("issdc").inc_max == 90.0
+
+
 def _cos_view_dependent_photom(cos_inc, cos_view, g):
     """cos_inc*cos_view -- unlike lambert/lommel_seeliger/lunar_lambert this actually diverges as cos_view -> 0,
     so it exercises what an emission floor is for even though none of the built-in models do."""

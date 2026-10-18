@@ -30,7 +30,7 @@ The steps run in this order. Band numbers are IIRS band numbers, 1-indexed.
 1. Solar flux: `flux` selects the solar spectrum and `sdist` scales it by the squared Sun distance.
 2. Thermal removal: `thermal`, `thermal_eps` (emissivity) and `thermal_bands`, the inclusive `(first, last)` band range whose mean brightness temperature is the pixel temperature. `thermal_eps * B(T)` is subtracted at every band.
 3. Polish: `polish` divides each band by a per-band factor, mapped by band number. Bands absent from the table get 1.0.
-4. Photometric normalization: `photom` is the disk function f(cos_inc, cos_view, g); `use_slope_az` applies a supplied terrain product; `cos_min` floors both cosines; `min_lit` nulls pixels less lit than it; `phase` rescales onto the Besse et al. (2013) 30° phase reference.
+4. Photometric normalization: `photom` is the disk function f(cos_inc, cos_view, g); `use_slope_az` applies a supplied terrain product; `cos_min` floors both cosines; `inc_max` nulls pixels whose local incidence exceeds it (the `iirspy` preset uses 85°, others 90° = off; `--l2-inc-max 90` restores the old behaviour); `min_lit` nulls pixels less lit than it; `phase` rescales onto the Besse et al. (2013) 30° phase reference.
 5. Spectral smoothing: `smoothing` is the moving-average width in bands and `smoothing_edges` sets the end bands. `"pair"` (width 3 only) sets the first band to the mean of bands 2–3 and the last to the mean of the last two.
 6. Clip: `clip_negative` sets negative reflectance to zero. It runs last, after smoothing, as range validation does in the ISSDC product. Past about 4.4 µm, where the signal is almost all thermal, this zeroes about half of the pixels of an ISSDC NDI band.
 
@@ -64,7 +64,7 @@ l2 = l1.calibrate(L2Config.preset("issdc", use_slope_az=True), slope_az=(slope, 
 ## Recorded metadata
 
 - `l1.img.attrs["l1_config"]` and `l2.img.attrs["l2_config"]` are JSON strings of every field. `L2Config(**json.loads(l2.img.attrs["l2_config"]))` rebuilds the config. A callable `photom` is recorded by function name only.
-- `l2.img.attrs` also holds the per-scene `L2.DIAGNOSTICS`: `solar_distance_au`, `inc_min_deg`, `inc_max_deg`, `inc_mean_deg`, `cos_inc_floor_frac`, `cos_view_floor_frac`, `slope_az_used` and `sun_az_offset`.
+- `l2.img.attrs` also holds the per-scene `L2.DIAGNOSTICS`: `solar_distance_au`, `inc_min_deg`, `inc_max_deg`, `inc_mean_deg`, `cos_inc_floor_frac`, `cos_view_floor_frac`, `inc_max_null_frac`, `slope_az_used` and `sun_az_offset`.
 - Coordinate `T` [K] is the per-pixel temperature when thermal removal is on.
 
 ## Data files
