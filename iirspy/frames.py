@@ -24,7 +24,7 @@ import numpy as np
 from scipy.ndimage import uniform_filter1d
 
 NG = 64
-K = 5  # max |offset| searched, lines
+K = 8  # max |offset| searched, lines (A12 20210723T2153218013 reaches +6)
 X0, X1, XBIN = 15, 235, 2  # cross-track span and binning of the matching rows
 HPX = 15  # cross-track high-pass window, px
 WIN = 1000  # pre-screen window, lines
@@ -269,7 +269,9 @@ def _joint(events, rows, refs, tol=6, half=80, slack=0.05):
             a, _ = _soft_level(c[: half - tol])
             b, _ = _soft_level(c[half + tol :])
             if a == b:
-                b = a + e[2]
+                b = int(np.clip(a + e[2], -K, K))  # offsets index corr columns, stay inside +-K
+                if b == a:
+                    b = int(np.clip(a - e[2], -K, K))
             scores[e] = _step_scores(c, a, b)
         kj = int(np.argmax(sum(scores.values())))
         for e, s in scores.items():

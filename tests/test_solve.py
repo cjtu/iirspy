@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from iirspy import solve
@@ -233,3 +234,13 @@ def test_keep_products_lands_only_what_is_new(tmp_path, monkeypatch):
     (out / "s_equatorial.gcps").write_text("re-solved")
     assert [f.name for f in solve.keep_products(out, dest)] == ["s_equatorial.gcps"]
     assert (dest / "s_equatorial.gcps").read_text() == "re-solved"
+
+
+def test_joint_clamps_synthesised_offset_at_search_edge():
+    from iirspy import frames
+
+    rng = np.random.default_rng(0)
+    rows = rng.random((2, 400, 8)).astype(np.float32)
+    rows[0, : -frames.K] = rows[1, frames.K :]  # group 0 sits at the +K edge everywhere
+    out = frames._joint([(200, 0, 1)], rows, {0: 1})
+    assert len(out) == 1 and out[0][1:] == (0, 1)
