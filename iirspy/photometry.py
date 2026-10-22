@@ -207,9 +207,7 @@ def slope_az_from_dem(dem):
     return xr.DataArray(slope, coords=dem.coords, dims=dem.dims), xr.DataArray(aspect, coords=dem.coords, dims=dem.dims)
 
 
-def photometric_factor(
-    solar_inc, sun_az, slope_az=None, like=None, photom="lambert", cos_min=0.0, min_lit=0.9, inc_max=90.0
-):
+def photometric_factor(solar_inc, sun_az, slope_az=None, like=None, photom="lambert", cos_min=0.0, min_lit=0.9):
     """(factor, g, floor fractions): the disk function times the lit fraction, NaN where unlit.
 
     Without `slope_az` the surface is the flat local horizontal at incidence `solar_inc` [deg], nadir
@@ -217,8 +215,7 @@ def photometric_factor(
     it records one, else (`sun_az`, 90 - `solar_inc`). `cos_min` floors cos_inc and cos_view
     before the model (clamped, not nulled); the fraction of pixels below it is returned as
     {"cos_inc_floor_frac", "cos_view_floor_frac"}. Pixels lit less than `min_lit` (from the
-    product's lit fraction) are nulled, as are those with local incidence above `inc_max` [deg]
-    (fraction returned as "inc_max_null_frac").
+    product's lit fraction) are nulled.
     """
     lit = 1.0
     if slope_az is not None:
@@ -230,10 +227,7 @@ def photometric_factor(
     else:
         cos_inc = np.cos(np.radians(solar_inc))
         cos_view, g = xr.ones_like(cos_inc), phase_angle(sun_az, 90 - solar_inc)
-    floors = {"cos_inc_floor_frac": 0.0, "cos_view_floor_frac": 0.0, "inc_max_null_frac": 0.0}
-    keep = cos_inc >= np.cos(np.radians(inc_max))  # before any cos_min clamp
-    if inc_max < 90.0:
-        floors["inc_max_null_frac"] = float(1 - np.asarray(keep).mean())
+    floors = {"cos_inc_floor_frac": 0.0, "cos_view_floor_frac": 0.0}
     if cos_min > 0.0:
         floors["cos_inc_floor_frac"] = float(np.asarray(cos_inc < cos_min).mean())
         cos_inc = cos_inc.clip(min=cos_min) if hasattr(cos_inc, "clip") else np.clip(cos_inc, cos_min, None)
@@ -243,8 +237,6 @@ def photometric_factor(
     factor = get_model(photom)(cos_inc, cos_view, g) * lit
     if min_lit > 0.0:
         factor = factor.where(np.asarray(lit) >= min_lit) if hasattr(factor, "where") else factor
-    if inc_max < 90.0 and hasattr(factor, "where"):
-        factor = factor.where(keep)
     factor = factor.where(factor > 0) if hasattr(factor, "where") else factor
     return factor, g, floors
 

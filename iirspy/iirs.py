@@ -1041,7 +1041,6 @@ class L2(IIRSData):
         "inc_mean_deg",
         "cos_inc_floor_frac",
         "cos_view_floor_frac",
-        "inc_max_null_frac",
         "slope_az_used",
         "sun_az_offset",
     )
@@ -1181,7 +1180,6 @@ class L2(IIRSData):
             photom=cfg.photom,
             cos_min=cfg.cos_min,
             min_lit=cfg.min_lit,
-            inc_max=cfg.inc_max,
         )
 
         num = rad - trad

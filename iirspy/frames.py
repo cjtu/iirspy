@@ -18,6 +18,7 @@ import os
 import re
 import warnings
 import zipfile
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -232,7 +233,7 @@ def _assemble(rows, refs, rel, starts, tol=3):  # noqa: C901
             if dec and sum(v == -1 for v in dec) > len(dec) / 2:
                 ref_drops[y] = dl
         sv = sorted([starts[g] for g in deps] + [0])
-        s0 = next(v for i, v in enumerate(sv) if i + 1 < len(sv) and sv[i + 1] == v) if len(sv) > 1 else 0
+        s0 = next((v for v, w in pairwise(sv) if v == w), 0)  # no shared start: anchor on the reference
         if s0:
             events.append((0, ref, -s0))
         events += [(y, ref, 1) for y in ref_drops]

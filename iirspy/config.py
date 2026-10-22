@@ -120,7 +120,6 @@ class L2Config(_Config):
         use_slope_az: Use the caller's `slope_az` terrain product when one is given.
         phase: Rescale onto Besse's 30 deg phase reference (`photometry.besse_phase`).
         cos_min: Floor on cos_inc and cos_view before the disk function (0 = none). Clamps.
-        inc_max: Null pixels whose local solar incidence exceeds this [deg] (90 = off). Nulls, unlike `cos_min`.
         min_lit: Null pixels with less than this lit fraction (needs `slope_az`).
         smoothing: Spectral moving-average width in bands (0 = off).
         smoothing_edges: End bands of the moving average (`utils.moving_average`).
@@ -139,12 +138,11 @@ class L2Config(_Config):
     use_slope_az: bool = True
     phase: bool = False
     cos_min: float = 0.0
-    inc_max: float = 90.0
     min_lit: float = 0.9
     smoothing: int = 0
     smoothing_edges: str = "pair"
 
-    def __post_init__(self):  # noqa: C901
+    def __post_init__(self):
         if isinstance(self.flux, Path):
             object.__setattr__(self, "flux", str(self.flux))
         elif not isinstance(self.flux, str):
@@ -159,8 +157,6 @@ class L2Config(_Config):
             raise ValueError(f"sdist {self.sdist!r}: not one of {SDIST} or a float")
         if self.thermal not in THERMAL:
             raise ValueError(f"thermal {self.thermal!r}: not one of {THERMAL}")
-        if not 0 < self.inc_max <= 90:
-            raise ValueError(f"inc_max {self.inc_max!r}: must be in (0, 90]")
         if self.smoothing_edges not in SMOOTHING_EDGES:
             raise ValueError(f"smoothing_edges {self.smoothing_edges!r}: not one of {SMOOTHING_EDGES}")
         if self.smoothing > 1 and self.smoothing_edges == "pair" and self.smoothing != 3:
@@ -181,7 +177,7 @@ L1Config.PRESETS = {
 }
 
 L2Config.PRESETS = {
-    "iirspy": {"thermal": "isothermal", "photom": "lambert", "inc_max": 85.0},
+    "iirspy": {"thermal": "isothermal", "photom": "lambert"},
     "issdc": {
         "sdist": "none",
         "thermal": "isothermal",
@@ -203,5 +199,5 @@ L2Config.PRESETS = {
         "smoothing": 3,
     },
 }
-# "issdc" L2 plus the grazing-incidence null; `iirs-compute-refl` reads the ISSDC nci L1 for this name instead of calibrating nri.
-L2Config.PRESETS["issdc-nci"] = {**L2Config.PRESETS["issdc"], "inc_max": 85.0}
+# Same L2 params as "issdc"; `iirs-compute-refl` reads the ISSDC nci L1 for this name instead of calibrating nri.
+L2Config.PRESETS["issdc-nci"] = L2Config.PRESETS["issdc"]
