@@ -396,6 +396,20 @@ class IIRSData(ABC):
         img = _expand_to_full_bands(self.img) if full_bands else self.img
         return _write_camera_product(img, fout, sub_rows)
 
+    def fix_frames(self, fcsv, fill=False):
+        """Move each 4-band group onto true frames and NaN its lost ones, or with `fill` rebuild them.
+
+        `fcsv` is the strip's frame table (`frames.build_table`), derived from the nri or nci cube, never an ndi.
+        """
+        if self.img.attrs.get("frames_fixed"):
+            raise ValueError(f"{self.basename}: frames already fixed")
+        if not Path(fcsv).exists():
+            raise FileNotFoundError(f"no frame table {fcsv}: build it from the nri (L0) or nci (L1) cube first")
+        attrs = dict(self.img.attrs)
+        img, lost = frames.apply(self.img, fcsv)
+        self.img = frames.fill(img, lost) if fill else img
+        self.img.attrs.update(attrs, frames_fixed=1, frames_filled=int(fill))
+
     def _save_snr_sidecar(self, fout, row_block=None):
         """Write the (y, x) empirical broadband SNR field beside fout, in fout's own format."""
         snr = self.img.snr.reset_coords(drop=True).expand_dims(band=[1]).astype("float32")
@@ -1181,6 +1195,8 @@ class L2(IIRSData):
             cfg.clip_negative
         ):  # last, like ISSDC's range validation: it zeroes pixels the smoothed spectrum leaves negative
             refl = refl.clip(min=0)
+        if cfg.fill_nan is not None:
+            refl = refl.fillna(cfg.fill_nan)
         if "wl" not in refl.coords:
             refl = refl.assign_coords(wl=rad.wl)
         if temp is not None:

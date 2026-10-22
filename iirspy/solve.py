@@ -401,16 +401,23 @@ def build_l1(
 
 
 def build_l1_nci(
-    lat_range: tuple[float, float], bands: list[int], ftif_out: Path, chunk_y: int = 1024
+    lat_range: tuple[float, float],
+    bands: list[int],
+    ftif_out: Path,
+    chunk_y: int = 1024,
+    fix_frames: bool = False,
+    fill_frames: bool = False,
 ) -> tuple[Path, int, tuple[float, float]]:
     """`build_l1`'s counterpart for ISSDC's own L1: the nci cube, cropped to `lat_range`, written in the same
     layout (native radiance units, `bands` only, `.meta.json` beside it) so everything after it is shared.
 
-    The cube is unzipped into the ISSDC tree under `ck.ARCHIVE` if needed (`ck.ensure_nci`). No empirical dark/flat,
-    no band or frame repair: ISSDC's calibration as shipped. Returns the L1 path, row 0's `Scan` and `lat_range`.
+    The cube is unzipped into the ISSDC tree under `ck.ARCHIVE` if needed (`ck.ensure_nci`). No empirical dark/flat
+    or band repair: ISSDC's calibration as shipped, plus `IIRSData.fix_frames` with `FRAMES` if asked (`fill_frames`
+    implies `fix_frames`). Returns the L1 path, row 0's `Scan` and `lat_range`.
     """
     from iirspy import L1
 
+    fix_frames = fix_frames or fill_frames
     fmeta = ftif_out.with_suffix(".meta.json")
     if ftif_out.exists() and fmeta.exists():
         meta = json.loads(fmeta.read_text())
@@ -418,6 +425,7 @@ def build_l1_nci(
             meta.get("source") == "issdc-nci"
             and meta.get("bands") == bands
             and tuple(meta["lat_range"]) == tuple(lat_range)
+            and meta.get("frames") == [fix_frames, fill_frames, _frames_key() if fix_frames else None]
         ):
             log(f"nci L1 already built: {ftif_out}")
             return ftif_out, meta["scan0"], lat_range
@@ -428,9 +436,20 @@ def build_l1_nci(
         scan0 = int(l1.extent[2])
         l1.img = l1.img.sel(band=bands) / utils.RAD_NATIVE_SCALE
         l1.img.attrs["units"] = "1000 mW/cm^2/sr/um"
+        if fix_frames:
+            l1.fix_frames(FRAMES, fill_frames)
     with phase(f"nci L1 write ({l1.img.shape[0]} band x {l1.img.shape[1]} rows)"):
         l1.save(str(ftif_out), snr_sidecar=False, empirical_sidecar=False)
-    fmeta.write_text(json.dumps({"scan0": scan0, "lat_range": list(lat_range), "bands": bands, "source": "issdc-nci"}))
+    frames_meta = [fix_frames, fill_frames, _frames_key() if fix_frames else None]
+    fmeta.write_text(
+        json.dumps({
+            "scan0": scan0,
+            "lat_range": list(lat_range),
+            "bands": bands,
+            "source": "issdc-nci",
+            "frames": frames_meta,
+        })
+    )
     log(f"nci L1 saved: {ftif_out}")
     return ftif_out, scan0, lat_range
 

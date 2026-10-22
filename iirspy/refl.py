@@ -134,19 +134,31 @@ def _parser():
         help="merged GCPs from iirs-solve-scene --keep (default geometry/recalibrated/<day>/"
         "<sid>_<group>.gcps under IIRS_RECAL_ROOT)",
     )
+    for step, h in (
+        ("fix", "move each 4-band group onto true frames"),
+        ("fill", "rebuild the lost frames (implies fix)"),
+    ):
+        ap.add_argument(
+            f"--{step}-frames",
+            nargs="?",
+            const=True,
+            type=_json_value,
+            default=None,
+            help=f"{h}; unset keeps the L1 preset (iirspy L1: on, issdc-nci: off)",
+        )
     ap.add_argument("--l2", default="iirspy", choices=list(L2Config.PRESETS), help="L2 preset (iirspy.config.L2Config)")
     for f in fields(L2Config):
         ap.add_argument(
             f"--l2-{f.name.replace('_', '-')}",
             dest=f"l2_{f.name}",
-            type=_l2_value,
+            type=_json_value,
             default=argparse.SUPPRESS,  # absent, not None: `--l2-polish null` is a real override
             help=f"override L2Config.{f.name}",
         )
     return ap
 
 
-def _l2_value(v: str):
+def _json_value(v: str):
     """A `--l2-<field>` value: JSON when it parses (numbers, true/false, null, lists), else the string."""
     try:
         return json.loads(v)
@@ -205,8 +217,11 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
 
     bands = _full_bands()
     nci = args.l2 == "issdc-nci"
-    build = solve.build_l1_nci if nci else solve.build_l1
-    ftif, scan0, lat_range = build(lat_range, bands, solve._work("l1_rad.tif"))
+    kw = {k: v for k in ("fix_frames", "fill_frames") if (v := getattr(args, k)) is not None}
+    if nci:
+        ftif, scan0, lat_range = solve.build_l1_nci(lat_range, bands, solve._work("l1_rad.tif"), **kw)
+    else:
+        ftif, scan0, lat_range = solve.build_l1(lat_range, bands, solve._work("l1_rad.tif"), calibrate_kwargs=kw)
     solve.log(f"L1 built ({'ISSDC nci' if nci else 'iirspy'}): {ftif} ({len(bands)} bands), scan0={scan0}")
 
     anc = ck.ancillary(sid)

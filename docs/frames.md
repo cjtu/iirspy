@@ -99,3 +99,7 @@ Figure 6: Band 78 at line 26856 against reference band 118, same layout as Figur
 - A solve whose merged GCPs are older than the table is re-solved on the re-timed cube. The L1 cache and the per-chunk solve cache are keyed on the table's content hash. The chunk reference hillshades and WAC images do not depend on the cube and are reused from the work dir.
 - `iirs-compute-refl` refuses to run on GCPs that predate the table. Re-run the solve first.
 - GLT, LOC and L2 products are in true-frame coordinates. ISSDC products (`nri`, `nci`, `ndi`) still carry the defects.
+
+## Repairing any product
+
+`iirs-fix-frames <sid> --product nri|nci|ndi --out f.tif [--fill-frames]` loads the ISSDC cube of that level, applies `IIRSData.fix_frames` (the same `frames.apply`/`frames.fill` as the pipeline) and writes it in nci camera order. The table is built from the nri or nci cube when absent; an ndi cannot supply one, so it needs the table from an earlier run. The ndi is repaired as shipped: lost frames are NaN (or filled), its spectral smoothing and baked-in per-row terms are not corrected.

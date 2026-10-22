@@ -33,6 +33,9 @@ The steps run in this order. Band numbers are IIRS band numbers, 1-indexed.
 4. Photometric normalization: `photom` is the disk function f(cos_inc, cos_view, g); `use_slope_az` applies a supplied terrain product; `cos_min` floors both cosines; `inc_max` nulls pixels whose local incidence exceeds it (the `iirspy` preset uses 85°, others 90° = off; `--l2-inc-max 90` restores the old behaviour); `min_lit` nulls pixels less lit than it; `phase` rescales onto the Besse et al. (2013) 30° phase reference.
 5. Spectral smoothing: `smoothing` is the moving-average width in bands and `smoothing_edges` sets the end bands. `"pair"` (width 3 only) sets the first band to the mean of bands 2–3 and the last to the mean of the last two.
 6. Clip: `clip_negative` sets negative reflectance to zero. It runs last, after smoothing, as range validation does in the ISSDC product. Past about 4.4 µm, where the signal is almost all thermal, this zeroes about half of the pixels of an ISSDC NDI band.
+7. Fill: `fill_nan` writes a value over every NaN (null pixels, lost frames, dropped bands) as the very last step. The `issdc` presets use 0, as ISSDC's NDI marks all its nulls with 0; the `iirspy` preset keeps NaN.
+
+`--fix-frames` and `--fill-frames` (true/false, bare = true; `L1Config` fields) re-time the cube with the strip's frame table and rebuild the lost frames before L2, on either L1 route (see `frames.md`). Unset keeps the L1 preset: on for the `iirspy` L1, off for `issdc-nci`.
 
 Table 2: L2 presets. Unlisted fields keep the `L2Config` defaults.
 

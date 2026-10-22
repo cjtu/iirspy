@@ -112,7 +112,8 @@ class L2Config(_Config):
             brightness temperature is T.
         thermal_t_min: T [K] at or below which (or NaN) a pixel's T falls back to the flat-surface
             equilibrium temperature at its incidence (`utils.flat_surface_temperature`).
-        clip_negative: Zero negative reflectance as the last step, after smoothing.
+        clip_negative: Zero negative reflectance after smoothing.
+        fill_nan: Value written over every NaN as the last step (ISSDC's ndi marks all nulls with 0), or None to keep NaN.
         polish: Per-band divisor: None, "verma2022", "issdc_empirical", or a csv path with `band`
             and `polish` columns. Mapped by band number; bands the table lacks get 1.0.
         photom: Disk function, a `photometry.MODELS` key or any f(cos_inc, cos_view, g) callable.
@@ -132,6 +133,7 @@ class L2Config(_Config):
     thermal_bands: tuple[int, int] = (227, 247)
     thermal_t_min: float = 0.0
     clip_negative: bool = False
+    fill_nan: float | None = None
     polish: str | None = None
     photom: str | Callable = "lambert"
     use_slope_az: bool = True
@@ -185,6 +187,7 @@ L2Config.PRESETS = {
         "thermal": "isothermal",
         "thermal_eps": 1.0,
         "clip_negative": True,
+        "fill_nan": 0.0,
         "polish": "issdc_empirical",
         "use_slope_az": False,
         "smoothing": 3,
@@ -200,5 +203,5 @@ L2Config.PRESETS = {
         "smoothing": 3,
     },
 }
-# Same L2 params as "issdc"; `iirs-compute-refl` reads the ISSDC nci L1 for this name instead of calibrating nri.
-L2Config.PRESETS["issdc-nci"] = L2Config.PRESETS["issdc"]
+# "issdc" L2 plus the grazing-incidence null; `iirs-compute-refl` reads the ISSDC nci L1 for this name instead of calibrating nri.
+L2Config.PRESETS["issdc-nci"] = {**L2Config.PRESETS["issdc"], "inc_max": 85.0}
