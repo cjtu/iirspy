@@ -234,11 +234,13 @@ def _cached_chunk(out: Path, c: dict, good_corr: float, decay_m: float, tweaks: 
 
 
 def _band_window(band: int) -> list[int]:
-    """+-6 bands around `band` -- as far as `interpolate_na(..., max_gap=6)` ever reaches to fill a
+    """+-BAND_GAP bands around `band` -- as far as `interpolate_na(..., max_gap=BAND_GAP)` ever reaches to fill a
     masked `band` pixel from its true neighbours, so it's also as much of the band axis as
     `calibrate_to_rad`'s masking/interpolation stage needs to touch to get `band` right.
     """
-    return sorted(range(max(1, band - 6), min(256, band + 6) + 1))
+    from iirspy.iirs import BAND_GAP
+
+    return sorted(range(max(1, band - BAND_GAP), min(256, band + BAND_GAP) + 1))
 
 
 def _cube_bands(band: int) -> list[int]:

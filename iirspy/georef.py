@@ -146,7 +146,7 @@ class GeorefConfig:
     grid_res: int = 40  # px = 1.6 km tie-point spacing
     max_shift: dict = field(default_factory=lambda: {1: 50, 2: 15, 3: 6, 4: 4})  # px, then floor
     min_reliability: int = 30
-    edge_reject_m: float = 1000  # 0 = off; drop tie points within this dist of the swath's nodata (edge or shadow)
+    edge_reject_m: float = 0  # 0 = off; drop tie points within this dist of the swath's nodata (edge or shadow)
     shadow_max: float = 0.75  # 1 = off; drop points whose reference window is more shadowed than this
     # Second pass at half `grid_res` within this far of the swath edge, `win` unchanged: the grid is
     # anchored to the array origin, so the outermost point can sit a full grid_res inboard of where
@@ -162,7 +162,7 @@ class GeorefConfig:
     # how to treat pixels far from identified tie points
     decay_m: float = 5_000.0  # distance at which the field falls back on overall median (or local plane)
     # Edge fit substitutes a local plan for the bulk median so swath margin trusts local tie points over global
-    edge_fit_k: int = 8  # 0 = off, use the bulk median
+    edge_fit_k: int = 0  # 0 = off, use the bulk median
     smooth_cv: bool = True  # pick TPS regularisation by k-fold CV
     smooth_fixed: float = 1.0  # used when smooth_cv is False
 
@@ -1098,7 +1098,7 @@ def tie_points(ref, tgt, transform, cfg, max_shift_px):
 
     `cfg.edge_dense_m` adds a second, denser pass confined to the swath margin, and
     `cfg.edge_reject_m` / `cfg.shadow_max` drop the two classes of confidently-wrong point that
-    `min_reliability` cannot see (see :class:`GeorefConfig`). All three are off by default.
+    `min_reliability` cannot see (see :class:`GeorefConfig`). Off by default except `shadow_max` (0.75).
     """
     from geoarray import GeoArray
 
