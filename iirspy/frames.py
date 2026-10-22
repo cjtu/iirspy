@@ -18,13 +18,14 @@ import os
 import re
 import warnings
 import zipfile
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
 from scipy.ndimage import uniform_filter1d
 
 NG = 64
-K = 5  # max |offset| searched, lines
+K = 8  # max |offset| searched, lines (A12 20210723T2153218013 reaches +6)
 X0, X1, XBIN = 15, 235, 2  # cross-track span and binning of the matching rows
 HPX = 15  # cross-track high-pass window, px
 WIN = 1000  # pre-screen window, lines
@@ -232,7 +233,7 @@ def _assemble(rows, refs, rel, starts, tol=3):  # noqa: C901
             if dec and sum(v == -1 for v in dec) > len(dec) / 2:
                 ref_drops[y] = dl
         sv = sorted([starts[g] for g in deps] + [0])
-        s0 = next(v for i, v in enumerate(sv) if i + 1 < len(sv) and sv[i + 1] == v) if len(sv) > 1 else 0
+        s0 = next((v for v, w in pairwise(sv) if v == w), 0)  # no shared start: anchor on the reference
         if s0:
             events.append((0, ref, -s0))
         events += [(y, ref, 1) for y in ref_drops]
@@ -269,7 +270,9 @@ def _joint(events, rows, refs, tol=6, half=80, slack=0.05):
             a, _ = _soft_level(c[: half - tol])
             b, _ = _soft_level(c[half + tol :])
             if a == b:
-                b = a + e[2]
+                b = int(np.clip(a + e[2], -K, K))  # offsets index corr columns, stay inside +-K
+                if b == a:
+                    b = int(np.clip(a - e[2], -K, K))
             scores[e] = _step_scores(c, a, b)
         kj = int(np.argmax(sum(scores.values())))
         for e, s in scores.items():
