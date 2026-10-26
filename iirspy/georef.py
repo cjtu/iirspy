@@ -146,7 +146,10 @@ class GeorefConfig:
     grid_res: int = 40  # px = 1.6 km tie-point spacing
     max_shift: dict = field(default_factory=lambda: {1: 50, 2: 15, 3: 6, 4: 4})  # px, then floor
     min_reliability: int = 30
-    edge_reject_m: float = 0  # 0 = off; drop tie points within this dist of the swath's nodata (edge or shadow)
+    edge_reject_m: float = 1000  # 0 = off; drop tie points within this dist of the swath edge (see edge_reject_axis)
+    edge_reject_axis: str = (
+        "cross"  # "cross" = edge_reject_m measures from the swath's left/right edges only; "all" = any nodata
+    )
     shadow_max: float = 0.75  # 1 = off; drop points whose reference window is more shadowed than this
     # Second pass at half `grid_res` within this far of the swath edge, `win` unchanged: the grid is
     # anchored to the array origin, so the outermost point can sit a full grid_res inboard of where
@@ -1045,6 +1048,36 @@ def edge_dist_m(mask, ps):
     return distance_transform_edt(mask) * ps
 
 
+def cross_edge_dist_m(mask, ps, row, col, bin_px=25):
+    """Metres from points (row, col) to the swath's left/right edge, ignoring nodata inside it and its along-track ends.
+
+    Edges are the min/max cross-track coordinate of `mask` per along-track bin (PCA axes), so lost-frame NaN stripes
+    and the swath ends do not count as edges, unlike :func:`edge_dist_m`.
+
+    >>> m = np.ones((100, 40), bool); m[40:44] = False  # a lost-frame stripe across the whole swath
+    >>> cross_edge_dist_m(m, 1.0, np.array([45, 45]), np.array([2, 20])).round().tolist()
+    [2.0, 19.0]
+    """
+    rr, cc = np.nonzero(mask[::4, ::4])
+    xy = np.stack([rr * 4.0, cc * 4.0], 1)
+    mu = xy.mean(0)
+    along = np.linalg.eigh(np.cov((xy - mu).T))[1][:, -1]
+    cross = np.array([-along[1], along[0]])
+    rr, cc = np.nonzero(mask)
+    a, c = (rr - mu[0]) * along[0] + (cc - mu[1]) * along[1], (rr - mu[0]) * cross[0] + (cc - mu[1]) * cross[1]
+    ib = np.floor((a - a.min()) / bin_px).astype(int)
+    nb = ib.max() + 1
+    lo, hi = np.full(nb, np.inf), np.full(nb, -np.inf)
+    np.minimum.at(lo, ib, c)
+    np.maximum.at(hi, ib, c)
+    ok = np.isfinite(lo)
+    x = np.arange(nb)
+    lo, hi = np.interp(x, x[ok], lo[ok]), np.interp(x, x[ok], hi[ok])
+    pa, pc = (row - mu[0]) * along[0] + (col - mu[1]) * along[1], (row - mu[0]) * cross[0] + (col - mu[1]) * cross[1]
+    pb = np.clip(np.floor((pa - a.min()) / bin_px).astype(int), 0, nb - 1)
+    return np.minimum(pc - lo[pb], hi[pb] - pc) * ps
+
+
 def _window_shadow(ref, row, col, win):
     """Shadowed fraction of each point's `win`-square reference window, via a summed-area table."""
     ny, nx = ref.shape
@@ -1098,7 +1131,7 @@ def tie_points(ref, tgt, transform, cfg, max_shift_px):
 
     `cfg.edge_dense_m` adds a second, denser pass confined to the swath margin, and
     `cfg.edge_reject_m` / `cfg.shadow_max` drop the two classes of confidently-wrong point that
-    `min_reliability` cannot see (see :class:`GeorefConfig`). Off by default except `shadow_max` (0.75).
+    `min_reliability` cannot see (see :class:`GeorefConfig`). On by default: `edge_reject_m` (1000, cross-track edges only) and `shadow_max` (0.75).
     """
     from geoarray import GeoArray
 
@@ -1130,7 +1163,8 @@ def tie_points(ref, tgt, transform, cfg, max_shift_px):
 
     row, col = _rowcol(tp, transform, tm.shape)
     if cfg.edge_reject_m:
-        tp = tp[dist[row, col] >= cfg.edge_reject_m]
+        d = dist[row, col] if cfg.edge_reject_axis == "all" else cross_edge_dist_m(tm, abs(transform.a), row, col)
+        tp = tp[d >= cfg.edge_reject_m]
         row, col = _rowcol(tp, transform, tm.shape)
     if cfg.shadow_max < 1.0:
         tp = tp[_window_shadow(ref, row, col, cfg.win) <= cfg.shadow_max]

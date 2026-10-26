@@ -169,6 +169,7 @@ def _load_gcps(path: Path) -> dict:
 # reused by a run that also leaves them off.
 TWEAK_DEFAULTS = {
     "edge_reject_m": 0.0,
+    "edge_reject_axis": "all",
     "shadow_max": 1.0,
     "edge_dense_m": 0.0,
     "edge_fit_k": 0,
@@ -1294,6 +1295,12 @@ def _parser():
         "(default GeorefConfig.edge_reject_m; 0 = off)",
     )
     ap.add_argument(
+        "--edge-reject-axis",
+        choices=("cross", "all"),
+        default=None,
+        help="measure --edge-reject-m from the left/right swath edges only ('cross') or from any nodata ('all')",
+    )
+    ap.add_argument(
         "--shadow-max",
         type=float,
         default=None,
@@ -1455,6 +1462,7 @@ def main(argv: list[str] | None = None) -> None:
         k: getattr(cfg0, k) if v is None else v
         for k, v in {
             "edge_reject_m": args.edge_reject_m,
+            "edge_reject_axis": args.edge_reject_axis,
             "shadow_max": args.shadow_max,
             "edge_dense_m": args.edge_dense_m,
             "edge_fit_k": args.edge_fit_k,
