@@ -31,6 +31,7 @@ from iirspy.georef import (
     load_lola_elev,
     lonlat_to_xyz,
     read_band,
+    sc_positions_km,
     stereo_crs,
     xy_to_lonlat,
 )
@@ -329,28 +330,6 @@ def _local_az_zenith(
     return az, zen
 
 
-def _sc_positions_km(sid: str, ets: list[float], scans: np.ndarray, stage: Path | None) -> tuple[np.ndarray, str]:
-    """(3, n) spacecraft position [km, IAU_MOON] at each ET, and where it came from.
-
-    The CH2 SPK when the loaded kernels cover the epoch, else the nri .spm's own state vector: it *is*
-    the SPK state in Moon-centred J2000 (0.000 km apart wherever both exist), so it needs only the
-    generic kernels to rotate into IAU_MOON. NaN (source "none") with neither.
-    """
-    import spiceypy as sp
-
-    try:
-        return np.stack([sp.spkpos("CHANDRAYAAN-2", et, "IAU_MOON", "NONE", "MOON")[0] for et in ets], 1), "spk"
-    except sp.stypes.SpiceyError:
-        pass
-    fspm, flabel = ck.spm(sid, stage), ck.label(sid, stage)
-    if fspm is None or flabel is None:
-        return np.full((3, len(ets)), np.nan), "none"
-    spm = utils.load_iirs_spm(fspm)
-    t = utils.get_line_times(flabel)[scans]
-    j2k = np.stack([np.interp(t, spm.timestamp, spm[k]) for k in ("scx", "scy", "scz")])
-    return np.stack([np.asarray(sp.pxform("J2000", "IAU_MOON", et)) @ j2k[:, i] for i, et in enumerate(ets)], 1), "spm"
-
-
 def _row_geometry(
     sid: str,
     lon: np.ndarray,
@@ -364,7 +343,7 @@ def _row_geometry(
     radius): sun and sensor azimuth/zenith [deg], sun distance [AU], sensor range [m].
 
     Row times come from the nri label (`utils.scan_utc`), never from .spm row numbers. The sun needs only
-    the generic kernels; the spacecraft comes from `_sc_positions_km` (CH2 SPK, else the .spm). Whatever
+    the generic kernels; the spacecraft comes from `georef.sc_positions_km` (CH2 SPK, else the .spm). Whatever
     cannot be computed -- no label, no kernels, no spacecraft state -- is left NaN.
 
     Azimuth/zenith are in the local topocentric (east, north, up) frame at each pixel (`georef._enu`),
@@ -384,7 +363,7 @@ def _row_geometry(
         sp.furnsh(str(k))
     scans = scan0 + np.arange(ny)
     ets = [sp.str2et(u) for u in utils.scan_utc(flabel, scans)]
-    sc_xyz_km, sc_source = _sc_positions_km(sid, ets, scans, stage)
+    sc_xyz_km, sc_source = sc_positions_km(flabel, ck.spm(sid, stage), scans)
     xyz_km = np.stack(lonlat_to_xyz(lon, lat, radius)) / 1000.0  # (3, ny, nx)
     for r, et in enumerate(ets):
         if not np.isfinite(lon[r]).any():

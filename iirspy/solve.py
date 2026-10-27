@@ -1451,7 +1451,9 @@ def main(argv: list[str] | None = None) -> None:
     del band
     log(f"L1 cube ({GROUP} group, lat {lat_range}): {ny} rows x {nx} cols, scan0={scan0}")
 
-    if scan_order_reversed(fgeom, flabel, ck.kernels(SID[:8])):
+    reversed_, scan_source = scan_order_reversed(fgeom, flabel, ck.spm(SID, STAGE), ck.kernels(SID[:8]))
+    log(f"scan order reversed={reversed_} (track from {scan_source})")
+    if reversed_:
         fgeom = _write_reversed_csv(fgeom)
 
     chunks = _plan_group_chunks(fgeom, scan0, ny, args.chunks, cfg0.niter)
@@ -1510,6 +1512,7 @@ def main(argv: list[str] | None = None) -> None:
     summary = {
         "sid": SID,
         "group": GROUP,
+        "scan_source": scan_source,
         "lat_range": lat_range,
         "solve_lat_range": ck.group_lat_range(GROUP),
         "width_range_km": WIDTH_RANGE_KM,

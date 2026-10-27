@@ -428,12 +428,36 @@ def sun_geometry(fgeom, flabel, cfg, kernels=None):
     return float(az_grid), float(el), float(r_sun)
 
 
-def scan_order_reversed(fgeom, flabel, kernels=None) -> bool:
-    """Whether the csv's `Scan` runs against time: Scan 0 is the end of the pass.
+def sc_positions_km(flabel, fspm, scans, use_spk: bool = True) -> tuple[np.ndarray, str]:
+    """(3, n) spacecraft position [km, IAU_MOON] at each absolute Scan, and its source ("spk"/"spm"/"none").
 
-    Compares the csv's central line with SPICE's nadir track at the label times, as is and with Scan reversed.
+    The CH2 SPK when the loaded kernels cover the epoch, else the nri .spm's own state vector: it *is*
+    the SPK state in Moon-centred J2000 (0.000 km apart wherever both exist), so it needs only the
+    generic kernels to rotate into IAU_MOON. NaN (source "none") with neither. `use_spk=False` forces the .spm.
+    """
+    import spiceypy as sp
+
+    ets = [sp.str2et(u) for u in utils.scan_utc(flabel, scans)]
+    if use_spk:
+        try:
+            return np.stack([sp.spkpos("CHANDRAYAAN-2", et, "IAU_MOON", "NONE", "MOON")[0] for et in ets], 1), "spk"
+        except sp.stypes.SpiceyError:
+            pass
+    if fspm is None:
+        return np.full((3, len(ets)), np.nan), "none"
+    spm = utils.load_iirs_spm(fspm)
+    t = utils.get_line_times(flabel)[scans]
+    j2k = np.stack([np.interp(t, spm.timestamp, spm[k]) for k in ("scx", "scy", "scz")])
+    return np.stack([np.asarray(sp.pxform("J2000", "IAU_MOON", et)) @ j2k[:, i] for i, et in enumerate(ets)], 1), "spm"
+
+
+def scan_order_reversed(fgeom, flabel, fspm=None, kernels=None, use_spk: bool = True) -> tuple[bool, str]:
+    """(reversed, source): whether the csv's `Scan` runs against time (Scan 0 is the end of the pass), and where
+    the spacecraft track came from ("spk"/"spm").
+
+    Compares the csv's central line with the nadir track at the label times, as is and with Scan reversed.
     Reversed when that fit is within the 20 km coarse capture and under half the forward misfit. A scene whose
-    SPK is off (both misfits km-scale) is never called reversed.
+    SPK is off (both misfits km-scale) is never called reversed. Exits if neither SPK nor `fspm` covers it.
     """
     import spiceypy as sp
 
@@ -452,15 +476,14 @@ def scan_order_reversed(fgeom, flabel, kernels=None) -> bool:
     scans = c.Scan.to_numpy()
 
     def misfit_km(at):
-        n = np.array([
-            sp.subpnt("NEAR POINT/ELLIPSOID", "MOON", sp.str2et(t), "IAU_MOON", "NONE", "-152")[0]
-            for t in utils.scan_utc(flabel, at)
-        ])
-        n /= np.linalg.norm(n, axis=1, keepdims=True)
-        return float(np.median(MOON_RADIUS_M / 1e3 * np.arccos(np.clip(np.sum(u * n, axis=1), -1, 1))))
+        p, src = sc_positions_km(flabel, fspm, at, use_spk)
+        if src == "none":
+            sys.exit(f"no CH2 SPK coverage and no .spm state for {flabel}: cannot test scan order")
+        n = p.T / np.linalg.norm(p, axis=0)[:, None]
+        return float(np.median(MOON_RADIUS_M / 1e3 * np.arccos(np.clip(np.sum(u * n, axis=1), -1, 1)))), src
 
-    fwd, rev = misfit_km(scans), misfit_km(df.Scan.max() - scans)
-    return bool(rev < fwd / 2 and rev < 20.0)
+    (fwd, src), (rev, _) = misfit_km(scans), misfit_km(df.Scan.max() - scans)
+    return bool(rev < fwd / 2 and rev < 20.0), src
 
 
 def sun_geometry_rows(gcps, shape, flabel, cfg, scan0, kernels=None):
