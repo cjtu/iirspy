@@ -543,17 +543,15 @@ class IIRSData(ABC):
         return _write_camera_product(snr, f.with_name(f.stem + "_snr" + f.suffix), row_block)
 
     def _save_empirical_sidecar(self, fout):
-        """Write the (band, x) empirical dark/flat/smile frames beside fout as one .npz."""
+        """Write the (band, x) empirical frames (dark, flat, smile, flat_unmasked, flat_bin<i>) beside fout as one .npz."""
         f = Path(fout)
         fnpz = f.with_name(f.stem + "_empirical.npz")
-        np.savez_compressed(
-            fnpz,
-            dark=self.img.empirical_dark.values.astype("float32"),
-            flat=self.img.empirical_flat.values.astype("float32"),
-            smile=self.img.empirical_smile.values.astype("float32"),
-            band=self.img.band.values,
-            x=self.img.x.values,
-        )
+        frames = {
+            str(k).removeprefix("empirical_"): v.values.astype("float32")
+            for k, v in self.img.coords.items()
+            if str(k).startswith("empirical_")
+        }
+        np.savez_compressed(fnpz, **frames, band=self.img.band.values, x=self.img.x.values)
         return str(fnpz)
 
     def _cube_scan0(self):
@@ -883,10 +881,13 @@ class L0(IIRSData):
 
         if cfg.attach_empirical_frames:
             # dark is (x,)-only zeros when no shadow was found; broadcast so all three frames share a shape
+            extra = {"empirical_flat_unmasked": flat.attrs.get("unmasked")}
+            extra |= {f"empirical_flat_bin{i}": f for i, f in enumerate(flat.attrs.get("bins", []))}
             rad = rad.assign_coords(
                 empirical_dark=(("band", "x"), dark.broadcast_like(flat).values),
                 empirical_flat=(("band", "x"), flat.values),
                 empirical_smile=(("band", "x"), smile.values),
+                **{k: (("band", "x"), v.values) for k, v in extra.items() if v is not None},
             )
 
         # Narrow to the requested output bands before the mask/interpolate stage below -- the

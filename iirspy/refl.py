@@ -129,6 +129,9 @@ def _parser():
     ap.add_argument("--keep", default=None, help="copy the L2 product, its vrt, summary and log here on success")
     ap.add_argument("--keep-l1", default=None, help="copy the L1 radiance product and its vrt here on success")
     ap.add_argument(
+        "--l1-only", action="store_true", help="stop after the L1: keep only its _empirical.npz frames and provenance"
+    )
+    ap.add_argument(
         "--clean",
         action="store_true",
         help="delete the work dir after --keep; drops the camera-space L1/L2 intermediates",
@@ -254,6 +257,19 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:  # no
     else:
         ftif, scan0, lat_range = solve.build_l1(lat_range, bands, solve._work("l1_rad.tif"), l1_config=args.l1_config)
     solve.log(f"L1 built ({'ISSDC nci' if nci else 'iirspy'}): {ftif} ({len(bands)} bands), scan0={scan0}")
+    if args.l1_only:
+        fnpz, fprov = ftif.with_name(ftif.stem + "_empirical.npz"), solve._work("provenance.json")
+        prov = utils.provenance(
+            sid=sid, group=group, l1_preset=args.l1, l1_config=args.l1_config.to_attrs(), l1_only=True
+        )
+        fprov.write_text(json.dumps(prov, indent=1, default=str))
+        _keep(args.keep_l1, *[f for f in (fnpz, fprov) if f.exists()])
+        solve.log(
+            f"--l1-only: kept {fnpz.name if fnpz.exists() else 'no empirical frames'}, done in {time.time() - t_start:.0f} s"
+        )
+        if args.clean:
+            shutil.rmtree(solve.OUT, ignore_errors=True)
+        return
 
     anc = ck.ancillary(sid)
     fgeom, flabel = anc["geometry/calibrated"], ck.label(sid, solve.STAGE)
