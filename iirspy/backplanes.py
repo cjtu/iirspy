@@ -618,6 +618,7 @@ def scene_obs(sid, group, gcps, shape, scan0, ftopo=None, fl1=None, stage_dir=No
     bands["tie_dist"] = (d * IIRS_GSD_M).reshape(ny, nx).astype("float32")
     return {
         "bands": bands,
+        "lat": lat.astype("float32"),
         "groups": {group: (scan0, scan0 + ny - 1)},
         "sensor_source": sc_source,
         "sc_xyz_m": sc_xyz_km * 1000.0,

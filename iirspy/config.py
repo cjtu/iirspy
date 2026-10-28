@@ -24,7 +24,8 @@ import numpy as np
 from iirspy import photometry, utils
 
 POLISH = {"verma2022": utils.FPOLISH, "issdc_empirical": utils.FPOLISH_ISSDC_EMPIRICAL}
-FLUX = ("pradan", "noaa_cdr_mean", "noaa_cdr_monthly")
+FLUX = ("pradan", "hsrs", "noaa_cdr_mean", "noaa_cdr_monthly")
+CALIB = ("lut", "lut_median")
 SDIST = ("spice", "none")
 THERMAL = ("none", "isothermal")
 SMOOTHING_EDGES = ("pair", "nan", "reflect")
@@ -75,7 +76,12 @@ class L1Config(_Config):
         bad_pixel_mask: Null the packaged bad detector elements.
         exclude_wl: Extra (lo, hi) wavelength ranges [nm] to null, or None.
         attach_snr: Attach the empirical broadband SNR as an `snr` coord (empirical scenes with shadow).
-        attach_empirical_frames: Attach the empirical dark/flat/smile (band, x) frames as coords.
+        attach_empirical_frames: Attach the empirical dark/flat/smile (band, x) frames as coords
+            (diagnostic only when `empirical` is off: they are saved, not applied).
+        calib: Radiometric scale when not `empirical`. "lut" is the per-element LUT gain/offset,
+            "lut_median" the LUT's per-band median gain/offset (no cross-track structure), or a path
+            to a G1 table `.npz` (see `L0.calibrate_to_rad`). `empirical` already uses the median, so
+            it needs "lut".
     """
 
     empirical: bool = False
@@ -87,8 +93,17 @@ class L1Config(_Config):
     exclude_wl: tuple[tuple[float, float], ...] | None = None
     attach_snr: bool = True
     attach_empirical_frames: bool = False
+    calib: str = "lut"
 
     def __post_init__(self):
+        if isinstance(self.calib, Path):
+            object.__setattr__(self, "calib", str(self.calib))
+        if self.calib not in CALIB and not Path(self.calib).is_file():
+            raise ValueError(f"calib {self.calib!r}: not one of {CALIB} or an existing G1 table")
+        if self.empirical and self.calib != "lut":
+            raise ValueError(
+                f"empirical already uses the band-median LUT scale; calib must be 'lut', not {self.calib!r}"
+            )
         if self.exclude_wl is not None:
             object.__setattr__(self, "exclude_wl", tuple((float(lo), float(hi)) for lo, hi in self.exclude_wl))
 
@@ -102,9 +117,10 @@ class L2Config(_Config):
 
     Attributes:
         flux: Solar spectrum. "pradan" (the PRADAN flux file), "noaa_cdr_mean" (NOAA SSI CDR v03,
-            2010-2019 mean), "noaa_cdr_monthly" (the CDR month of the scene's start time), a path
-            to a file in PRADAN's format (tab-separated nm, mW/cm^2/um at 1 AU), or a per-band
-            sequence in W/m^2/sr/um for bands 1..N, used as is (no distance scaling).
+            2010-2019 mean), "noaa_cdr_monthly" (the CDR month of the scene's start time), "hsrs"
+            (HSRS v2 through the IIRS SRFs, packaged in PRADAN's format), a path to a file in PRADAN's
+            format (tab-separated nm, mW/cm^2/um at 1 AU; scaled by 1/sdist^2), or a per-band
+            sequence in W/m^2/sr/um for bands 1..N, used as is (NO distance scaling).
         sdist: Sun distance for scaling the flux: "spice", "none" (1 AU) or a float in AU.
         thermal: Thermal tail model, "none" or "isothermal" (one temperature per pixel).
         thermal_eps: Emissivity, used both to estimate T and to remove eps * B(T).
@@ -174,10 +190,34 @@ L1Config.PRESETS = {
         "fill_frames": True,
     },
     "issdc": {},
+    "p0": {
+        "calib": "lut_median",
+        "empirical": False,
+        "fix_frames": True,
+        "fill_frames": False,
+        "bad_pixel_mask": False,
+        "interp_bands": None,
+        "interp_spatial": False,
+        "attach_empirical_frames": True,
+    },
 }
 
 L2Config.PRESETS = {
     "iirspy": {"thermal": "isothermal", "photom": "lambert"},
+    "l2d": {
+        "flux": "hsrs",
+        "sdist": "spice",
+        "thermal": "isothermal",
+        "photom": "lambert",
+        "phase": False,
+        "polish": None,
+        "smoothing": 0,
+        "clip_negative": False,
+        "fill_nan": None,
+        "use_slope_az": True,
+        "min_lit": 0.0,
+        "cos_min": 0.0,
+    },
     "issdc": {
         "sdist": "none",
         "thermal": "isothermal",

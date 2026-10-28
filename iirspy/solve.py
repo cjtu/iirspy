@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import errno
 import filecmp
+import hashlib
 import json
 import os
 import shutil
@@ -31,6 +32,7 @@ import numpy as np
 
 from iirspy import __version__, utils
 from iirspy import chunks as ck
+from iirspy.config import CALIB
 
 WIDTH_RANGE_KM = (100.0, 150.0)
 OVERLAP_FRAC = 0.10
@@ -300,6 +302,7 @@ def build_l1(
     out_bands: list[int] | None = None,
     chunk_y: int = 1024,
     keep_raw: bool = False,
+    l1_config=None,
 ) -> tuple[Path, int, tuple[float, float]]:
     """Extract the nri zip and calibrate it, cropped to `lat_range`.
 
@@ -314,6 +317,9 @@ def build_l1(
     dark/flat/smile search enough of the spectrum to work with -- a chunk solve only ever reads one
     band back out (`read_band(ftif, cfg.band)`), so writing all of `bands` to disk for that case is
     pure I/O nobody uses. None (default, what `iirspy.refl` wants) writes every calibrated band.
+
+    l1_config (an `L1Config`) replaces CALIBRATE_KWS and calibrate_kwargs outright (`iirs-compute-refl`);
+    its full resolved fields, plus a G1 table's content hash, are the cache key.
 
     calibrate_kwargs overrides CALIBRATE_KWS (e.g. interp_bands=None, exclude_wl=[...]) for a
     one-off reprocessing run without touching the production default -- it's part of the cache key
@@ -349,6 +355,10 @@ def build_l1(
 
     saved_bands = out_bands if out_bands is not None else bands
     effective_calibrate_kws = {**CALIBRATE_KWS, "frame_offsets": str(FRAMES), **(calibrate_kwargs or {})}
+    if l1_config is not None:
+        effective_calibrate_kws = {"l1_config": l1_config.to_attrs(), "frame_offsets": str(FRAMES)}
+        if l1_config.calib not in CALIB:
+            effective_calibrate_kws["calib_sha256"] = hashlib.sha256(Path(l1_config.calib).read_bytes()).hexdigest()
     fmeta = ftif_out.with_suffix(".meta.json")
     if ftif_out.exists() and fmeta.exists():
         meta = json.loads(fmeta.read_text())
@@ -375,7 +385,12 @@ def build_l1(
 
     # `chunk_y` sets both the dask y-chunk and, through `_row_block`, the write block.
     with phase("L0 read + calibrate (graph build; the compute lands in the write)"):
-        l1 = L0(SID, STAGE, chunk={"band": -1, "y": chunk_y, "x": -1}).calibrate(**effective_calibrate_kws)
+        l0 = L0(SID, STAGE, chunk={"band": -1, "y": chunk_y, "x": -1})
+        l1 = (
+            l0.calibrate(**effective_calibrate_kws)
+            if l1_config is None
+            else l0.calibrate(l1_config, frame_offsets=str(FRAMES))
+        )
     # l1.img already holds exactly `bands` -- that's what _stage_inputs staged.
     _, xyext = utils.parse_geom(l1.csv, latlonextent=(-180, 180, *lat_range))
     ymin, ymax = xyext[2], xyext[3]
@@ -491,8 +506,6 @@ def ensure_frame_offsets(dest: Path | None = None) -> Path:
 
 def _frames_key() -> str:
     """Content hash of `FRAMES`, so a cache built on another (or no) table never matches."""
-    import hashlib
-
     return hashlib.sha256(FRAMES.read_bytes()).hexdigest()[:12]
 
 
@@ -1291,14 +1304,13 @@ def _parser():
         "--edge-reject-m",
         type=float,
         default=None,
-        help="drop tie points whose centre is closer than this to the swath's own nodata edge "
-        "(default GeorefConfig.edge_reject_m; 0 = off)",
+        help="drop tie points whose centre is closer than this to the swath's own nodata edge (default 1000; 0 = off)",
     )
     ap.add_argument(
         "--edge-reject-axis",
         choices=("cross", "all"),
         default=None,
-        help="measure --edge-reject-m from the left/right swath edges only ('cross') or from any nodata ('all')",
+        help="measure --edge-reject-m from the left/right swath edges only ('cross', default) or from any nodata ('all')",
     )
     ap.add_argument(
         "--shadow-max",

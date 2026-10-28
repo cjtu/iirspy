@@ -38,6 +38,7 @@ FNOAA = str(PKG_DATA.joinpath("solar_flux_noaa_cdr_v03.csv"))
 FBADBANDS = str(PKG_DATA.joinpath("iirs_bad_bands.csv"))
 FBADPIXELS = str(PKG_DATA.joinpath("bad_pixel_mask.csv"))
 FSOLAR = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_solar_flux.txt"))
+FSOLAR_HSRS = str(PKG_DATA.joinpath("ch2_iirs_solar_flux_hsrs.txt"))
 FWAVELENGTHS = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_wavelength.csv"))
 # Projections used in the Ch2 IIRS selenoref tool https://doi.org/10.1007/s12524-024-01814-4
 IIRS_PROJ_DICT = {
@@ -872,6 +873,50 @@ def get_solar_flux(sdist=1.0, fflux=FSOLAR):
     L = np.loadtxt(fflux, delimiter="\t", usecols=1)
     flux = L * 10 / (np.pi * sdist**2)  # [W/m^2/sr/um]
     return xr.DataArray(flux, coords={"band": np.arange(1, 257)}, name="Solar flux [W/m^2/sr/um]")
+
+
+def provenance(**extra) -> dict:
+    """Who/what/where made a product: package version and git state, environment, run ids, plus `extra`.
+
+    `git` is {"commit", "dirty"} when the package sits in a git checkout, else None; never raises.
+    """
+    import datetime
+    import os
+    import platform
+    import socket
+    import subprocess
+    import sys
+
+    src = Path(__file__).parent
+    git = None
+    if "site-packages" not in src.parts:
+        try:
+
+            def run(*a):
+                cmd = ["git", "-C", str(src), *a]
+                return subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=True).stdout.strip()  # noqa: S603
+
+            git = {"commit": run("rev-parse", "HEAD"), "dirty": bool(run("status", "--porcelain", "--", "."))}
+        except Exception:
+            git = None
+    versions: dict[str, str | None] = {}
+    for pkg in ("numpy", "xarray", "rasterio", "dask"):
+        try:
+            versions[pkg] = metadata.version(pkg)
+        except metadata.PackageNotFoundError:
+            versions[pkg] = None
+    slurm = {k: os.environ[k] for k in ("SLURM_JOB_ID", "SLURM_ARRAY_JOB_ID", "SLURM_ARRAY_TASK_ID") if k in os.environ}
+    return {
+        "iirspy_version": IIRSPY_VERSION,
+        "git": git,
+        "python": platform.python_version(),
+        "packages": versions,
+        "host": socket.gethostname(),
+        "utc": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+        "argv": list(sys.argv),
+        "slurm": slurm,
+        **extra,
+    }
 
 
 def spice_kernels(day, spice_dir=None) -> list[Path]:

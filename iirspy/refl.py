@@ -5,7 +5,12 @@ full-band L1 radiance, L2 reflectance and the OBS backplane in camera space, plu
 group's CRS. No re-registration -- if the scene isn't solved yet, this refuses to run.
 
     iirs-compute-refl <sid> --group south|north|equatorial [--out WORKDIR] [--keep DIR]
-        [--keep-l1 DIR] [--clean] [--gcps PATH] [--l2 PRESET] [--l2-<field> VALUE ...]
+        [--keep-l1 DIR] [--clean] [--gcps PATH] [--l1 PRESET] [--l1-<field> VALUE ...]
+        [--l2 PRESET] [--l2-<field> VALUE ...]
+
+`--l1` picks an `iirspy.config.L1Config` preset (default iirspy; `p0` is the frozen derivation basis) and each
+`--l1-<field>` overrides one field, same JSON-value rules as `--l2-<field>`; `--fix-frames`/`--fill-frames` override
+both. The resolved config is part of the L1 cache key. Ignored for `--l2 issdc-nci`.
 
 `--l2` picks an `iirspy.config.L2Config` preset (default iirspy); `issdc-nci` is the `issdc` L2 on ISSDC's own
 L1 (the nci cube under `IIRS_ARCHIVE/zips/nci`, unzipped into the archive's ISSDC tree on first use) instead of our
@@ -23,6 +28,7 @@ same as `iirspy.solve`.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -32,17 +38,16 @@ from dataclasses import fields, replace
 from pathlib import Path
 
 import numpy as np
+import rasterio
 import xarray as xr
 
 from iirspy import chunks as ck
-from iirspy import solve
-from iirspy.config import L2Config
+from iirspy import solve, utils
+from iirspy.config import L1Config, L2Config
 
 
 def _full_bands() -> list[int]:
     """Every band calibration can produce -- the same OSF/invalid sets `calibrate_to_rad` nulls."""
-    from iirspy import utils
-
     return sorted(set(range(1, 257)) - set(utils.OSF) - set(utils.INVALID))
 
 
@@ -146,6 +151,15 @@ def _parser():
             default=None,
             help=f"{h}; unset keeps the L1 preset (iirspy L1: on, issdc-nci: off)",
         )
+    ap.add_argument("--l1", default="iirspy", choices=list(L1Config.PRESETS), help="L1 preset (iirspy.config.L1Config)")
+    for f in fields(L1Config):
+        ap.add_argument(
+            f"--l1-{f.name.replace('_', '-')}",
+            dest=f"l1_{f.name}",
+            type=_json_value,
+            default=argparse.SUPPRESS,
+            help=f"override L1Config.{f.name}",
+        )
     ap.add_argument("--l2", default="iirspy", choices=list(L2Config.PRESETS), help="L2 preset (iirspy.config.L2Config)")
     for f in fields(L2Config):
         ap.add_argument(
@@ -172,9 +186,26 @@ def l2_config(args) -> L2Config:
     return L2Config.preset(args.l2, **over)
 
 
+def l1_config(args) -> L1Config:
+    """The preset `args.l1` with every given `--l1-<field>` and then `--fix-frames`/`--fill-frames` applied."""
+    over = {f.name: getattr(args, f"l1_{f.name}") for f in fields(L1Config) if hasattr(args, f"l1_{f.name}")}
+    over |= {k: v for k in ("fix_frames", "fill_frames") if (v := getattr(args, k)) is not None}
+    return L1Config.preset(args.l1, **over)
+
+
+def _file_info(f, sha=False) -> dict:
+    """Path and mtime (UTC) of an input, plus its sha256 when `sha`."""
+    import datetime
+
+    f = Path(f)
+    mtime = datetime.datetime.fromtimestamp(f.stat().st_mtime, datetime.UTC).isoformat(timespec="seconds")
+    return {"path": str(f), "mtime": mtime, **({"sha256": hashlib.sha256(f.read_bytes()).hexdigest()} if sha else {})}
+
+
 def main(argv: list[str] | None = None) -> None:
 
     args = _parser().parse_args(argv)
+    args.l1_config = l1_config(args)
     args.l2_config = l2_config(args)  # fail on a bad preset/field value before any work
     sid, group = args.sid, args.group
     if args.clean and not (args.keep or args.keep_l1):
@@ -206,7 +237,7 @@ def main(argv: list[str] | None = None) -> None:
         raise
 
 
-def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
+def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:  # noqa: C901
     from iirspy import georef
     from iirspy.iirs import L1, L2
 
@@ -221,7 +252,7 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
     if nci:
         ftif, scan0, lat_range = solve.build_l1_nci(lat_range, bands, solve._work("l1_rad.tif"), **kw)
     else:
-        ftif, scan0, lat_range = solve.build_l1(lat_range, bands, solve._work("l1_rad.tif"), calibrate_kwargs=kw)
+        ftif, scan0, lat_range = solve.build_l1(lat_range, bands, solve._work("l1_rad.tif"), l1_config=args.l1_config)
     solve.log(f"L1 built ({'ISSDC nci' if nci else 'iirspy'}): {ftif} ({len(bands)} bands), scan0={scan0}")
 
     anc = ck.ancillary(sid)
@@ -270,6 +301,23 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
     backplanes.write_obs(fobs, obs, sid, row0=scan0)
     solve.log(f"OBS saved: {fobs} (sensor geometry from {obs['sensor_source']})")
 
+    from iirspy import l2_stats
+
+    t_stats = time.time()
+    try:
+        stats = l2_stats.l2_stats(
+            fl2,
+            ftif,
+            np.asarray(l2.img.solar_inc),
+            obs["lat"],
+            emi=obs["bands"]["sensor_zenith"],
+            phase=obs["bands"]["phase"],
+            sdist=float(l2.img.attrs["solar_distance_au"]),
+        )
+    except Exception as e:  # sanity stats must never fail a refl run
+        stats = {"error": f"{type(e).__name__}: {e}"}
+    solve.log(f"l2_stats: {time.time() - t_stats:.1f}s {stats.get('error', 'ok')}")
+
     fglt = fgcps.parent / f"{sid}_{group}_glt.tif"
     if not fglt.is_file():
         solve.log(f"glt: {fglt} not found -- iirs-solve-scene should have built it alongside {fgcps}")
@@ -306,14 +354,43 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:
         if "empirical_notes" in l1.img.attrs
         else None,
         "l2_diagnostics": {k: l2.img.attrs.get(k) for k in L2.DIAGNOSTICS},
+        "l2_stats": stats,
         "total_s": round(time.time() - t_start, 1),
     }
     fsummary = solve._work("refl_summary.json")
     fsummary.write_text(json.dumps(summary, indent=1, default=str))
     solve.log(f"\ndone in {summary['total_s']}s.")
 
-    _keep(args.keep_l1, ftif, ftif.with_suffix(".vrt"))
-    _keep(args.keep, fl2, fl2.with_suffix(".vrt"), fobs, fsummary, solve.LOG)
+    inputs = {
+        "nri_zip": _file_info(solve.ZIP),
+        "gcps": _file_info(fgcps, sha=True),
+        "frames": {**_file_info(solve.FRAMES), "key": solve._frames_key()},
+        "label": _file_info(flabel),
+        "geometry": _file_info(fgeom),
+        "spice_kernels": [str(k) for k in kernels],
+        "topo": _file_info(ftopo) if ftopo else None,
+    }
+    prov = utils.provenance(
+        sid=sid,
+        group=group,
+        l1_preset=None if nci else args.l1,
+        l1_config=None if nci else args.l1_config.to_attrs(),
+        l2_preset=args.l2,
+        l2_config=l2cfg.to_attrs(),
+        inputs=inputs,
+        empirical_notes=summary["l1_empirical_notes"],
+    )
+    fprov = solve._work("provenance.json")
+    fprov.write_text(json.dumps(prov, indent=1, default=str))
+    for f in (ftif, fl2):
+        with rasterio.open(f, "r+") as dst:
+            dst.update_tags(IIRS_PROVENANCE=json.dumps(prov, default=str))
+
+    sidecars = [
+        f for f in (ftif.with_name(ftif.stem + "_empirical.npz"), ftif.with_name(ftif.stem + "_snr.tif")) if f.exists()
+    ]
+    _keep(args.keep_l1, ftif, ftif.with_suffix(".vrt"), *sidecars, fprov)
+    _keep(args.keep, fl2, fl2.with_suffix(".vrt"), fobs, fsummary, fprov, solve.LOG)
     if ftopo:  # geometry, so it lands beside the GCPs rather than with L2
         _keep(str(fgcps.parent) if args.keep else None, ftopo)
 
