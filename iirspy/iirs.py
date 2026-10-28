@@ -1333,6 +1333,9 @@ class L2(IIRSData):
             min_lit=cfg.min_lit,
         )
 
+        # photfn is numpy (topo); unchunked, photfn * solar_flux is an eager (y, x, band) float64 cube
+        if rad.chunks is not None and hasattr(photfn, "chunk"):
+            photfn = photfn.chunk({"y": rad.chunksizes["y"]})
         num = rad - trad
         den = photfn * solar_flux
         if cfg.polish is not None:
