@@ -1,6 +1,7 @@
 """P0 basis: lut_median and G1-table calibration, HSRS flux with distance scaling, refl CLI configs."""
 
 import numpy as np
+import pandas as pd
 import pytest
 import xarray as xr
 
@@ -22,6 +23,7 @@ def l0(tmp_path, monkeypatch):
     monkeypatch.setattr(utils, "get_gain_offset", lambda *a, **k: (gain, offset))
     monkeypatch.setattr(utils, "get_saturation_radiance", lambda *a, **k: sat)
     monkeypatch.setattr(L0, "_start_time", lambda self: "2020-12-02T15:27:48")
+    monkeypatch.setattr(utils, "get_exposure_duration", lambda *a: 1.0)
     dn = xr.DataArray(
         rng.uniform(1, 100, (3, 6, 250)).astype("float32"),
         dims=("band", "y", "x"),
@@ -54,6 +56,11 @@ def test_p0_and_identity_g1_table(l0, tmp_path):
     rad_t = _cal(obj, calib=str(ft.with_name("g1b.npz")))
     np.testing.assert_allclose(rad_t.values, rad.values, rtol=1e-6)
     assert rad_t.attrs["calib_table_version"] == "t" and len(rad_t.attrs["calib_table_sha256"]) == 64
+    assert iirs._read_g1_table(ft, pd.Timestamp("2020-12-02T15:27:48Z"))[3]["calib_table_epoch"] == "2019-01-01"
+    with pytest.MonkeyPatch.context() as mp:  # table gain is in e1 (1 ms) units, scaled by exposure like the LUT
+        mp.setattr(utils, "get_exposure_duration", lambda *a: 10.0)
+        rad_e3 = _cal(obj, calib=str(ft.with_name("g1b.npz")))
+    np.testing.assert_allclose(rad_e3.values, (10 * (obj.img * gm / 10 + om)).values, rtol=1e-6)
     with pytest.raises(ValueError, match="precedes"):
         np.savez(ft, gain=ngain[:1], offset=om.values, epoch_start=["2021-01-01"])
         _cal(obj, calib=str(ft))

@@ -219,7 +219,7 @@ def _read_g1_table(fnpz, t):
     """Gain, offset, bad-pixel mask (or None) and provenance attrs of the G1 table epoch covering `t`.
 
     The npz holds `gain` (n_epoch, 256, 250) and `offset` (n_epoch, 256) or (256,), both in the LUT's
-    units [mW/cm^2/sr/um per DN] and applied as is (no exposure scaling), `epoch_start` (n_epoch,) ISO
+    units [mW/cm^2/sr/um per DN] for e1 (1 ms; scaled by exposure like the LUT), `epoch_start` (n_epoch,) ISO
     dates, optional `mask` (n_epoch, 256, 250) bool (True = bad) and `version`. The epoch is the latest
     `epoch_start` <= `t`.
     """
@@ -227,6 +227,7 @@ def _read_g1_table(fnpz, t):
 
     z = np.load(fnpz)
     starts = pd.DatetimeIndex(z["epoch_start"])
+    t = pd.Timestamp(t).tz_localize(None) if pd.Timestamp(t).tzinfo else pd.Timestamp(t)  # label times end in Z
     e = int(starts.searchsorted(t, side="right")) - 1
     if not starts.is_monotonic_increasing:
         raise ValueError(f"{fnpz}: epoch_start must be ascending")
@@ -876,6 +877,7 @@ class L0(IIRSData):
                 gain, offset = gain.median("x"), offset.median("x")
             elif cfg.calib != "lut":
                 gain, offset, table_mask, table_attrs = _read_g1_table(cfg.calib, pd.Timestamp(self._start_time()))
+                gain = gain * (utils.E1_EXPOSURE_MS / utils.get_exposure_duration(self.qub))  # e1 units, as the LUT
             # Apply gain and offset to convert DN -> Radiance
             rad = 10 * (self.img * gain + offset)  # [mW/cm^2/sr/μm] -> [W/m^2/sr/um]
 
