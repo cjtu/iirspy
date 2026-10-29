@@ -257,6 +257,13 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:  # no
     else:
         ftif, scan0, lat_range = solve.build_l1(lat_range, bands, solve._work("l1_rad.tif"), l1_config=args.l1_config)
     solve.log(f"L1 built ({'ISSDC nci' if nci else 'iirspy'}): {ftif} ({len(bands)} bands), scan0={scan0}")
+    # GCP rows are cube rows of the solve's crop: a different crop start would shift every GCP row.
+    fsum = fgcps.parent / f"{fgcps.stem}_solve_summary.json"
+    solve_scan0 = json.loads(fsum.read_text()).get("scan0") if fsum.exists() else None
+    if not nci and solve_scan0 is not None and solve_scan0 != scan0:
+        sys.exit(
+            f"{sid} {group}: L1 crop starts at scan {scan0} but the solve's started at {solve_scan0} -- re-solve with this iirspy"
+        )
     if args.l1_only:
         fnpz, fprov = ftif.with_name(ftif.stem + "_empirical.npz"), solve._work("provenance.json")
         prov = utils.provenance(
