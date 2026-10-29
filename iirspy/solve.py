@@ -359,6 +359,10 @@ def build_l1(
         effective_calibrate_kws = {"l1_config": l1_config.to_attrs(), "frame_offsets": str(FRAMES)}
         if l1_config.calib not in CALIB:
             effective_calibrate_kws["calib_sha256"] = hashlib.sha256(Path(l1_config.calib).read_bytes()).hexdigest()
+    # Crop with the geometry csv the solve's GCP lattice uses: a sid can carry several g_grd csvs
+    # (d18/n18) whose latitudes differ, so the label's own csv can cut the cube rows differently.
+    fgeom = ck.ancillary(SID)["geometry/calibrated"]
+    crop_geom = fgeom.name if fgeom is not None else "label"
     fmeta = ftif_out.with_suffix(".meta.json")
     if ftif_out.exists() and fmeta.exists():
         meta = json.loads(fmeta.read_text())
@@ -370,6 +374,7 @@ def build_l1(
             and "calibrate_kwargs" in meta
             and meta["calibrate_kwargs"] == effective_calibrate_kws
             and meta.get("frames") == _frames_key()
+            and meta.get("crop_geom") == crop_geom
         ):
             log(f"L1 already built: {ftif_out} (covers {cached_range}, requested {lat_range})")
             return ftif_out, meta["scan0"], cached_range
@@ -392,7 +397,7 @@ def build_l1(
             else l0.calibrate(l1_config, frame_offsets=str(FRAMES))
         )
     # l1.img already holds exactly `bands` -- that's what _stage_inputs staged.
-    _, xyext = utils.parse_geom(l1.csv, latlonextent=(-180, 180, *lat_range))
+    _, xyext = utils.parse_geom(fgeom or l1.csv, latlonextent=(-180, 180, *lat_range))
     ymin, ymax = xyext[2], xyext[3]
     log(f"L1 crop lat={lat_range}: scan {ymin}-{ymax} ({ymax - ymin} rows)")
     l1.img = l1.img.sel(y=slice(ymin, ymax))
@@ -409,6 +414,7 @@ def build_l1(
             "bands": saved_bands,
             "calibrate_kwargs": effective_calibrate_kws,
             "frames": _frames_key(),
+            "crop_geom": crop_geom,
         })
     )
     if not keep_raw:

@@ -185,6 +185,7 @@ def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeyp
     # detect a rebuild by the next real step past the cache check, `_stage_inputs`.
     monkeypatch.setattr(solve.utils, "extract", lambda *a, **k: [])
     monkeypatch.setattr(solve, "_stage_inputs", boom)
+    monkeypatch.setattr(solve.ck, "ancillary", lambda sid: {"geometry/calibrated": None})
 
     ffr = tmp_path / "frames.csv"
     ffr.write_text("kind,line,group,bands,value\n")
@@ -199,11 +200,18 @@ def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeyp
             "bands": [1, 2],
             "calibrate_kwargs": {**solve.CALIBRATE_KWS, "frame_offsets": str(ffr), "empirical": True},
             "frames": solve._frames_key(),
+            "crop_geom": "label",
         })
     )
 
     # Matching kwargs (the default) -> cache hit, no rebuild attempted.
     assert solve.build_l1((10.0, 20.0), [1, 2], ftif) == (ftif, 0, (10.0, 20.0))
+
+    # Cropped with a different geometry csv than the solve now uses -> cache miss.
+    monkeypatch.setattr(solve.ck, "ancillary", lambda sid: {"geometry/calibrated": tmp_path / "x_g_grd_d18.csv"})
+    with pytest.raises(RuntimeError, match="rebuild-attempted"):
+        solve.build_l1((10.0, 20.0), [1, 2], ftif)
+    monkeypatch.setattr(solve.ck, "ancillary", lambda sid: {"geometry/calibrated": None})
 
     # Different calibrate_kwargs to the same path -> cache miss, must not return the stale cube.
     with pytest.raises(RuntimeError, match="rebuild-attempted"):
