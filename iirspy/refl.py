@@ -44,6 +44,7 @@ import xarray as xr
 from iirspy import chunks as ck
 from iirspy import solve, utils
 from iirspy.config import L1Config, L2Config
+from iirspy.empirical import PAN_BANDS
 
 
 def _full_bands() -> list[int]:
@@ -132,6 +133,11 @@ def _parser():
         "--l1-only", action="store_true", help="stop after the L1: keep only its _empirical.npz frames and provenance"
     )
     ap.add_argument(
+        "--topo-only",
+        action="store_true",
+        help="build the pan-band L1 for the scan crop, write only <sid>_<group>_topo.tif beside the GCPs (needs --keep)",
+    )
+    ap.add_argument(
         "--clean",
         action="store_true",
         help="delete the work dir after --keep; drops the camera-space L1/L2 intermediates",
@@ -211,6 +217,8 @@ def main(argv: list[str] | None = None) -> None:
     args.l1_config = l1_config(args)
     args.l2_config = l2_config(args)  # fail on a bad preset/field value before any work
     sid, group = args.sid, args.group
+    if args.topo_only and not args.keep:
+        sys.exit("--topo-only needs --keep: the topo is kept beside the GCPs")
     if args.clean and not (args.keep or args.keep_l1):
         sys.exit("--clean without --keep/--keep-l1 would discard the whole run")
 
@@ -249,7 +257,7 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:  # no
     cfg = replace(ck.chunk_cfg(group), aoi=aoi, lat_band=lat_range)
     solve.log(f"aoi from {len(gcps)} merged gcps: {[round(v / 1000, 1) for v in aoi]} km")
 
-    bands = _full_bands()
+    bands = PAN_BANDS if args.topo_only else _full_bands()  # topo-only needs the scan crop, not the spectrum
     nci = args.l2 == "issdc-nci"
     kw = {k: v for k in ("fix_frames", "fill_frames") if (v := getattr(args, k)) is not None}
     if nci:
@@ -285,6 +293,16 @@ def _run(args, sid: str, group: str, fgcps: Path, t_start: float) -> None:  # no
     kernels = ck.kernels(sid[:8])
     az, elev, r_sun = georef.sun_geometry(fgeom, flabel, cfg, kernels)
     solve.log(f"sun (grid frame): az={az:.1f} elev={elev:.2f} r_sun={r_sun:.4f} deg")
+
+    if args.topo_only:
+        with rasterio.open(ftif) as src:
+            shape = (src.height, src.width)
+        topo = georef.scene_topo(sid, group, gcps, shape, fgeom, flabel, cfg, kernels, solve.OUT, scan0=scan0)
+        _keep(str(fgcps.parent), topo)
+        solve.log(f"--topo-only: {topo} -> {fgcps.parent}, done in {time.time() - t_start:.0f} s")
+        if args.clean:
+            shutil.rmtree(solve.OUT, ignore_errors=True)
+        return
 
     l1 = L1.from_file(ftif, sid, str(ck.ARCHIVE if nci else solve.STAGE))
     if nci:
