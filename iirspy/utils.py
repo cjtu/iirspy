@@ -6,7 +6,6 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -1167,107 +1166,6 @@ def detect_stripes_2D(data, threshold):
     num_anom = np.sum(((data < data_l) & (data < data_r)) | ((data > data_l) & (data > data_r)), axis=0)
     is_stripe_x = num_anom > threshold  # 1D bool array along samples (x)
     return is_stripe_x
-
-
-def fourier_filter(img, vthresh=0.8, vtilt=0.0, hthresh=0.0, htilt=0.0, get_filt_at_band=None):
-    """
-    Filters linear features from an img cube in ftt domain.
-
-    Creates a mask in fft domain that interpolates vertical (v) and horizontal
-    (h) features (e.g., stripes, dead pixel rows, etc).
-
-    The vthresh and hthresh control how aggressive the filter is:
-    - v_span=0.1 will slightly fade vertical features identified
-    - v_span=0.9 will aggerssively fade vertical features (real signal may blur)
-
-    The htilt and vtilt control the sublinearity of the features.
-    For example:
-    - htilt=0 will only target perfectly horizontal stripes
-    - htilt=0.9 will capture sub-horiontal features (real signal may blur)
-
-    In practice, balance of the span and depth for horizonal and vertical
-    lines will be needed. The parameters depend on the image size and the
-    nature of the artefacts.
-
-    It can be helpful to show the shape of the noise in the fft domain.
-    Use get_filt_at_band with all other params 0 to get the fft for
-    that band (plot with plt.imshow). Vertical striping will appear as a
-    bright ray from the center to the left/right in the fft domain, while
-    horizontal striping will appear as bright rays towards the top/bottom.
-    Tweak params and plot until the mask covers those bright rays.
-
-    See Suárez-Valencia (2024) ESS (https://doi.org/10.1029/2023EA003464)
-
-    Parameters
-    ----------
-    img (np.array, xr.DataArray)
-        Input image (band, y, x)
-    vthresh (float, 0-1)
-        How aggressively vertical features are filtered (default 0.8).
-    vtilt (float, 0-1)
-        How vertical (0) or sub-vertical (up to 1) of features to filter (default 0).
-    hthresh (float, 0-1)
-        How aggressively horizontal features are filtered (default 0.8).
-    htilt (float, 0-1)
-        How horizontal (0) or sub-horizontal (up to 1) of features to filter (default 0).
-    get_filt_at_band (int or None)
-        Return the masked fft domain image at the given band number.
-    """
-    # Mask triangles parameters
-    y, x = img.shape[1:3]
-    cy, cx = (y // 2, x // 2)
-
-    # Mask triangles. Note h/v transposed in phase space (v:left/right, h:up/down)
-    h_mask_base = int(cy * (vtilt))
-    h_mask_height = int(cx * (1 - vthresh))
-    v_mask_base = int(cx * (htilt))
-    v_mask_height = int(cy * (1 - hthresh))
-
-    # Left triangle vertices (top left, point towards center, bottom left)
-    left_triangle = np.array([[0, cy - h_mask_base], [cx - h_mask_height, cy], [0, cy + h_mask_base]])
-
-    # Right triangle vertices (top right, point towards center, bottom right)
-    right_triangle = np.array([[x, cy - h_mask_base], [cx + h_mask_height, cy], [x, cy + h_mask_base]])
-
-    # Top triangle vertices (top left, point towards center, top right)
-    top_triangle = np.array([[cx - v_mask_base, 0], [cx, cy - v_mask_height], [cx + v_mask_base, 0]])
-
-    # Bottom triangle vertices (bottom left, point towards center, bottom right)
-    bottom_triangle = np.array([[cx - v_mask_base, y], [cx, cy + v_mask_height], [cx + v_mask_base, y]])
-
-    # Draw all triangles
-    mask = np.ones((y, x, 2))
-    cv2.fillPoly(mask, [left_triangle.astype(np.int32)], (0, 0))
-    cv2.fillPoly(mask, [right_triangle.astype(np.int32)], (0, 0))
-    cv2.fillPoly(mask, [top_triangle.astype(np.int32)], (0, 0))
-    cv2.fillPoly(mask, [bottom_triangle.astype(np.int32)], (0, 0))
-
-    if get_filt_at_band is not None:
-        img = img[get_filt_at_band, :, :].data
-        fft = cv2.dft(img, flags=cv2.DFT_COMPLEX_OUTPUT)
-        fft_shift = np.fft.fftshift(fft)
-        masked_fft = fft_shift * mask
-        # Scale for plotting
-        mfft = 20 * np.log(cv2.magnitude(masked_fft[:, :, 0], masked_fft[:, :, 1]))
-        return mfft
-
-    out = img.copy()
-    for band in range(img.shape[0]):
-        # if np.isnan(np.sum(img[band,:,:])):
-        # continue
-        # Fourier transform
-        fft = cv2.dft(img[band, :, :].data, flags=cv2.DFT_COMPLEX_OUTPUT)
-        fft_shift = np.fft.fftshift(fft)
-        # Apply mask
-        masked_fft = fft_shift * mask
-        # Inverse Fourier transform
-        ifft_shift = np.fft.ifftshift(masked_fft)
-        ifft = cv2.idft(ifft_shift) / (y * x)
-        out[band, :, :] = cv2.magnitude(ifft[:, :, 0], ifft[:, :, 1])
-
-    # Preserve original non-data regions
-    imgmask = img != 0
-    return out * imgmask
 
 
 def smooth_savgol(data: xr.DataArray, savgol_window: int = 9, savgol_polyorder: int = 2) -> xr.DataArray:
