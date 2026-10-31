@@ -24,7 +24,8 @@ import numpy as np
 from iirspy import photometry, utils
 
 POLISH = {"verma2022": utils.FPOLISH, "issdc_empirical": utils.FPOLISH_ISSDC_EMPIRICAL}
-FLUX = ("pradan", "noaa_cdr_mean", "noaa_cdr_monthly")
+FLUX = ("pradan", "hsrs", "noaa_cdr_mean", "noaa_cdr_monthly")
+CALIB = ("lut", "lut_median")
 SDIST = ("spice", "none")
 THERMAL = ("none", "isothermal")
 SMOOTHING_EDGES = ("pair", "nan", "reflect")
@@ -75,7 +76,12 @@ class L1Config(_Config):
         bad_pixel_mask: Null the packaged bad detector elements.
         exclude_wl: Extra (lo, hi) wavelength ranges [nm] to null, or None.
         attach_snr: Attach the empirical broadband SNR as an `snr` coord (empirical scenes with shadow).
-        attach_empirical_frames: Attach the empirical dark/flat/smile (band, x) frames as coords.
+        attach_empirical_frames: Attach the empirical dark/flat/smile (band, x) frames as coords
+            (diagnostic only when `empirical` is off: they are saved, not applied).
+        calib: Radiometric scale when not `empirical`. "lut" is the per-element LUT gain/offset,
+            "lut_median" the LUT's per-band median gain/offset (no cross-track structure), or a path
+            to a G1 table `.npz` (see `L0.calibrate_to_rad`). `empirical` already uses the median, so
+            it needs "lut".
     """
 
     empirical: bool = False
@@ -87,8 +93,17 @@ class L1Config(_Config):
     exclude_wl: tuple[tuple[float, float], ...] | None = None
     attach_snr: bool = True
     attach_empirical_frames: bool = False
+    calib: str = "lut"
 
     def __post_init__(self):
+        if isinstance(self.calib, Path):
+            object.__setattr__(self, "calib", str(self.calib))
+        if self.calib not in CALIB and not Path(self.calib).is_file():
+            raise ValueError(f"calib {self.calib!r}: not one of {CALIB} or an existing G1 table")
+        if self.empirical and self.calib != "lut":
+            raise ValueError(
+                f"empirical already uses the band-median LUT scale; calib must be 'lut', not {self.calib!r}"
+            )
         if self.exclude_wl is not None:
             object.__setattr__(self, "exclude_wl", tuple((float(lo), float(hi)) for lo, hi in self.exclude_wl))
 
@@ -97,14 +112,15 @@ class L1Config(_Config):
 class L2Config(_Config):
     """L1 radiance -> L2 reflectance choices (see `L2._compute_reflectance`).
 
-    Steps run in order: solar flux, thermal removal, clip, polish, photometric normalization,
-    Besse phase, spectral smoothing.
+    Steps run in order: solar flux, thermal removal, polish, photometric normalization,
+    Besse phase, spectral smoothing, clip.
 
     Attributes:
         flux: Solar spectrum. "pradan" (the PRADAN flux file), "noaa_cdr_mean" (NOAA SSI CDR v03,
-            2010-2019 mean), "noaa_cdr_monthly" (the CDR month of the scene's start time), a path
-            to a file in PRADAN's format (tab-separated nm, mW/cm^2/um at 1 AU), or a per-band
-            sequence in W/m^2/sr/um for bands 1..N, used as is (no distance scaling).
+            2010-2019 mean), "noaa_cdr_monthly" (the CDR month of the scene's start time), "hsrs"
+            (HSRS v2 through the IIRS SRFs, packaged in PRADAN's format), a path to a file in PRADAN's
+            format (tab-separated nm, mW/cm^2/um at 1 AU; scaled by 1/sdist^2), or a per-band
+            sequence in W/m^2/sr/um for bands 1..N, used as is (NO distance scaling).
         sdist: Sun distance for scaling the flux: "spice", "none" (1 AU) or a float in AU.
         thermal: Thermal tail model, "none" or "isothermal" (one temperature per pixel).
         thermal_eps: Emissivity, used both to estimate T and to remove eps * B(T).
@@ -112,13 +128,14 @@ class L2Config(_Config):
             brightness temperature is T.
         thermal_t_min: T [K] at or below which (or NaN) a pixel's T falls back to the flat-surface
             equilibrium temperature at its incidence (`utils.flat_surface_temperature`).
-        clip_negative: Zero negative thermal-removed radiance before polish.
+        clip_negative: Zero negative reflectance after smoothing.
+        fill_nan: Value written over every NaN as the last step (ISSDC's ndi marks all nulls with 0), or None to keep NaN.
         polish: Per-band divisor: None, "verma2022", "issdc_empirical", or a csv path with `band`
             and `polish` columns. Mapped by band number; bands the table lacks get 1.0.
         photom: Disk function, a `photometry.MODELS` key or any f(cos_inc, cos_view, g) callable.
         use_slope_az: Use the caller's `slope_az` terrain product when one is given.
         phase: Rescale onto Besse's 30 deg phase reference (`photometry.besse_phase`).
-        cos_min: Floor on cos_inc and cos_view before the disk function (0 = none).
+        cos_min: Floor on cos_inc and cos_view before the disk function (0 = none). Clamps.
         min_lit: Null pixels with less than this lit fraction (needs `slope_az`).
         smoothing: Spectral moving-average width in bands (0 = off).
         smoothing_edges: End bands of the moving average (`utils.moving_average`).
@@ -131,6 +148,7 @@ class L2Config(_Config):
     thermal_bands: tuple[int, int] = (227, 247)
     thermal_t_min: float = 0.0
     clip_negative: bool = False
+    fill_nan: float | None = None
     polish: str | None = None
     photom: str | Callable = "lambert"
     use_slope_az: bool = True
@@ -172,15 +190,40 @@ L1Config.PRESETS = {
         "fill_frames": True,
     },
     "issdc": {},
+    "p0": {
+        "calib": "lut_median",
+        "empirical": False,
+        "fix_frames": True,
+        "fill_frames": False,
+        "bad_pixel_mask": False,
+        "interp_bands": None,
+        "interp_spatial": False,
+        "attach_empirical_frames": True,
+    },
 }
 
 L2Config.PRESETS = {
     "iirspy": {"thermal": "isothermal", "photom": "lambert"},
+    "l2d": {
+        "flux": "hsrs",
+        "sdist": "spice",
+        "thermal": "isothermal",
+        "photom": "lambert",
+        "phase": False,
+        "polish": None,
+        "smoothing": 0,
+        "clip_negative": False,
+        "fill_nan": None,
+        "use_slope_az": True,
+        "min_lit": 0.0,
+        "cos_min": 0.0,
+    },
     "issdc": {
         "sdist": "none",
         "thermal": "isothermal",
         "thermal_eps": 1.0,
         "clip_negative": True,
+        "fill_nan": 0.0,
         "polish": "issdc_empirical",
         "use_slope_az": False,
         "smoothing": 3,
@@ -196,3 +239,5 @@ L2Config.PRESETS = {
         "smoothing": 3,
     },
 }
+# Same L2 params as "issdc"; `iirs-compute-refl` reads the ISSDC nci L1 for this name instead of calibrating nri.
+L2Config.PRESETS["issdc-nci"] = L2Config.PRESETS["issdc"]

@@ -342,16 +342,20 @@ def build_flat(img, dark, rs, lit, row_bright, ref_flat=None):
     """
     bad = on_bands(utils.load_bad_pixel_mask(), img)
     ref_flat = None if ref_flat is None else on_bands(ref_flat, img)
-    flats, runs_used = [], {}
+    flats, runs_used, levels = [], {}, []
     for lo, hi in dn_bins(row_bright, lit):
         rows = flattest_rows(rs, lit & (row_bright >= lo) & (row_bright < hi))
         runs_used[f"{lo:.0f}-{hi:.0f}"] = None if rows is None else [int(rows[0]), int(rows[-1]) + 1]
         if rows is not None:
             flats.append(derive_sensor_flat(img, dark, rows))
-    emp_notes = {"flat_runs": runs_used, "flat_fallback": False, "flat_ref_rms": None}
+            levels.append(float(np.nanmedian(row_bright[rows])))
+    emp_notes = {"flat_runs": runs_used, "flat_fallback": False, "flat_ref_rms": None, "flat_bin_levels": levels}
 
     if flats:
-        flat = xr.concat(flats, dim="region").median("region").where(~bad).astype("float32")
+        unmasked = xr.concat(flats, dim="region").median("region").astype("float32")
+        flat = unmasked.where(~bad)
+        # unmasked composite + per-bin flats ride along as attrs; L1.calibrate_to_rad attaches them as frames
+        flat.attrs.update(unmasked=unmasked, bins=[f.astype("float32") for f in flats])
         if ref_flat is not None:
             emp_notes["flat_ref_rms"] = _flat_rms(flat, ref_flat)
     elif ref_flat is not None:
@@ -476,7 +480,9 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
     if flat_yrange is not None:
         a, b = int(flat_yrange[0]), int(flat_yrange[1])
         bad = on_bands(utils.load_bad_pixel_mask(), img)
-        flat = derive_sensor_flat(img, dark, np.arange(a, b)).where(~bad).astype("float32")
+        unmasked = derive_sensor_flat(img, dark, np.arange(a, b))
+        flat = unmasked.where(~bad).astype("float32")
+        flat.attrs.update(unmasked=unmasked, bins=[unmasked])
         emp_notes.update(
             flat_runs={"user": [a, b]},
             flat_fallback=False,

@@ -6,7 +6,6 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -38,6 +37,7 @@ FNOAA = str(PKG_DATA.joinpath("solar_flux_noaa_cdr_v03.csv"))
 FBADBANDS = str(PKG_DATA.joinpath("iirs_bad_bands.csv"))
 FBADPIXELS = str(PKG_DATA.joinpath("bad_pixel_mask.csv"))
 FSOLAR = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_solar_flux.txt"))
+FSOLAR_HSRS = str(PKG_DATA.joinpath("ch2_iirs_solar_flux_hsrs.txt"))
 FWAVELENGTHS = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_wavelength.csv"))
 # Projections used in the Ch2 IIRS selenoref tool https://doi.org/10.1007/s12524-024-01814-4
 IIRS_PROJ_DICT = {
@@ -208,12 +208,14 @@ def geom2grid(fgeom, extent, xs=None, ys=None):
     # NOTE: Makes almost no difference (pixel lvl offset, overall offset much larger)
     # df_buf, _ = parse_geom(fgeom, extent, buffer=0.5)
 
-    # Create thin plate spline interpolators
+    # TPS on unit vectors, not lon/lat: near a pole lon swings up to 180 deg within a few scans (and
+    # wraps at +-180 anywhere), and a spline on lon oscillates there by tens of km.
     points = df_buf[["Pixel", "Scan"]].values
     lons = df_buf["Longitude"].values
-    lats = df_buf["Latitude"].values
-    rbf_lon = RBFInterpolator(points, lons, kernel="thin_plate_spline")
-    rbf_lat = RBFInterpolator(points, lats, kernel="thin_plate_spline")
+    lon, lat = np.radians(lons), np.radians(df_buf["Latitude"].values)
+    rbf = RBFInterpolator(
+        points, np.c_[np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], kernel="thin_plate_spline"
+    )
 
     # Create a 2D grid of all pixel x and y values in extent
     pixel_range = np.arange(xyext[0], xyext[1] + 1, 1)
@@ -224,9 +226,12 @@ def geom2grid(fgeom, extent, xs=None, ys=None):
         scan_range = ys
     grid_pixel, grid_scan = np.meshgrid(pixel_range, scan_range)
 
-    # Create the 2D interpolated grids of lon and lat
-    gridlon = rbf_lon(np.column_stack([grid_pixel.ravel(), grid_scan.ravel()])).reshape(grid_pixel.shape)
-    gridlat = rbf_lat(np.column_stack([grid_pixel.ravel(), grid_scan.ravel()])).reshape(grid_pixel.shape)
+    v = rbf(np.column_stack([grid_pixel.ravel(), grid_scan.ravel()]))
+    v /= np.linalg.norm(v, axis=1)[:, None]
+    gridlon = np.degrees(np.arctan2(v[:, 1], v[:, 0])).reshape(grid_pixel.shape)
+    gridlat = np.degrees(np.arcsin(np.clip(v[:, 2], -1, 1))).reshape(grid_pixel.shape)
+    if (lons > 180).any():  # keep the csv's own 0-360 convention
+        gridlon %= 360
     return gridlon, gridlat, xyext
 
 
@@ -869,6 +874,50 @@ def get_solar_flux(sdist=1.0, fflux=FSOLAR):
     return xr.DataArray(flux, coords={"band": np.arange(1, 257)}, name="Solar flux [W/m^2/sr/um]")
 
 
+def provenance(**extra) -> dict:
+    """Who/what/where made a product: package version and git state, environment, run ids, plus `extra`.
+
+    `git` is {"commit", "dirty"} when the package sits in a git checkout, else None; never raises.
+    """
+    import datetime
+    import os
+    import platform
+    import socket
+    import subprocess
+    import sys
+
+    src = Path(__file__).parent
+    git = None
+    if "site-packages" not in src.parts:
+        try:
+
+            def run(*a):
+                cmd = ["git", "-C", str(src), *a]
+                return subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=True).stdout.strip()  # noqa: S603
+
+            git = {"commit": run("rev-parse", "HEAD"), "dirty": bool(run("status", "--porcelain", "--", "."))}
+        except Exception:
+            git = None
+    versions: dict[str, str | None] = {}
+    for pkg in ("numpy", "xarray", "rasterio", "dask"):
+        try:
+            versions[pkg] = metadata.version(pkg)
+        except metadata.PackageNotFoundError:
+            versions[pkg] = None
+    slurm = {k: os.environ[k] for k in ("SLURM_JOB_ID", "SLURM_ARRAY_JOB_ID", "SLURM_ARRAY_TASK_ID") if k in os.environ}
+    return {
+        "iirspy_version": IIRSPY_VERSION,
+        "git": git,
+        "python": platform.python_version(),
+        "packages": versions,
+        "host": socket.gethostname(),
+        "utc": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+        "argv": list(sys.argv),
+        "slurm": slurm,
+        **extra,
+    }
+
+
 def spice_kernels(day, spice_dir=None) -> list[Path]:
     """Generic SPICE kernels plus the orbit SPKs covering `day`, a "YYYYMMDD" string.
 
@@ -1117,107 +1166,6 @@ def detect_stripes_2D(data, threshold):
     num_anom = np.sum(((data < data_l) & (data < data_r)) | ((data > data_l) & (data > data_r)), axis=0)
     is_stripe_x = num_anom > threshold  # 1D bool array along samples (x)
     return is_stripe_x
-
-
-def fourier_filter(img, vthresh=0.8, vtilt=0.0, hthresh=0.0, htilt=0.0, get_filt_at_band=None):
-    """
-    Filters linear features from an img cube in ftt domain.
-
-    Creates a mask in fft domain that interpolates vertical (v) and horizontal
-    (h) features (e.g., stripes, dead pixel rows, etc).
-
-    The vthresh and hthresh control how aggressive the filter is:
-    - v_span=0.1 will slightly fade vertical features identified
-    - v_span=0.9 will aggerssively fade vertical features (real signal may blur)
-
-    The htilt and vtilt control the sublinearity of the features.
-    For example:
-    - htilt=0 will only target perfectly horizontal stripes
-    - htilt=0.9 will capture sub-horiontal features (real signal may blur)
-
-    In practice, balance of the span and depth for horizonal and vertical
-    lines will be needed. The parameters depend on the image size and the
-    nature of the artefacts.
-
-    It can be helpful to show the shape of the noise in the fft domain.
-    Use get_filt_at_band with all other params 0 to get the fft for
-    that band (plot with plt.imshow). Vertical striping will appear as a
-    bright ray from the center to the left/right in the fft domain, while
-    horizontal striping will appear as bright rays towards the top/bottom.
-    Tweak params and plot until the mask covers those bright rays.
-
-    See Suárez-Valencia (2024) ESS (https://doi.org/10.1029/2023EA003464)
-
-    Parameters
-    ----------
-    img (np.array, xr.DataArray)
-        Input image (band, y, x)
-    vthresh (float, 0-1)
-        How aggressively vertical features are filtered (default 0.8).
-    vtilt (float, 0-1)
-        How vertical (0) or sub-vertical (up to 1) of features to filter (default 0).
-    hthresh (float, 0-1)
-        How aggressively horizontal features are filtered (default 0.8).
-    htilt (float, 0-1)
-        How horizontal (0) or sub-horizontal (up to 1) of features to filter (default 0).
-    get_filt_at_band (int or None)
-        Return the masked fft domain image at the given band number.
-    """
-    # Mask triangles parameters
-    y, x = img.shape[1:3]
-    cy, cx = (y // 2, x // 2)
-
-    # Mask triangles. Note h/v transposed in phase space (v:left/right, h:up/down)
-    h_mask_base = int(cy * (vtilt))
-    h_mask_height = int(cx * (1 - vthresh))
-    v_mask_base = int(cx * (htilt))
-    v_mask_height = int(cy * (1 - hthresh))
-
-    # Left triangle vertices (top left, point towards center, bottom left)
-    left_triangle = np.array([[0, cy - h_mask_base], [cx - h_mask_height, cy], [0, cy + h_mask_base]])
-
-    # Right triangle vertices (top right, point towards center, bottom right)
-    right_triangle = np.array([[x, cy - h_mask_base], [cx + h_mask_height, cy], [x, cy + h_mask_base]])
-
-    # Top triangle vertices (top left, point towards center, top right)
-    top_triangle = np.array([[cx - v_mask_base, 0], [cx, cy - v_mask_height], [cx + v_mask_base, 0]])
-
-    # Bottom triangle vertices (bottom left, point towards center, bottom right)
-    bottom_triangle = np.array([[cx - v_mask_base, y], [cx, cy + v_mask_height], [cx + v_mask_base, y]])
-
-    # Draw all triangles
-    mask = np.ones((y, x, 2))
-    cv2.fillPoly(mask, [left_triangle.astype(np.int32)], (0, 0))
-    cv2.fillPoly(mask, [right_triangle.astype(np.int32)], (0, 0))
-    cv2.fillPoly(mask, [top_triangle.astype(np.int32)], (0, 0))
-    cv2.fillPoly(mask, [bottom_triangle.astype(np.int32)], (0, 0))
-
-    if get_filt_at_band is not None:
-        img = img[get_filt_at_band, :, :].data
-        fft = cv2.dft(img, flags=cv2.DFT_COMPLEX_OUTPUT)
-        fft_shift = np.fft.fftshift(fft)
-        masked_fft = fft_shift * mask
-        # Scale for plotting
-        mfft = 20 * np.log(cv2.magnitude(masked_fft[:, :, 0], masked_fft[:, :, 1]))
-        return mfft
-
-    out = img.copy()
-    for band in range(img.shape[0]):
-        # if np.isnan(np.sum(img[band,:,:])):
-        # continue
-        # Fourier transform
-        fft = cv2.dft(img[band, :, :].data, flags=cv2.DFT_COMPLEX_OUTPUT)
-        fft_shift = np.fft.fftshift(fft)
-        # Apply mask
-        masked_fft = fft_shift * mask
-        # Inverse Fourier transform
-        ifft_shift = np.fft.ifftshift(masked_fft)
-        ifft = cv2.idft(ifft_shift) / (y * x)
-        out[band, :, :] = cv2.magnitude(ifft[:, :, 0], ifft[:, :, 1])
-
-    # Preserve original non-data regions
-    imgmask = img != 0
-    return out * imgmask
 
 
 def smooth_savgol(data: xr.DataArray, savgol_window: int = 9, savgol_polyorder: int = 2) -> xr.DataArray:

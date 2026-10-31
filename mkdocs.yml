@@ -10,7 +10,9 @@ copyright: Maintained by <a href="https://github.com/cjtu/">cjtu</a>.
 nav:
   - Home: index.md
   - Calibration configs: reflectance.md
+  - L2 reflectance: reflectance.md
   - Frame defects: frames.md
+  - Data guide: data-guide.md
   - Modules: modules.md
 plugins:
   - search
