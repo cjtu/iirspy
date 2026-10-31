@@ -302,7 +302,15 @@ def _save_geotiff(fout, row_block, da, compress="ZSTD", predictor=None):
     if wls:
         # Which IIRS bands these planes are: 1..256 on a full cube, arbitrary on a subset
         tags["band_numbers"] = ",".join(str(int(b)) for b in da.band.values)
-    with rasterio.open(fout, "w", **profile) as dst, ProgressBar():
+    try:
+        dst = rasterio.open(fout, "w", **profile)
+    except rasterio.errors.RasterioIOError as e:
+        if "missing codec" not in str(e):
+            raise
+        # e.g. StdEnv/2026's libtiff has no ZSTD/LERC/LZMA: write DEFLATE (same predictor) instead of failing
+        warnings.warn(f"GDAL has no {profile['compress']} codec; writing {fout} with DEFLATE", stacklevel=2)
+        dst = rasterio.open(fout, "w", **{**profile, "compress": "DEFLATE"})
+    with dst, ProgressBar():
         if tags:
             dst.update_tags(**tags)
         for y0 in range(0, ny, row_block):
