@@ -221,7 +221,7 @@ def _read_g1_table(fnpz, t):
     The npz holds `gain` (n_epoch, 256, 250) and `offset` (n_epoch, 256) or (256,), both in the LUT's
     units [mW/cm^2/sr/um per DN] for e1 (1 ms; scaled by exposure like the LUT), `epoch_start` (n_epoch,) ISO
     dates, optional `mask` (n_epoch, 256, 250) bool (True = bad) and `version`. The epoch is the latest
-    `epoch_start` <= `t`.
+    `epoch_start` <= `t`. A `t` more than one median epoch spacing past the last epoch warns.
     """
     import hashlib
 
@@ -233,12 +233,16 @@ def _read_g1_table(fnpz, t):
         raise ValueError(f"{fnpz}: epoch_start must be ascending")
     if e < 0:
         raise ValueError(f"{fnpz}: scene start {t} precedes the first epoch {starts[0]}")
+    if len(starts) > 1 and t > starts[-1] + starts.to_series().diff().median():
+        warnings.warn(f"{fnpz}: scene start {t} is past the last epoch start {starts[-1]} (open-ended)", stacklevel=2)
     if z["gain"].shape != (len(starts), 256, 250):
         raise ValueError(f"{fnpz}: gain {z['gain'].shape} is not (n_epoch, 256, 250)")
     coords = {"band": 1 + np.arange(256), "x": 0.5 + np.arange(250)}
     gain = xr.DataArray(z["gain"][e].astype("float32"), coords=coords)
     off = np.broadcast_to(z["offset"][e] if z["offset"].ndim == 2 else z["offset"], (256,))
     offset = xr.DataArray(off.astype("float32"), coords={"band": coords["band"]})
+    if "mask" in z and z["mask"].shape != (len(starts), 256, 250):
+        raise ValueError(f"{fnpz}: mask {z['mask'].shape} is not (n_epoch, 256, 250)")
     mask = xr.DataArray(z["mask"][e].astype(bool), coords=coords) if "mask" in z else None
     attrs = {
         "calib_table": str(fnpz),
@@ -912,7 +916,9 @@ class L0(IIRSData):
 
         # Drop known bad detector elements (x, bands)
         if cfg.bad_pixel_mask is True:
-            bad_pixel_mask = utils.load_bad_pixel_mask() if table_mask is None else table_mask
+            bad_pixel_mask = utils.load_bad_pixel_mask()
+            if table_mask is not None:
+                bad_pixel_mask = bad_pixel_mask | table_mask
         else:
             bad_pixel_mask = cfg.bad_pixel_mask
         if bad_pixel_mask is not False:  # Apply user-supplied mask

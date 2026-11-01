@@ -66,6 +66,23 @@ def test_p0_and_identity_g1_table(l0, tmp_path):
         _cal(obj, calib=str(ft))
 
 
+def test_g1_table_mask_union_and_open_ended_warning(tmp_path):
+    m = np.zeros((3, 256, 250), bool)
+    m[:, 5, 7] = True
+    ft = tmp_path / "g1m.npz"
+    np.savez(
+        ft,
+        gain=np.ones((3, 256, 250)),
+        offset=np.zeros(256),
+        mask=m,
+        epoch_start=["2019-01-01", "2019-07-01", "2020-01-01"],
+    )
+    tm = iirs._read_g1_table(ft, pd.Timestamp("2020-01-02"))[2]
+    assert bool((utils.load_bad_pixel_mask() | tm)[5, 7])
+    with pytest.warns(UserWarning, match="past the last epoch"):
+        iirs._read_g1_table(ft, pd.Timestamp("2021-01-01"))
+
+
 def test_attach_empirical_frames_does_not_apply(l0, monkeypatch):
     obj, *_ = l0
     ones = xr.DataArray(np.full((3, 250), 0.5), coords={"band": BANDS, "x": obj.img.x.values})
