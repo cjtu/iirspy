@@ -208,7 +208,7 @@ def geometry(
     sid: str,
     group: str,
     merged: dict,
-    scan0: int,
+    row0: int,
     shape: tuple[int, int],
     paths,
     cfg,
@@ -223,7 +223,7 @@ def geometry(
 ):
     """`Geometry` of one solved group from its merged GCP lattice: LOC from the lattice + LOLA radius, topo
     (when `topo_dir` is given) and SPICE sun/sensor terms from that LOC, QA from the lattice and the solve summary
-    beside `fgcps`. `shape` is the (ny, nx) of the L1 crop starting at absolute Scan `scan0`; `fl1` the L1 cube
+    beside `fgcps`. `shape` is the (ny, nx) of the L1 crop starting at absolute Scan `row0`; `fl1` the L1 cube
     for SNR and the PAN-incomplete flag."""
     from iirspy.georef import backplanes as bp
     from iirspy.georef.geometry import Geometry, quality
@@ -234,11 +234,11 @@ def geometry(
     lon, lat, radius = bp.group_loc_core(merged, group, paths.dem_roots, nrow=ny, ncol=nx)
     loc = {"lon": lon, "lat": lat, "radius": radius}
     ftopo = (
-        scene_topo(sid, group, lon, lat, fgeom, flabel, cfg, kernels, topo_dir, paths.dem_roots, scan0=scan0)
+        scene_topo(sid, group, lon, lat, fgeom, flabel, cfg, kernels, topo_dir, paths.dem_roots, scan0=row0)
         if topo_dir
         else None
     )
-    obs = bp.obs_from_loc(sid, group, loc, scan0, merged, paths, ftopo, fl1, stage_dir)
+    obs = bp.obs_from_loc(sid, group, loc, row0, merged, paths, ftopo, fl1, stage_dir)
 
     fsum = Path(fgcps).with_name(f"{Path(fgcps).stem}_solve_summary.json") if fgcps else None
     summary = json.loads(fsum.read_text()) if fsum is not None and fsum.exists() else {}
@@ -259,7 +259,7 @@ def geometry(
     return Geometry.from_arrays(
         sid,
         group,
-        scan0,
+        row0,
         "arosics",
         loc,
         obs["bands"],

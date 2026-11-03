@@ -6,7 +6,7 @@ import numpy as np
 import xarray as xr
 
 from iirspy.georef import backplanes as bp
-from iirspy.georef.georef import glt_from_loc
+from iirspy.georef.georef import GeorefConfig, glt_from_loc, to_stereo
 
 GRADES = ("pass", "warn", "fail")
 
@@ -83,9 +83,24 @@ class Geometry:
         return self._qa
 
     @property
+    def has_topo(self) -> bool:
+        return "topo" in self.sidecars
+
+    @property
     def shape(self) -> tuple[int, int]:
         ny, nx = self.loc.lon.shape
         return ny, nx
+
+    def grid(self, res, bounds=None):
+        """Export grid at `res` m/px in this group's CRS; `bounds` (xmin, ymin, xmax, ymax) default to the LOC's finite extent."""
+        if bounds is None:
+            x, y = to_stereo(self.group).transform(self.loc.lon.values, self.loc.lat.values)
+            x, y = np.asarray(x), np.asarray(y)
+            finite = np.isfinite(x) & np.isfinite(y)
+            if not finite.any():
+                raise ValueError(f"{self.stem}: LOC has no finite (x, y)")
+            bounds = (float(x[finite].min()), float(y[finite].min()), float(x[finite].max()), float(y[finite].max()))
+        return GeorefConfig(pole=self.group, aoi=tuple(bounds), ps=res)
 
     def glt(self, grid, window=None):
         return glt_from_loc(self.loc, self.group, grid, window)

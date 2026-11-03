@@ -1,6 +1,9 @@
+import time
 import warnings
 
 import numpy as np
+
+from iirspy import io
 
 
 def flat_surface_temperature(inc, sdist=1.0, s0=1370.0, eps=0.95, a0=0.08, a=0.045, b=0.14):
@@ -45,3 +48,16 @@ def thermal_radiance(rad, eps=1.0, bands=(227, 247), inc=None, sdist=1.0, t_min=
     wl = rad.wl * 1e-9
     bbr = 1e-6 * (2 * h * c * c / wl**5) * 1 / (np.exp(h * c / (wl * k * t)) - 1)
     return eps * bbr, t
+
+
+def subtract(rad, cfg, *, ws=None, sdist, inc, **_):
+    """Remove the isothermal thermal tail eps * B(T) from `rad`; the temperature [K] rides along as coord `T`."""
+    if cfg.thermal == "none":
+        return rad
+    t0 = time.monotonic()
+    trad, temp = thermal_radiance(
+        rad, cfg.thermal_eps, cfg.thermal_bands, inc=inc, sdist=sdist, t_min=cfg.thermal_t_min
+    )
+    out = (rad - trad).assign_coords(T=temp)
+    fields = ("thermal_eps", "thermal_bands", "thermal_t_min")
+    return io.record_step(out, rad, "thermal", cfg.thermal, t0, cfg, fields)

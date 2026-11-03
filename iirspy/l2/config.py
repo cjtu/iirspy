@@ -20,7 +20,7 @@ import numpy as np
 from iirspy.config import Config
 from iirspy.l2 import photometry, polish
 
-POLISH = {"verma2022": polish.FPOLISH, "issdc_empirical": polish.FPOLISH_ISSDC_EMPIRICAL}
+POLISH = polish.POLISH
 FLUX = ("pradan", "hsrs", "noaa_cdr_mean", "noaa_cdr_monthly")
 SDIST = ("spice", "none")
 THERMAL = ("none", "isothermal")
@@ -29,7 +29,7 @@ SMOOTHING_EDGES = ("pair", "nan", "reflect")
 
 @dataclass(frozen=True)
 class L2Config(Config):
-    """L1 radiance -> L2 reflectance choices (see `L2._compute_reflectance`).
+    """L1 radiance -> L2 reflectance choices (see `iirspy.l2.calibrate`).
 
     Steps run in order: solar flux, thermal removal, polish, photometric normalization,
     Besse phase, spectral smoothing, clip.

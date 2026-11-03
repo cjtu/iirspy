@@ -55,9 +55,9 @@ KEEP_GLOBS = (".gcps", "_glt.tif", "_loc.tif", "_solve_summary.json", "_solve.lo
 def _band_window(band: int) -> list[int]:
     """+-BAND_GAP bands around `band` -- as far as `interpolate_na(..., max_gap=BAND_GAP)` ever reaches to fill a
     masked `band` pixel from its true neighbours, so it's also as much of the band axis as
-    `calibrate_to_rad`'s masking/interpolation stage needs to touch to get `band` right.
+    `iirspy.l1.calibrate`'s masking/interpolation stage needs to touch to get `band` right.
     """
-    from iirspy.iirs import BAND_GAP
+    from iirspy.l1.fill import BAND_GAP
 
     return sorted(range(max(1, band - BAND_GAP), min(256, band + BAND_GAP) + 1))
 

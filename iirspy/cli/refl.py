@@ -28,19 +28,16 @@ same as `iirs-solve-scene`.
 
 from __future__ import annotations
 
-import errno
-import hashlib
 import json
-import os
 import shutil
 import sys
 import time
 from dataclasses import fields, replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import rasterio
-import xarray as xr
 
 from iirspy import instrument, io
 from iirspy.cli._run import (
@@ -48,37 +45,25 @@ from iirspy.cli._run import (
     build_l1,
     build_l1_nci,
     ensure_frame_offsets,
+    file_info,
     frame_offsets_path,
+    is_disk_full,
+    keep,
     log_provenance,
     open_run,
     paths_from_env,
     predates_frames,
+    resource_report,
 )
 from iirspy.georef import chunks as ck
 from iirspy.instrument import PAN_BANDS
 from iirspy.l1.config import L1Config
 from iirspy.l1.frames import table_key as frames_key
 from iirspy.l2.config import L2Config
-from iirspy.workspace import Workspace, ncpu
+from iirspy.workspace import ncpu
 
 
-def _full_bands() -> list[int]:
-    """Every band calibration can produce -- the same OSF/invalid sets `calibrate_to_rad` nulls."""
-    return sorted(set(range(1, 257)) - set(instrument.OSF) - set(instrument.INVALID))
-
-
-def _topo_info(ftopo: Path | None) -> dict:
-    """topo path plus the bands/piece count it used, from its own tags -- for the summary."""
-    if not ftopo:
-        return {}
-    import rasterio
-
-    with rasterio.open(ftopo) as src:
-        t = src.tags()
-    return {"path": str(ftopo), "bands_used": t.get("bands_used"), "n_pieces": t.get("n_pieces")}
-
-
-def _solve_quality(fgcps: Path, group: str) -> dict:
+def _solve_quality(fgcps: Path) -> dict:
     """converged/corr/n_merged_gcps/overlap agreement from the solve's own summary json, if kept
     next to the GCPs -- so a suspect refl product points at the registration it was built on."""
     fsummary = fgcps.parent / f"{fgcps.stem}_solve_summary.json"
@@ -92,47 +77,6 @@ def _solve_quality(fgcps: Path, group: str) -> dict:
         "n_merged_gcps": s.get("n_merged_gcps"),
         "overlap_agreement": s.get("overlap_agreement"),
     }
-
-
-def _chunk_report(img) -> str:
-    """Whether the cube's chunking can actually keep `ncpu` dask threads busy.
-
-    Blocks are split along y only, so y-blocks is the real parallelism ceiling: fewer of them than
-    workers and the extra cores idle no matter what `--cpus-per-task` says. Block MB x workers is
-    the floor under `--mem`, since `_compute_reflectance` holds several cube-shaped temporaries.
-    """
-    n, ny, nx = img.shape
-    cube_mb = n * ny * nx * 4 / 2**20
-    if img.chunks is None:
-        return f"L1 {img.shape} UNCHUNKED, {cube_mb:.0f} MB resident -- expect cube-sized temporaries"
-    ychunks = img.chunks[img.dims.index("y")]
-    block_mb = n * max(ychunks) * nx * 4 / 2**20
-    return (
-        f"L1 {img.shape} = {cube_mb:.0f} MB in {len(ychunks)} y-blocks of <={block_mb:.0f} MB "
-        f"for {ncpu()} workers ({'ok' if len(ychunks) >= ncpu() else 'STARVED: fewer blocks than cores'})"
-    )
-
-
-def _peak_rss_report() -> str:
-    """Peak RSS against the Slurm allocation, so `--mem` can be right-sized off a real run."""
-    import resource
-
-    peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-    limit = os.environ.get("SLURM_MEM_PER_NODE")
-    of = f" of --mem={int(limit) / 1024:.0f}G ({100 * peak_mb / int(limit):.0f}%)" if limit else ""
-    return f"peak RSS {peak_mb:.0f} MB{of}"
-
-
-def _keep(ws: Workspace, dest_dir: str | None, *files: Path) -> None:
-    """Copy a product and its sidecars out of the work dir. The vrt names its tif by relative path,
-    so it has to land in the same dir -- which is why L1 and L2 keep separately."""
-    if not dest_dir:
-        return
-    dest = Path(dest_dir)
-    dest.mkdir(parents=True, exist_ok=True)
-    for f in files:
-        shutil.copyfile(f, dest / f.name)
-    ws.log(f"kept {len(files)} file(s) -> {dest}")
 
 
 def _parser():
@@ -228,26 +172,7 @@ def l1_config(args) -> L1Config:
     return L1Config.preset(args.l1, **over)
 
 
-def _is_disk_full(exc: BaseException) -> bool:
-    """Disk quota exceeded surfaces as OSError(errno) from shutil.copy*, or as a message-only
-    error from GDAL/rasterio writes -- check both so either path gets the same clear diagnosis."""
-    if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
-        return True
-    msg = str(exc).lower()
-    return "disk quota exceeded" in msg or "no space left on device" in msg
-
-
-def _file_info(f, sha=False) -> dict:
-    """Path and mtime (UTC) of an input, plus its sha256 when `sha`."""
-    import datetime
-
-    f = Path(f)
-    mtime = datetime.datetime.fromtimestamp(f.stat().st_mtime, datetime.UTC).isoformat(timespec="seconds")
-    return {"path": str(f), "mtime": mtime, **({"sha256": hashlib.sha256(f.read_bytes()).hexdigest()} if sha else {})}
-
-
 def main(argv: list[str] | None = None) -> None:  # noqa: C901
-
     args = _parser().parse_args(argv)
     args.l1_config = l1_config(args)
     args.l2_config = l2_config(args)  # fail on a bad preset/field value before any work
@@ -280,23 +205,21 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901
         job = replace(job, frames=frames)
     elif args.l2 != "issdc-nci" or args.fix_frames or args.fill_frames:
         job = replace(job, frames=ensure_frame_offsets(job, job.ws.dir))
-    t_start = time.time()
     log_provenance(job.ws)
     job.ws.log(
         f"{sid} group={group} zip={job.zip.name} ncpu={ncpu()} stage={job.stage} georef={args.georef} gcps={fgcps}"
     )
-
     try:
-        _run(job, args, fgcps, t_start)
+        _run(job, args, fgcps, time.time())
     except Exception as e:
-        if _is_disk_full(e):
+        if is_disk_full(e):
             job.ws.log(f"FATAL: disk full/quota exceeded -- run `diskusage_report` to check usage. ({e})")
             sys.exit(f"{sid} {group}: disk full/quota exceeded -- run `diskusage_report` to check usage")
         raise
 
 
 def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C901
-    from iirspy.georef import arosics, backplanes, georef, run_georef
+    from iirspy.georef import arosics, backplanes, georef
     from iirspy.iirs import L1, L2
 
     ws, sid, group, paths = job.ws, job.sid, job.group, job.paths
@@ -312,15 +235,15 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
         cfg = replace(ck.chunk_cfg(group, paths.dem_roots), aoi=aoi, lat_band=lat_range)
         ws.log(f"aoi from {len(gcps)} merged gcps: {[round(v / 1000, 1) for v in aoi]} km")
 
-    bands = PAN_BANDS if args.topo_only else _full_bands()  # topo-only needs the scan crop, not the spectrum
+    # topo-only needs the scan crop, not the spectrum
+    bands = PAN_BANDS if args.topo_only else sorted(set(range(1, 257)) - set(instrument.OSF) - set(instrument.INVALID))
     nci = args.l2 == "issdc-nci"
-    kw = {k: v for k in ("fix_frames", "fill_frames") if (v := getattr(args, k)) is not None}
+    ftif = ws.path(f"{sid}_{group}_l1_rad.tif")
     if nci:
-        ftif, scan0, lat_range = build_l1_nci(job, lat_range, bands, ws.path(f"{sid}_{group}_l1_rad.tif"), **kw)
+        kw = {k: v for k in ("fix_frames", "fill_frames") if (v := getattr(args, k)) is not None}
+        ftif, scan0, lat_range = build_l1_nci(job, lat_range, bands, ftif, **kw)
     else:
-        ftif, scan0, lat_range = build_l1(
-            job, lat_range, bands, ws.path(f"{sid}_{group}_l1_rad.tif"), l1_config=args.l1_config
-        )
+        ftif, scan0, lat_range = build_l1(job, lat_range, bands, ftif, l1_config=args.l1_config)
     ws.log(f"L1 built ({'ISSDC nci' if nci else 'iirspy'}): {ftif} ({len(bands)} bands), scan0={scan0}")
     # GCP rows are cube rows of the solve's crop: a different crop start would shift every GCP row.
     fsum = fgcps.parent / f"{fgcps.stem}_solve_summary.json" if fgcps else None
@@ -329,17 +252,14 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
         sys.exit(
             f"{sid} {group}: L1 crop starts at scan {scan0} but the solve's started at {solve_scan0} -- re-solve with this iirspy"
         )
+    prov_kw = {"sid": sid, "group": group, "l1_preset": None if nci else args.l1}
+    prov_kw["l1_config"] = None if nci else args.l1_config.to_attrs()
     if args.l1_only:
         fnpz, fprov = ftif.with_name(ftif.stem + "_empirical.npz"), ws.path(f"{sid}_{group}_provenance.json")
-        prov = io.provenance(sid=sid, group=group, l1_preset=args.l1, l1_config=args.l1_config.to_attrs(), l1_only=True)
-        fprov.write_text(json.dumps(prov, indent=1, default=str))
-        _keep(ws, args.keep_l1, *[f for f in (fnpz, fprov) if f.exists()])
-        ws.log(
-            f"--l1-only: kept {fnpz.name if fnpz.exists() else 'no empirical frames'}, done in {time.time() - t_start:.0f} s"
-        )
-        if args.clean:
-            shutil.rmtree(ws.dir, ignore_errors=True)
-        return
+        fprov.write_text(json.dumps(io.provenance(**prov_kw, l1_only=True), indent=1, default=str))
+        keep(ws, args.keep_l1, *[f for f in (fnpz, fprov) if f.exists()])
+        ws.log(f"--l1-only: done in {time.time() - t_start:.0f} s")
+        return _finish(ws, args)
 
     anc = ck.ancillary(sid, paths)
     fgeom, flabel = anc["geometry/calibrated"], ck.label(sid, paths, job.stage)
@@ -348,78 +268,48 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
     l2cfg = args.l2_config
     kernels: list[Path] = []
     az = elev = r_sun = None
-
     if args.georef == "arosics":
         kernels = ck.kernels(sid[:8], paths)
         az, elev, r_sun = georef.sun_geometry(fgeom, flabel, cfg, kernels)
         ws.log(f"sun (grid frame): az={az:.1f} elev={elev:.2f} r_sun={r_sun:.4f} deg")
 
-    if fgcps is not None and args.topo_only:
+    if args.topo_only:
+        assert fgcps is not None  # noqa: S101 -- main() routes only the arosics method here
         with rasterio.open(ftif) as src:
-            shape = (src.height, src.width)
-        lon, lat, _ = backplanes.group_loc_core(merged, group, paths.dem_roots, nrow=shape[0], ncol=shape[1])
+            nrow, ncol = src.height, src.width
+        lon, lat, _ = backplanes.group_loc_core(merged, group, paths.dem_roots, nrow=nrow, ncol=ncol)
         topo = georef.scene_topo(
             sid, group, lon, lat, fgeom, flabel, cfg, kernels, ws.dir, paths.dem_roots, scan0=scan0
         )
-        _keep(ws, str(fgcps.parent), topo)
+        keep(ws, str(fgcps.parent), topo)
         ws.log(f"--topo-only: {topo} -> {fgcps.parent}, done in {time.time() - t_start:.0f} s")
-        if args.clean:
-            shutil.rmtree(ws.dir, ignore_errors=True)
-        return
+        return _finish(ws, args)
 
     l1 = L1.from_file(ftif, sid, str(paths.archive if nci else job.stage))
     if nci:
         l1.img.attrs["calibration_source"] = "issdc"
-    ws.log(_chunk_report(l1.img))
-
-    shape = l1.img.shape[-2:]
+    ws.log(resource_report(l1.img))
+    inputs: dict[str, Any]
     if args.georef == "issdc":
-        geo = run_georef(
-            "issdc",
-            sid=sid,
-            group=group,
-            fgeom=fgeom,
-            flabel=flabel,
-            fspm=ck.spm(sid, paths, job.stage),
-            shape=shape,
-            row0=scan0,
-        )
+        inputs = {"fspm": ck.spm(sid, paths, job.stage)}
     else:
-        geo = run_georef(
-            "arosics",
-            sid=sid,
-            group=group,
-            merged=merged,
-            scan0=scan0,
-            shape=shape,
-            paths=paths,
-            cfg=cfg,
-            fgeom=fgeom,
-            flabel=flabel,
-            kernels=kernels,
-            fl1=ftif,
-            stage_dir=job.stage,
-            fgcps=fgcps,
-            topo_dir=ws.dir if l2cfg.use_slope_az else None,
-        )
+        inputs = {
+            "merged": merged,
+            "paths": paths,
+            "cfg": cfg,
+            "kernels": kernels,
+            "fl1": ftif,
+            "stage_dir": job.stage,
+            "fgcps": fgcps,
+            "topo_dir": ws.dir if l2cfg.use_slope_az else None,
+        }
+    geo = l1.georef(args.georef, ws=ws, group=group, fgeom=fgeom, flabel=flabel, **inputs)
+    if geo.row0 != scan0:
+        sys.exit(f"geometry row0 {geo.row0} != L1 scan0 {scan0}")
     ftopo = geo.sidecars.get("topo")
     ws.log(f"geometry: {geo.method} {geo.quality}; topo: {ftopo or 'none'}")
 
-    # incidence and the facet terms are read from the geometry only: with DEM topo the photometric model takes
-    # the facet slope/aspect/lit and the sun in the local frame; without it, the per-pixel sun zenith.
-    obs = geo.obs
-    inc = None if ftopo else xr.DataArray(obs.sun_zenith.values, dims=("y", "x"))
-    slope_az = (
-        (
-            obs.facet_slope.values,
-            obs.facet_aspect.values,
-            obs.lit_frac.values,
-            (obs.sun_azimuth.values, 90 - obs.sun_zenith.values),
-        )
-        if ftopo
-        else None
-    )
-    l2 = l1.calibrate(l2cfg, inc=inc, slope_az=slope_az)
+    l2 = l1.calibrate(l2cfg, geom=geo, ws=ws)
     ws.log(f"L2 computed ({args.l2}: {json.dumps(l2cfg.to_attrs())})")
 
     # Camera space keeps one unblended spectrum per pixel; the GLT projects on demand and the
@@ -428,11 +318,9 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
     l2.save(str(fl2))
     ws.log(f"L2 saved: {fl2}")
     if gcps:
-        for f in (Path(ftif), fl2):
+        for f in (ftif, fl2):
             ws.log(f"gcp vrt -> {georef.save_gcp_vrt(f, gcps, georef.stereo_crs(group))}")
-
     gfiles = geo.save(ws.dir)
-    fobs = gfiles["obs"]
     ws.log(
         f"geometry saved: {', '.join(f.name for f in gfiles.values())} (sensor geometry from {geo.tags['SENSOR_SOURCE']})"
     )
@@ -446,21 +334,28 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
             ftif,
             np.asarray(l2.img.solar_inc),
             geo.loc.lat.values,
-            emi=obs.sensor_zenith.values,
-            phase=obs.phase.values,
+            emi=geo.obs.sensor_zenith.values,
+            phase=geo.obs.phase.values,
             sdist=float(l2.img.attrs["solar_distance_au"]),
         )
     except Exception as e:  # sanity stats must never fail a refl run
         stats = {"error": f"{type(e).__name__}: {e}"}
     ws.log(f"l2_stats: {time.time() - t_stats:.1f}s {stats.get('error', 'ok')}")
-
     fglt = fgcps.parent / f"{sid}_{group}_glt.tif" if fgcps else None
     if fglt is not None:
         ws.log(f"glt: {fglt}" if fglt.is_file() else f"glt: {fglt} not found -- iirs-solve-scene should have built it")
-
-    resources = f"{_chunk_report(l1.img)}; {_peak_rss_report()}; ncpu={ncpu()}"
+    resources = f"{resource_report(l1.img)}; ncpu={ncpu()}"
     ws.log(resources)
 
+    notes = json.loads(l1.img.attrs["empirical_notes"]) if "empirical_notes" in l1.img.attrs else None
+    topo_tags = {}
+    if ftopo:
+        with rasterio.open(ftopo) as src:
+            topo_tags = {
+                "path": str(ftopo),
+                "bands_used": src.tags().get("bands_used"),
+                "n_pieces": src.tags().get("n_pieces"),
+            }
     summary = {
         "sid": sid,
         "group": group,
@@ -469,27 +364,25 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
         "geometry_quality": geo.quality,
         "gcps": str(fgcps) if fgcps else None,
         "n_gcps": len(gcps) if gcps else None,
-        "solve_quality": _solve_quality(fgcps, group) if fgcps else None,
+        "solve_quality": _solve_quality(fgcps) if fgcps else None,
         "lat_range": list(lat_range),
         "bands": bands,
         "l2_preset": args.l2,
         "l1_source": "issdc-nci" if nci else "iirspy",
         "l2_config": l2cfg.to_attrs(),
-        "topo": _topo_info(ftopo),
+        "topo": topo_tags,
         "aoi_m": list(cfg.aoi) if cfg else None,
         "scan0": scan0,
         "l1": ftif.name,
         "l2": fl2.name,
-        "obs": fobs.name,
+        "obs": gfiles["obs"].name,
         "obs_sensor_source": geo.tags["SENSOR_SOURCE"],
         "geometry": {k: f.name for k, f in gfiles.items()},
         "glt": str(fglt) if fglt else None,
         "sun_az_grid_deg": az,
         "sun_elev_deg": elev,
         "sun_angular_radius_deg": r_sun,
-        "l1_empirical_notes": json.loads(l1.img.attrs["empirical_notes"])
-        if "empirical_notes" in l1.img.attrs
-        else None,
+        "l1_empirical_notes": notes,
         "l2_diagnostics": {k: l2.img.attrs.get(k) for k in L2.DIAGNOSTICS},
         "l2_stats": stats,
         "total_s": round(time.time() - t_start, 1),
@@ -498,25 +391,23 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
     fsummary.write_text(json.dumps(summary, indent=1, default=str))
     ws.log(f"\ndone in {summary['total_s']}s.")
 
-    inputs = {
-        "nri_zip": _file_info(job.zip),
-        "gcps": _file_info(fgcps, sha=True) if fgcps else None,
-        "frames": {**_file_info(job.frames), "key": frames_key(job.frames)} if job.frames else None,
-        "label": _file_info(flabel),
-        "geometry_csv": _file_info(fgeom),
+    prov_inputs = {
+        "nri_zip": file_info(job.zip),
+        "gcps": file_info(fgcps, sha=True) if fgcps else None,
+        "frames": {**file_info(job.frames), "key": frames_key(job.frames)} if job.frames else None,
+        "label": file_info(flabel),
+        "geometry_csv": file_info(fgeom),
         "geometry": geo.provenance,
         "spice_kernels": [str(k) for k in kernels],
-        "topo": _file_info(ftopo) if ftopo else None,
+        "topo": file_info(ftopo) if ftopo else None,
     }
     prov = io.provenance(
-        sid=sid,
-        group=group,
-        l1_preset=None if nci else args.l1,
-        l1_config=None if nci else args.l1_config.to_attrs(),
+        **prov_kw,
         l2_preset=args.l2,
         l2_config=l2cfg.to_attrs(),
-        inputs=inputs,
-        empirical_notes=summary["l1_empirical_notes"],
+        inputs=prov_inputs,
+        empirical_notes=notes,
+        steps=json.loads(l2.img.attrs["provenance"]),
     )
     fprov = ws.path(f"{sid}_{group}_provenance.json")
     fprov.write_text(json.dumps(prov, indent=1, default=str))
@@ -528,11 +419,14 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
         f for f in (ftif.with_name(ftif.stem + "_empirical.npz"), ftif.with_name(ftif.stem + "_snr.tif")) if f.exists()
     ]
     vrt = lambda f: [f.with_suffix(".vrt")] if f.with_suffix(".vrt").exists() else []
-    _keep(ws, args.keep_l1, ftif, *vrt(ftif), *sidecars, fprov)
-    _keep(ws, args.keep, fl2, *vrt(fl2), *gfiles.values(), fsummary, fprov, job.logfile)
+    keep(ws, args.keep_l1, ftif, *vrt(ftif), *sidecars, fprov)
+    keep(ws, args.keep, fl2, *vrt(fl2), *gfiles.values(), fsummary, fprov, job.logfile)
     if ftopo and fgcps:  # geometry, so it lands beside the GCPs rather than with L2
-        _keep(ws, str(fgcps.parent) if args.keep else None, ftopo)
+        keep(ws, str(fgcps.parent) if args.keep else None, ftopo)
+    _finish(ws, args)
 
+
+def _finish(ws, args) -> None:
     if args.clean:
         shutil.rmtree(ws.dir, ignore_errors=True)
         print(f"removed work dir {ws.dir}", flush=True)

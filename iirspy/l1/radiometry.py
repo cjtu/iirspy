@@ -1,10 +1,17 @@
+import hashlib
+import json
+import time
+import warnings
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
+import pdr
 import xarray as xr
 
-from iirspy import instrument
+from iirspy import instrument, io
 from iirspy.instrument import DCALIB, E1_EXPOSURE_MS
+from iirspy.l1.config import CALIB
 
 
 def load_reference_flat(fimg, calib_dir=DCALIB):
@@ -73,3 +80,76 @@ def get_gain_offset(fimg, denoise=False, gain_z=None, offset_z=None, calib_dir=D
         ozscore = abs(oresid / oresid.std())
         off = off.where(ozscore < offset_z)
     return gain, off
+
+
+def _read_g1_table(fnpz, t):
+    """Gain, offset, bad-pixel mask (or None) and provenance attrs of the G1 table epoch covering `t`.
+
+    The npz holds `gain` (n_epoch, 256, 250) and `offset` (n_epoch, 256) or (256,), both in the LUT's
+    units [mW/cm^2/sr/um per DN] for e1 (1 ms; scaled by exposure like the LUT), `epoch_start` (n_epoch,) ISO
+    dates, optional `mask` (n_epoch, 256, 250) bool (True = bad) and `version`. The epoch is the latest
+    `epoch_start` <= `t`. A `t` more than one median epoch spacing past the last epoch warns.
+    """
+    z = np.load(fnpz)
+    starts = pd.DatetimeIndex(z["epoch_start"])
+    t = pd.Timestamp(t).tz_localize(None) if pd.Timestamp(t).tzinfo else pd.Timestamp(t)  # label times end in Z
+    e = int(starts.searchsorted(t, side="right")) - 1
+    if not starts.is_monotonic_increasing:
+        raise ValueError(f"{fnpz}: epoch_start must be ascending")
+    if e < 0:
+        raise ValueError(f"{fnpz}: scene start {t} precedes the first epoch {starts[0]}")
+    if len(starts) > 1 and t > starts[-1] + starts.to_series().diff().median():
+        warnings.warn(f"{fnpz}: scene start {t} is past the last epoch start {starts[-1]} (open-ended)", stacklevel=2)
+    if z["gain"].shape != (len(starts), 256, 250):
+        raise ValueError(f"{fnpz}: gain {z['gain'].shape} is not (n_epoch, 256, 250)")
+    coords = {"band": 1 + np.arange(256), "x": 0.5 + np.arange(250)}
+    gain = xr.DataArray(z["gain"][e].astype("float32"), coords=coords)
+    off = np.broadcast_to(z["offset"][e] if z["offset"].ndim == 2 else z["offset"], (256,))
+    offset = xr.DataArray(off.astype("float32"), coords={"band": coords["band"]})
+    if "mask" in z and z["mask"].shape != (len(starts), 256, 250):
+        raise ValueError(f"{fnpz}: mask {z['mask'].shape} is not (n_epoch, 256, 250)")
+    mask = xr.DataArray(z["mask"][e].astype(bool), coords=coords) if "mask" in z else None
+    attrs = {
+        "calib_table": str(fnpz),
+        "calib_table_sha256": hashlib.sha256(Path(fnpz).read_bytes()).hexdigest(),
+        "calib_table_version": str(z["version"]) if "version" in z else "",
+        "calib_table_epoch": str(starts[e].date()),
+    }
+    return gain, offset, mask, attrs
+
+
+def _lut(dn, cfg, qub, calib_dir):
+    gain, offset = get_gain_offset(qub, calib_dir=calib_dir)
+    return 10 * (dn * gain + offset)
+
+
+def _lut_median(dn, cfg, qub, calib_dir):
+    gain, offset = get_gain_offset(qub, calib_dir=calib_dir)
+    return 10 * (dn * gain.median("x") + offset.median("x"))
+
+
+def _g1(dn, cfg, qub, calib_dir):
+    start = pd.Timestamp(pdr.open(qub).metaget("start_date_time"))
+    gain, offset, bad, attrs = _read_g1_table(cfg.calib, start)
+    gain = gain * (E1_EXPOSURE_MS / instrument.get_exposure_duration(qub))  # e1 units, as the LUT
+    rad = 10 * (dn * gain + offset)
+    rad.attrs.update(attrs)
+    return rad if bad is None else rad.assign_coords(calib_bad=(("band", "x"), bad.values))
+
+
+def _empirical(dn, cfg, qub, calib_dir):
+    gain, offset = get_gain_offset(qub, calib_dir=calib_dir)
+    if json.loads(dn.attrs["empirical_notes"])["has_shadow"]:
+        return 10 * gain.median("x") * dn
+    return 10 * (gain.median("x") * dn + offset.median("x"))
+
+
+RADIOMETRY = {"lut": _lut, "lut_median": _lut_median, "g1": _g1, "empirical": _empirical}
+
+
+def radiometry(dn, cfg, *, ws=None, qub, calib_dir=DCALIB, **_):
+    """DN (dark and flat/smile corrected when `cfg.empirical`) -> radiance [W/m^2/sr/um]."""
+    t0 = time.monotonic()
+    method = "empirical" if cfg.empirical else cfg.calib if cfg.calib in CALIB else "g1"
+    rad = RADIOMETRY[method](dn, cfg, qub, calib_dir)
+    return io.record_step(rad, dn, "radiometry", method, t0, cfg, ("calib",), qub=str(qub))

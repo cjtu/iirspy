@@ -74,7 +74,8 @@ def test_issdc_preset_reproduces_ndi():
     IIRS_L2_REPRO holds <sid>/nci.npz (rad[, rad_flip]) and <sid>/ndi.npz (rfl, obs) windows of
     256 lines plus 8 padding lines each side.
     """
-    from iirspy.iirs import L2
+    from iirspy.georef.geometry import Geometry, quality
+    from iirspy.l2 import calibrate
 
     pad, n = 8, 256
     wl = instrument.get_wls()
@@ -91,8 +92,19 @@ def test_issdc_preset_reproduces_ndi():
             coords = {"band": np.arange(1, 257), "wl": ("band", wl), "y": np.arange(ny), "x": np.arange(nx)}
             da = xr.DataArray(rad * instrument.RAD_NATIVE_SCALE, dims=("band", "y", "x"), coords=coords)
             da = da.assign_coords(solar_inc=("y", np.zeros(ny)), solar_az=("y", np.zeros(ny)))
-            inc = xr.DataArray(sunzen[w, pad : pad + n], dims=("y", "x"))
-            refl = L2.__new__(L2)._compute_reflectance(da, None, L2Config.preset("issdc"), inc=inc).values
+            zen = sunzen[w, pad : pad + n]
+            loc = {"lon": np.zeros(zen.shape), "lat": np.zeros(zen.shape), "radius": np.full(zen.shape, 1737400.0)}
+            geom = Geometry.from_arrays(
+                "sid",
+                "south",
+                0,
+                "issdc",
+                loc,
+                {"sun_zenith": zen},
+                np.zeros(zen.shape, "uint16"),
+                quality("issdc", "warn"),
+            )
+            refl = calibrate(da, L2Config.preset("issdc"), geom=geom).values
             ok = np.isfinite(refl) & np.isfinite(ref) & (ref > 0.01)
             ratio = np.where(ok, refl / np.where(ok, ref, 1), np.nan)
             meds.append(np.nanmedian(np.nanmedian(ratio.reshape(256, -1), 1)[short]))

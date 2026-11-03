@@ -40,7 +40,7 @@ Overwrites and black stripes come from exact or near-exact row repeats and all-z
 
 ### Offsets table
 
-The table is `<sid>_frames_offsets.csv`, one per strip. `L0.calibrate_to_rad` with `fix_frames` builds it from the full cube on first use and caches it beside the `.qub`, or takes an existing table as `frame_offsets`. A band-subset cube cannot be scanned; pass a table built from the full cube or zip with `iirspy.l1.frames.build_table`. `iirs-solve-scene` keeps it beside the strip's GCPs and `_L1_b54.tif` in the geometry/recalibrated day directory, shared by all CRS groups.
+The table is `<sid>_frames_offsets.csv`, one per strip. `L0.calibrate` with `fix_frames` builds it from the full cube on first use and caches it beside the `.qub`, or takes an existing table as `frame_offsets`. A band-subset cube cannot be scanned; pass a table built from the full cube or zip with `iirspy.l1.frames.build_table`. `iirs-solve-scene` keeps it beside the strip's GCPs and `_L1_b54.tif` in the geometry/recalibrated day directory, shared by all CRS groups.
 
 Table 1: Columns of `<sid>_frames_offsets.csv`.
 

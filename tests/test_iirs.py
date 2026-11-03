@@ -6,7 +6,7 @@ def test_import_classes():
 
 
 def test_output_bands_window_matches_full_interpolation():
-    """`calibrate_to_rad(output_bands=...)` narrows *before* `interpolate_na("band", max_gap=6)`.
+    """`l1.calibrate(output_bands=...)` narrows *before* `interpolate_na("band", max_gap=6)`.
 
     That's only safe because a band outside +-6 of the target could never have fed its
     interpolated value anyway (that's what max_gap=6 means) -- so narrowing first must give the
@@ -79,23 +79,28 @@ def test_clip_aoi_warps_onto_the_map_grid_and_matches_a_polygon_masked_apply_glt
     from rasterio.warp import transform_geom
 
     from iirspy.georef import georef
+    from iirspy.georef.geometry import Geometry, quality
     from iirspy.iirs import IIRSData
 
     ny, nx = 10, 8
     rows, cols = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
     x, y = 500.0 + 30.0 * cols, 3500.0 - 50.0 * rows
     lon, lat = georef.xy_to_lonlat(x, y, "south")
-    loc = xr.Dataset(
-        {"lon": (("y", "x"), lon), "lat": (("y", "x"), lat)},
-        coords={"y": np.arange(ny), "x": np.arange(nx)},
+    geom = Geometry.from_arrays(
+        "sid",
+        "south",
+        0,
+        "arosics",
+        {"lon": lon, "lat": lat, "radius": np.full((ny, nx), 1737400.0)},
+        {},
+        np.zeros((ny, nx), "uint16"),
+        quality("arosics", "pass"),
     )
 
     cube = np.arange(ny * nx, dtype="float32").reshape(1, ny, nx)
     img = xr.DataArray(cube, dims=("band", "y", "x"), coords={"band": [1]})
-    inst = SimpleNamespace(img=img, _loc_cache={"south": loc})
-    inst.glt = MethodType(IIRSData.glt, inst)
+    inst = SimpleNamespace(img=img, basename="sid")
     inst._cube_scan0 = MethodType(IIRSData._cube_scan0, inst)
-    inst._read_loc = MethodType(IIRSData._read_loc, inst)
     inst.clip_aoi = MethodType(IIRSData.clip_aoi, inst)
     inst._render = MethodType(IIRSData._render, inst)
 
@@ -107,11 +112,11 @@ def test_clip_aoi_warps_onto_the_map_grid_and_matches_a_polygon_masked_apply_glt
         "coordinates": [[georef.to_lonlat("south").transform(px, py) for px, py in corners]],
     }
 
-    out = inst.clip_aoi(geom_lonlat, crs, res=40.0)
+    out = inst.clip_aoi(geom_lonlat, geom=geom, res=40.0)
 
     want_geom = transform_geom(georef.LONLAT, crs, geom_lonlat)
     gxs, gys = zip(*want_geom["coordinates"][0], strict=False)
-    table, tr = inst.glt(crs, 40.0, bounds=(min(gxs), min(gys), max(gxs), max(gys)))
+    table, tr = geom.glt(geom.grid(40.0, (min(gxs), min(gys), max(gxs), max(gys))))
     poly_mask = geometry_mask([want_geom], out_shape=table.shape[1:], transform=tr, invert=True)
     table[0][~poly_mask] = georef.NODATA
     want = georef.apply_glt(cube, table, cube_scan0=0)

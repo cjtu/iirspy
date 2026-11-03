@@ -1,24 +1,21 @@
 import copy
-import json
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import pdr
 import rasterio
 import xarray as xr
 from rioxarray.exceptions import NoDataInBounds
 
-from iirspy import instrument, io
+from iirspy import georef, instrument, io, l1, l2
 from iirspy.georef import ancillary
-from iirspy.l1 import empirical, frames, radiometry
-from iirspy.l1.config import CALIB, L1Config
-from iirspy.l1.empirical import empirical_frames
-from iirspy.l2 import photometry, polish, solar, thermal
-from iirspy.l2.config import POLISH, L2Config
+from iirspy.l1 import empirical, frames
+from iirspy.l1.config import L1Config
+from iirspy.l2 import polish
+from iirspy.l2.config import L2Config
 
 # Skip div 0 and 0/0 warnings
 np.seterr(divide="ignore", invalid="ignore")
@@ -111,17 +108,6 @@ def _chunks(nband, ny, nx, chunk=True):
     return {"band": nband, "y": int(io.CHUNKSIZE / (nband * nx * 4)), "x": nx}
 
 
-FLAT_SMILE_MIN = 0.2  # clip flat*smile away from 0 before dividing (avoids blow-ups)
-
-
-def _in_wl_ranges(wl, ranges):
-    """True where `wl` falls in any (lo, hi) of `ranges` (inclusive); all False if `ranges` is falsy."""
-    hit = xr.zeros_like(wl, dtype=bool)
-    for lo, hi in ranges or ():
-        hit = hit | ((wl >= lo) & (wl <= hi))
-    return hit
-
-
 def _expand_to_full_bands(da):
     """Reindex `da`'s band dim onto the full 1..256 IIRS range, NaN-filling any band not present.
 
@@ -133,94 +119,6 @@ def _expand_to_full_bands(da):
         return da
     da = da.reindex(band=all_bands)
     return da.assign_coords(wl=("band", instrument.get_wls()))
-
-
-BAND_GAP = 9  # widest spectral hole `interpolate_na` bridges: two dropped groups (8 bands) in a row
-ROW_GAP = 5  # likewise along y: up to 4 lost frames in a row
-
-
-def _interp_rows(rad, max_gap=ROW_GAP):
-    """Linear fill along y of NaN runs shorter than `max_gap` rows, chunk by chunk (overlapped so a run on a chunk edge fills).
-
-    A 2-row run straddling the chunk edge fills; a run of `max_gap` rows or more stays NaN:
-
-    >>> import dask.array as da
-    >>> a = np.ones((1, 12, 1)); a[0, 5:7] = np.nan; a[0, 8:] = np.nan
-    >>> r = xr.DataArray(da.from_array(a, chunks=(1, 6, 1)), dims=("band", "y", "x"))
-    >>> np.isnan(_interp_rows(r, 4).values[0, :, 0]).astype(int).tolist()
-    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1]
-    """
-    import dask.array as da
-
-    ax = rad.get_axis_num("y")
-    data = rad.data if isinstance(rad.data, da.Array) else da.from_array(rad.data)
-    data = data.rechunk({a: -1 for a in range(rad.ndim) if a != ax})
-
-    def block(b):
-        dims = [f"d{i}" for i in range(b.ndim)]
-        dims[ax] = "y"
-        return (
-            xr.DataArray(b, dims=dims, coords={"y": np.arange(b.shape[ax])}).interpolate_na("y", max_gap=max_gap).values
-        )
-
-    return rad.copy(data=data.map_overlap(block, depth={ax: max_gap}, boundary="none", dtype=data.dtype))
-
-
-def _retime(rad, fix, frame_offsets, qub):
-    """(`rad` on true frames, (band, y) lost-frame mask) via `iirspy.l1.frames.apply`, or (`rad`, None) when off.
-
-    No `frame_offsets` builds the table from the full cube `qub` and caches it beside it as
-    `<qub stem>_frames_offsets.csv`.
-    """
-    if not fix:
-        return rad, None
-    if frame_offsets is None:
-        frame_offsets = Path(qub).with_name(f"{Path(qub).stem}_frames_offsets.csv")
-        if not frame_offsets.exists():
-            try:
-                frames.build_table(qub, frame_offsets)
-            except ValueError as e:
-                warnings.warn(f"fix_frames skipped: {e}", UserWarning, stacklevel=3)
-                return rad, None
-    return frames.apply(rad, frame_offsets)
-
-
-def _read_g1_table(fnpz, t):
-    """Gain, offset, bad-pixel mask (or None) and provenance attrs of the G1 table epoch covering `t`.
-
-    The npz holds `gain` (n_epoch, 256, 250) and `offset` (n_epoch, 256) or (256,), both in the LUT's
-    units [mW/cm^2/sr/um per DN] for e1 (1 ms; scaled by exposure like the LUT), `epoch_start` (n_epoch,) ISO
-    dates, optional `mask` (n_epoch, 256, 250) bool (True = bad) and `version`. The epoch is the latest
-    `epoch_start` <= `t`. A `t` more than one median epoch spacing past the last epoch warns.
-    """
-    import hashlib
-
-    z = np.load(fnpz)
-    starts = pd.DatetimeIndex(z["epoch_start"])
-    t = pd.Timestamp(t).tz_localize(None) if pd.Timestamp(t).tzinfo else pd.Timestamp(t)  # label times end in Z
-    e = int(starts.searchsorted(t, side="right")) - 1
-    if not starts.is_monotonic_increasing:
-        raise ValueError(f"{fnpz}: epoch_start must be ascending")
-    if e < 0:
-        raise ValueError(f"{fnpz}: scene start {t} precedes the first epoch {starts[0]}")
-    if len(starts) > 1 and t > starts[-1] + starts.to_series().diff().median():
-        warnings.warn(f"{fnpz}: scene start {t} is past the last epoch start {starts[-1]} (open-ended)", stacklevel=2)
-    if z["gain"].shape != (len(starts), 256, 250):
-        raise ValueError(f"{fnpz}: gain {z['gain'].shape} is not (n_epoch, 256, 250)")
-    coords = {"band": 1 + np.arange(256), "x": 0.5 + np.arange(250)}
-    gain = xr.DataArray(z["gain"][e].astype("float32"), coords=coords)
-    off = np.broadcast_to(z["offset"][e] if z["offset"].ndim == 2 else z["offset"], (256,))
-    offset = xr.DataArray(off.astype("float32"), coords={"band": coords["band"]})
-    if "mask" in z and z["mask"].shape != (len(starts), 256, 250):
-        raise ValueError(f"{fnpz}: mask {z['mask'].shape} is not (n_epoch, 256, 250)")
-    mask = xr.DataArray(z["mask"][e].astype(bool), coords=coords) if "mask" in z else None
-    attrs = {
-        "calib_table": str(fnpz),
-        "calib_table_sha256": hashlib.sha256(Path(fnpz).read_bytes()).hexdigest(),
-        "calib_table_version": str(z["version"]) if "version" in z else "",
-        "calib_table_epoch": str(starts[e].date()),
-    }
-    return gain, offset, mask, attrs
 
 
 class IIRSData(ABC):
@@ -464,45 +362,6 @@ class IIRSData(ABC):
         """
         return int(self.img.y.values[0])
 
-    def _read_loc(self, group=None):
-        """This sid's `<sid>_<group>_loc.tif`, loaded via `io.get_iirs_paths` and cached per group.
-
-        Raises FileNotFoundError if no LOC product exists yet.
-        """
-        cache = self.__dict__.setdefault("_loc_cache", {})
-        if group not in cache:
-            from iirspy.georef import backplanes
-
-            paths = io.get_iirs_paths(
-                self.directory, level=self.level, basenames=[self.basename], exts=("loc",), group=group
-            )
-            floc = paths.get("loc", {}).get(self.basename)
-            if floc is None:
-                raise FileNotFoundError(f"no {self.basename}_{group or '<group>'}_loc.tif under {self.directory}")
-            cache[group] = backplanes.read_loc(floc)
-        return cache[group]
-
-    def glt(self, crs, res, bounds=None):
-        """(table, transform) GLT for this sid's whole strip on `crs` at `res` m/px.
-
-        `crs` must be one of the three IIRS projected CRSs (`georef.pole_from_crs`), since that
-        ties camera pixels to a group's own TPS. `bounds` defaults to the loc's own finite extent
-        in `crs`.
-        """
-        from iirspy import georef
-
-        group = georef.pole_from_crs(crs)
-        loc = self._read_loc(group)
-        if bounds is None:
-            x, y = georef.to_stereo(group).transform(loc.lon.values, loc.lat.values)
-            x, y = np.asarray(x), np.asarray(y)
-            finite = np.isfinite(x) & np.isfinite(y)
-            if not finite.any():
-                raise ValueError(f"{self.basename}'s loc has no finite (x, y) in {crs}")
-            bounds = (float(x[finite].min()), float(y[finite].min()), float(x[finite].max()), float(y[finite].max()))
-        cfg = georef.GeorefConfig(pole=group, aoi=tuple(bounds), ps=res)
-        return georef.glt_from_loc(loc, group, cfg)
-
     def _render(self, img, table, tr, crs, row_block=None):
         """`img` pulled through GLT `table` as a lazy (band, y, x) DataArray, `row_block` map rows
         per dask chunk, so a write streams it instead of holding the whole map grid."""
@@ -524,30 +383,31 @@ class IIRSData(ABC):
         da.attrs = dict(self.img.attrs)
         return da.rio.write_crs(crs).rio.write_transform(tr)
 
-    def to_geotiff(self, fout, crs=None, res=None, bounds=None, bands=None, row_block=None, full_bands=True, glt=None):
-        """Render `self.img` onto `crs` at `res` m/px (via `self.glt` + `georef.apply_glt`) and write it.
+    def to_geotiff(self, fout, *, geom=None, grid=None, glt=None, bands=None, row_block=None, full_bands=True):
+        """Render `self.img` onto the map grid `grid` through `geom`'s GLT and write it.
 
-        `glt` is a saved GLT (`georef.save_glt`, e.g. the solve's `<sid>_<group>_glt.tif`) to use
-        instead of one built from the loc; its own grid and CRS win over `crs`/`res`/`bounds`, and
-        it is cropped to the scans this cube holds. `bands` narrows which band numbers render;
-        `full_bands` reindexes the output to the full 1..256 IIRS band range before writing.
+        `grid` is a `GeorefConfig` (see `Geometry.grid`). `glt` is a saved GLT (`georef.save_glt`, e.g. the solve's
+        `<sid>_<group>_glt.tif`) used instead of `geom`/`grid`; its own grid and CRS win and it is cropped to the scans
+        this cube holds. `bands` narrows which band numbers render; `full_bands` reindexes the output to the full
+        1..256 IIRS band range before writing.
         """
-        from iirspy import georef
-
         if glt is not None:
             with rasterio.open(glt) as src:
                 table, tr, crs = src.read(), src.transform, src.crs
             table, tr = georef.crop_glt(table, tr, self._cube_scan0(), self.img.sizes["y"])
         else:
-            table, tr = self.glt(crs, res, bounds)
+            if geom is None or grid is None:
+                raise ValueError("to_geotiff needs geom and grid, or a saved glt")
+            table, tr = geom.glt(grid)
+            crs = georef.stereo_crs(grid.pole)
         img = self.img if bands is None else self.img.sel(band=list(bands))
         da = self._render(img, table, tr, crs, row_block)
         return io.write_camera_product(_expand_to_full_bands(da) if full_bands else da, fout, row_block)
 
-    def clip_aoi(self, geometry, crs, res, geom_crs=None, fout=None, row_block=None, full_bands=True):
-        """Render `self.img` clipped to a polygon `geometry`, via a GLT built from this sid's loc.
+    def clip_aoi(self, polygon, *, geom, res, geom_crs=None, fout=None, row_block=None, full_bands=True):
+        """Render `self.img` clipped to `polygon` through `geom`'s GLT at `res` m/px.
 
-        `geometry`'s bounding box in `crs` becomes the GLT's bounds to keep the render small, then
+        The polygon's bounding box in the group's CRS becomes the GLT's bounds to keep the render small, then
         any GLT cell outside the true polygon (not just its bbox) is nulled before `apply_glt`
         resamples. Returns the clipped `DataArray` if `fout` is None, else writes it and returns
         the written path.
@@ -555,20 +415,15 @@ class IIRSData(ABC):
         from rasterio.features import geometry_mask
         from rasterio.warp import transform_geom
 
-        from iirspy import georef
-
-        geom_crs = georef.LONLAT if geom_crs is None else geom_crs
-        geom = transform_geom(geom_crs, crs, geometry)
-        xs, ys = zip(*geom["coordinates"][0], strict=False)
-        bounds = (min(xs), min(ys), max(xs), max(ys))
-
-        table, tr = self.glt(crs, res, bounds=bounds)
-        poly_mask = geometry_mask([geom], out_shape=table.shape[1:], transform=tr, invert=True)
+        crs = georef.stereo_crs(geom.group)
+        poly = transform_geom(georef.LONLAT if geom_crs is None else geom_crs, crs, polygon)
+        xs, ys = zip(*poly["coordinates"][0], strict=False)
+        table, tr = geom.glt(geom.grid(res, (min(xs), min(ys), max(xs), max(ys))))
+        poly_mask = geometry_mask([poly], out_shape=table.shape[1:], transform=tr, invert=True)
         table = table.copy()
         table[0][~poly_mask] = georef.NODATA  # outside the true polygon, not just its bbox
-        inside = table[0] >= 0
-        if not inside.any():
-            raise ValueError(f"no camera pixels of {self.basename} fall within the given geometry")
+        if not (table[0] >= 0).any():
+            raise ValueError(f"no camera pixels of {self.basename} fall within the given polygon")
 
         da = self._render(self.img, table, tr, crs, row_block)
         if fout is None:
@@ -696,7 +551,7 @@ class L0(IIRSData):
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
         return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
-    def calibrate_to_rad(  # noqa: C901
+    def calibrate(
         self,
         config="iirspy",
         *,
@@ -704,158 +559,27 @@ class L0(IIRSData):
         calib_dir=instrument.DCALIB,
         output_bands=None,
         frame_offsets=None,
+        ws=None,
         **overrides,
     ):
+        """Calibrate to an L1 object, with ISSDC L1 metadata if it exists (see `iirspy.l1.calibrate`).
+
+        `config` is an `L1Config` or a preset name; `overrides` replace single fields. `empirical_kws` go to
+        `empirical.empirical_frames`, e.g. dark_yrange/flat_yrange (positional row ranges into this cube) or
+        apply_smile=True. `output_bands` narrows the returned bands. `frame_offsets` is the strip's frame table
+        (`frames.build_table`) for `fix_frames`; None builds it from this cube (all 256 bands, ~1 min) and caches it
+        beside the .qub.
         """
-        IIRS L0 digital number -> L1 radiance [W/m^2/sr/um], with method choices from `config`.
-
-          L1_Radiance [mW/cm^2/sr/um] = Gain * L0_DN + Offset   (x10 to [W/m^2/sr/um])
-
-        Raw counts are already dark subtracted; the gain/offset LUT is picked by the scene's gain
-        and exposure settings. The LUT is per detector element (band, x), but its cross-track
-        structure is poorly correlated with the on-orbit response and injects striping/speckle.
-        With `empirical`, a per-scene residual dark + sensor flat + band-relative smile (see
-        iirspy.l1.empirical) replaces it and the LUT gives only the per-band absolute scale; in-scene
-        shadow, when present, anchors the zero point in place of the LUT offset:
-
-          scene with dark rows   : rad = 10 * gain_med * (DN - dark_resid) / (flat * smile)
-          scene without dark rows: rad = 10 * (gain_med * DN / (flat * smile) + offset_med)
-
-        `calib` picks the non-empirical scale: "lut" (above), "lut_median" (the LUT's per-band
-        median gain/offset) or a G1 table `.npz` (see `_read_g1_table`) whose epoch covers the scene
-        start. With `attach_empirical_frames` and no `empirical`, the empirical frames are computed
-        and attached but not applied.
-
-        With `fix_frames`, each 4-band group is moved onto true frames by the `frame_offsets` table
-        and its lost frames nulled (see iirspy.l1.frames); `fill_frames` rebuilds them. Then OSF/invalid
-        bands, `exclude_wl`, bad pixels and saturated pixels are nulled, and
-        `interp_bands`/`interp_spatial` fill gaps.
-
-        Parameters
-        ----------
-        config : str or L1Config
-            Preset name or config (see `iirspy.l1.config.L1Config`); `overrides` replace single fields.
-        empirical_kws : dict or None
-            Extra keyword arguments for empirical.empirical_frames, e.g. dark_yrange/flat_yrange
-            (positional row ranges into this cube) or apply_smile=True.
-        calib_dir : path
-            Calibration LUT directory.
-        output_bands : list of int or None
-            Band numbers to mask/interpolate/return. The empirical frames always see every band
-            `self.img` holds; only narrow past what `interp_bands`' max_gap=BAND_GAP can reach.
-        frame_offsets : path or None
-            Frame table from `iirspy.l1.frames.build_table`, for `fix_frames`. None builds it from this
-            cube (all 256 bands, ~1 min) and caches it beside the .qub; a band-subset cube can't be
-            scanned, so its rows stay in raw order, with a warning.
-
-        Returns
-        -------
-        xarray.DataArray
-            Radiance [W/m^2/sr/um], with the config as json in `attrs["l1_config"]`.
-        """
-        cfg = L1Config.resolve(config, **overrides)
-        gain, offset = radiometry.get_gain_offset(self.qub, calib_dir=calib_dir)
-        table_attrs, table_mask = {}, None
-
-        if cfg.empirical or cfg.attach_empirical_frames:
-            ref_flat = radiometry.load_reference_flat(self.qub, calib_dir=calib_dir)
-            dark, flat, smile, snr, emp_notes = empirical_frames(self.img, ref_flat, **(empirical_kws or {}))
-
-        if cfg.empirical:
-            # Empirical correction: LUT gives per-band absolute scale, flat/smile handle cross-track
-            gain_med, offset_med = gain.median("x"), offset.median("x")
-            fs = (flat * smile).clip(min=FLAT_SMILE_MIN)  # avoid divide by 0
-            if snr is not None:
-                # Shadow scene: the in-scene zero anchors the zero point, so drop the LUT offset
-                rad = 10 * gain_med * (self.img - dark) / fs
-                if cfg.attach_snr:
-                    rad = rad.assign_coords(snr=(("y", "x"), snr.values))
-            else:
-                # No zero reference: the lab offset is the only zero-point info, so keep it
-                rad = 10 * (gain_med * self.img / fs + offset_med)
-        else:
-            if cfg.calib == "lut_median":
-                gain, offset = gain.median("x"), offset.median("x")
-            elif cfg.calib != "lut":
-                gain, offset, table_mask, table_attrs = _read_g1_table(cfg.calib, pd.Timestamp(self._start_time()))
-                gain = gain * (
-                    instrument.E1_EXPOSURE_MS / instrument.get_exposure_duration(self.qub)
-                )  # e1 units, as the LUT
-            # Apply gain and offset to convert DN -> Radiance
-            rad = 10 * (self.img * gain + offset)  # [mW/cm^2/sr/μm] -> [W/m^2/sr/um]
-
-        if cfg.attach_empirical_frames:
-            # dark is (x,)-only zeros when no shadow was found; broadcast so all three frames share a shape
-            extra = {"empirical_flat_unmasked": flat.attrs.get("unmasked")}
-            extra |= {f"empirical_flat_bin{i}": f for i, f in enumerate(flat.attrs.get("bins", []))}
-            rad = rad.assign_coords(
-                empirical_dark=(("band", "x"), dark.broadcast_like(flat).values),
-                empirical_flat=(("band", "x"), flat.values),
-                empirical_smile=(("band", "x"), smile.values),
-                **{k: (("band", "x"), v.values) for k, v in extra.items() if v is not None},
-            )
-
-        # Narrow to the requested output bands before the mask/interpolate stage below -- the
-        # empirical frames above already saw every band `self.img` holds, so this can't affect them.
-        rad = rad if output_bands is None else rad.sel(band=output_bands)
-
-        # Re-time each 4-band group onto true frames; its lost frames go NaN until `fill_frames`
-        rad, lost = _retime(rad, cfg.fix_frames, frame_offsets, self.qub)
-
-        # Drop OSF and invalid bands, plus any caller-supplied wavelength ranges. interp if specified
-        rad = rad.where(
-            ~(rad.band.isin((*instrument.OSF, *instrument.INVALID)) | _in_wl_ranges(rad.wl, cfg.exclude_wl))
+        img = l1.calibrate(
+            self.img,
+            L1Config.resolve(config, **overrides),
+            ws=ws,
+            qub=self.qub,
+            calib_dir=calib_dir,
+            empirical_kws=empirical_kws,
+            frame_offsets=frame_offsets,
+            output_bands=output_bands,
         )
-
-        # Drop known bad detector elements (x, bands)
-        if cfg.bad_pixel_mask is True:
-            bad_pixel_mask = instrument.load_bad_pixel_mask()
-            if table_mask is not None:
-                bad_pixel_mask = bad_pixel_mask | table_mask
-        else:
-            bad_pixel_mask = cfg.bad_pixel_mask
-        if bad_pixel_mask is not False:  # Apply user-supplied mask
-            rad = rad.where(~bad_pixel_mask)
-
-        # Drop saturated pixels
-        rad = rad.where(rad < instrument.get_saturation_radiance(self.qub, calib_dir))
-
-        # Rebuild lost frames from each pixel's own spectrum before any generic band interpolation
-        rad = frames.fill(rad, lost) if lost is not None and cfg.fill_frames else rad
-
-        # Interpolate across bands
-        if cfg.interp_bands is not None:
-            rad = rad.interpolate_na("band", max_gap=BAND_GAP, keep_attrs=True, method=cfg.interp_bands)
-
-        # Fill single-column all-band NaN gaps across x (max_gap=2 in 0.5-based x coords spans
-        # exactly one missing column; wider seams and edge columns have no bounded gap to fill),
-        # then runs of up to ROW_GAP - 1 lost rows along y
-        if cfg.interp_spatial:
-            rad = rad.interpolate_na("x", max_gap=2, keep_attrs=True, method="linear")
-            rad = _interp_rows(rad)
-
-        # Format and output Radiance DataArray (float32: gain/offset LUTs are float32, keep graph float32)
-        out = rad.astype("float32")
-        out.name = "Radiance [W/m^2/sr/µm]"
-        out.attrs["name"] = "Radiance"
-        out.attrs["units"] = "W/m^2/sr/um"
-        out.attrs["calibration_source"] = "empirical" if cfg.empirical else "user"
-        out.attrs["iirspy_version"] = io.IIRSPY_VERSION
-        out.attrs["l1_config"] = json.dumps(cfg.to_attrs())
-        out.attrs["calib"] = cfg.calib if cfg.calib in CALIB else "g1_table"
-        out.attrs.update(table_attrs)
-        if cfg.empirical or cfg.attach_empirical_frames:
-            out.attrs["empirical_notes"] = json.dumps(emp_notes)  # provenance: how the product was made
-
-        return out
-
-    def _start_time(self):
-        """Scene start, from the nri label."""
-        return pdr.open(self.qub).metaget("start_date_time")
-
-    def calibrate(self, config="iirspy", **kwargs):
-        """Calibrate to an L1 object (see `calibrate_to_rad`), with ISSDC L1 metadata if it exists."""
-        img = self.calibrate_to_rad(config, **kwargs)
         try:
             out = L1(self.basename, str(self.directory), self.extent)
             out.img = img
@@ -1049,29 +773,30 @@ class L1(IIRSData):
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
         return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
-    def calibrate(self, config="iirspy", *, inc=None, slope_az=None, sun_az_offset=0.0, **overrides):
-        """Calibrate to an L2 reflectance object (requires the SPM file for solar angles).
+    def georef(self, method, *, ws=None, **inputs):
+        """The scene's `Geometry` by `method` (a `georef.GEOREF` key); `inputs` are that method's own (see `iirspy.georef`)."""
+        return georef.run_georef(
+            method, ws=ws, sid=self.basename, shape=self.img.shape[-2:], row0=self._cube_scan0(), **inputs
+        )
 
-        `config` is an `L2Config` or a preset name (see `iirspy.l2.config.L2Config`); `overrides`
-        replace individual fields, e.g. `calibrate("issdc", polish=None)`. The keywords are
-        per-scene inputs: `inc` (solar incidence [deg], per line or per pixel, default the spm's),
-        `slope_az` (camera-space slope/aspect[/lit], see `photometry.load_slope_az`; make one from
-        a DEM with `photometry.slope_az_from_dem`) and `sun_az_offset` (deg added to the spm
-        azimuth to reach slope_az's grid-north frame).
+    def calibrate(self, config="iirspy", *, geom=None, ws=None, **overrides):
+        """Calibrate to an L2 reflectance object (see `iirspy.l2.calibrate`; needs the SPM file for solar angles).
+
+        `config` is an `L2Config` or a preset name; `overrides` replace individual fields, e.g.
+        `calibrate("issdc", polish=None)`. `geom` is the scene's `Geometry` (from `georef`) for the photometric step.
         """
         if self.spm is None:
             raise FileNotFoundError(
                 f"SPM file required for reflectance calibration. Expected: "
                 f"{self.directory}/miscellaneous/calibrated/ch2_iir_nci_{self.basename}_spm.dat"
             )
-        cfg = L2Config.resolve(config, **overrides)
-        return L2._from_l1(self, cfg, inc=inc, slope_az=slope_az, sun_az_offset=sun_az_offset)
+        return L2._from_l1(self, L2Config.resolve(config, **overrides), geom, ws)
 
 
 class L2(IIRSData):
     """Class for IIRS L2 reflectance data."""
 
-    # Per-scene attrs `_compute_reflectance` records beside `l2_config`
+    # Per-scene attrs `iirspy.l2.calibrate` records beside `l2_config`
     DIAGNOSTICS = (
         "solar_distance_au",
         "inc_min_deg",
@@ -1080,7 +805,6 @@ class L2(IIRSData):
         "cos_inc_floor_frac",
         "cos_view_floor_frac",
         "slope_az_used",
-        "sun_az_offset",
     )
 
     @classmethod
@@ -1141,7 +865,7 @@ class L2(IIRSData):
         return instance
 
     @classmethod
-    def _from_l1(cls, l1_instance, cfg, inc=None, slope_az=None, sun_az_offset=0.0):
+    def _from_l1(cls, l1_instance, cfg, geom=None, ws=None):
         """Internal method to create L2 from L1 instance."""
         instance = cls.__new__(cls)
         instance.basename = l1_instance.basename
@@ -1156,105 +880,12 @@ class L2(IIRSData):
         instance.spm = l1_instance.spm
         instance.metadata = l1_instance.metadata.copy()
 
-        instance.img = instance._compute_reflectance(
-            l1_instance.img,
-            l1_instance.qub if hasattr(l1_instance, "qub") else None,
-            cfg,
-            inc=inc,
-            slope_az=slope_az,
-            sun_az_offset=sun_az_offset,
+        instance.img = l2.calibrate(
+            l1_instance.img, cfg, ws=ws, qub=l1_instance.qub if hasattr(l1_instance, "qub") else None, geom=geom
         )
         instance.img.attrs["calibration_source"] = "user"
 
         return instance
-
-    def _compute_reflectance(self, rad, qub_path, cfg, inc=None, slope_az=None, sun_az_offset=0.0):
-        """I/F reflectance from radiance, with each step chosen by `cfg` (see `iirspy.l2.config.L2Config`).
-
-        Steps, in order: solar flux at the scene's distance, thermal removal, polish,
-        photometric normalization, Besse phase, spectral smoothing, clip. Polish is folded into
-        one division with the flux and photometric terms; all divisors are positive.
-
-        Parameters
-        ----------
-        rad : xarray.DataArray
-            (band, y, x) radiance [W/m^2/sr/um] with `wl` and per-line `solar_inc`/`solar_az` coords.
-        qub_path : str or None
-            Label for the scene's epoch (solar distance, monthly flux). None means 1 AU.
-        cfg : L2Config
-            Method choices.
-        inc : float or xarray.DataArray, optional
-            Solar incidence [deg], per line or per pixel. Default `rad.solar_inc`.
-        slope_az : str, Path, xarray object or tuple, optional
-            Camera-space slope/aspect[/lit] on this cube's grid (`photometry.load_slope_az`). Used
-            only when `cfg.use_slope_az`.
-        sun_az_offset : float
-            Degrees added to the spm solar azimuth (local north) to reach slope_az's grid north.
-
-        Returns
-        -------
-        xarray.DataArray
-            Reflectance, with `cfg` as json in `attrs["l2_config"]`, the per-scene `L2.DIAGNOSTICS` in
-            attrs, and the thermal temperature [K] as coord `T` when removed.
-        """
-        slope_az = slope_az if cfg.use_slope_az else None
-        inc = (rad.solar_inc if inc is None else inc) * xr.ones_like(rad.isel(x=0, band=0, drop=True))
-
-        sdist = solar.sun_distance(cfg, qub_path)
-        solar_flux = solar.solar_flux(cfg, sdist, qub_path)
-
-        trad, temp = (0.0, None)
-        if cfg.thermal == "isothermal":
-            trad, temp = thermal.thermal_radiance(
-                rad, cfg.thermal_eps, cfg.thermal_bands, inc=inc, sdist=sdist, t_min=cfg.thermal_t_min
-            )
-
-        sun_az = (rad.solar_az if "solar_az" in rad.coords else 0.0) + sun_az_offset
-        photfn, g, floors = photometry.photometric_factor(
-            inc,
-            sun_az,
-            slope_az,
-            like=rad.isel(band=0, drop=True),
-            photom=cfg.photom,
-            cos_min=cfg.cos_min,
-            min_lit=cfg.min_lit,
-        )
-
-        # photfn is numpy (topo); unchunked, photfn * solar_flux is an eager (y, x, band) float64 cube
-        if rad.chunks is not None and hasattr(photfn, "chunk"):
-            photfn = photfn.chunk({"y": rad.chunksizes["y"]})
-        num = rad - trad
-        den = photfn * solar_flux
-        if cfg.polish is not None:
-            den = den * polish.spectral_polish(rad.band, POLISH.get(cfg.polish, cfg.polish))
-        refl = num / den
-        refl = photometry.besse_rescale(refl, cfg.photom, g, rad.wl) if cfg.phase else refl
-        refl = polish.moving_average(refl, cfg.smoothing, cfg.smoothing_edges)
-        if (
-            cfg.clip_negative
-        ):  # last, like ISSDC's range validation: it zeroes pixels the smoothed spectrum leaves negative
-            refl = refl.clip(min=0)
-        if cfg.fill_nan is not None:
-            refl = refl.fillna(cfg.fill_nan)
-        if "wl" not in refl.coords:
-            refl = refl.assign_coords(wl=rad.wl)
-        if temp is not None:
-            refl = refl.assign_coords(T=temp)
-        refl.name = "Reflectance"
-        refl.attrs["name"] = "Reflectance"
-        refl.attrs["units"] = ""
-
-        refl.attrs["l2_config"] = json.dumps(cfg.to_attrs())
-        refl.attrs.update(
-            **floors,
-            sun_az_offset=sun_az_offset,
-            slope_az_used=slope_az is not None,
-            solar_distance_au=sdist,
-            inc_min_deg=float(inc.min()),
-            inc_max_deg=float(inc.max()),
-            inc_mean_deg=float(inc.mean()),
-        )
-        return refl
 
     def __init__(
         self,

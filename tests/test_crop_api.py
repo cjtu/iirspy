@@ -71,8 +71,9 @@ def test_cropped_l0_from_file_calibrates(tmp_path, monkeypatch):
         "interp_bands": None,
         "interp_spatial": False,
     }
-    rad = l0.calibrate_to_rad(**kw)
+    l1 = l0.calibrate(**kw)
+    rad = l1.img
     keep = ~rad.band.isin((*instrument.OSF, *instrument.INVALID))
     expected = 10 * (2 * l0.img.where(keep, drop=True).values + 1)
     np.testing.assert_allclose(rad.where(keep, drop=True).values, expected, rtol=1e-6)
-    assert isinstance(l0.calibrate(**kw), L1)
+    assert isinstance(l1, L1)

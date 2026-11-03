@@ -1,10 +1,14 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
 import xarray as xr
 
+from iirspy.georef.geometry import Geometry, quality
+from iirspy.l2 import calibrate
 from iirspy.l2 import photometry as ph
+from iirspy.l2.config import L2Config
 
 
 def test_flat_slope_az_reproduces_cos_inc():
@@ -65,11 +69,21 @@ def _synthetic_l1(ny=4, nx=3):
     return rad
 
 
-def _refl(rad, slope_az=None, **kw):
-    from iirspy.iirs import L2
-    from iirspy.l2.config import L2Config
+def _topo_geom(rad, slope_az):
+    shape = rad.shape[1:]
+    per_line = lambda name: np.broadcast_to(rad[name].values[:, None], shape)
+    obs = dict(zip(("facet_slope", "facet_aspect", "lit_frac"), (np.asarray(a) for a in slope_az), strict=True))
+    obs |= {"sun_azimuth": per_line("solar_az"), "sun_zenith": per_line("solar_inc")}
+    loc = {"lon": np.zeros(shape), "lat": np.zeros(shape), "radius": np.full(shape, 1737400.0)}
+    qa = np.zeros(shape, "uint16")
+    return Geometry.from_arrays(
+        "sid", "south", 0, "arosics", loc, obs, qa, quality("arosics", "pass"), sidecars={"topo": Path("topo.tif")}
+    )
 
-    return L2.__new__(L2)._compute_reflectance(rad, None, L2Config(flux=1.0, **kw), slope_az=slope_az)
+
+def _refl(rad, slope_az=None, **kw):
+    geom = None if slope_az is None else _topo_geom(rad, slope_az)
+    return calibrate(rad, L2Config(flux=1.0, **kw), geom=geom)
 
 
 def test_flat_slope_az_matches_the_no_slope_az_reflectance():

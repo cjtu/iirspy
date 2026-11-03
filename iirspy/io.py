@@ -1,5 +1,7 @@
 import hashlib
+import json
 import re
+import time
 import warnings
 from dataclasses import dataclass
 from importlib import metadata
@@ -197,6 +199,24 @@ def get_iirs_shape_meta(fimg):
     axs = pdr.open(fimg).metaget("Array_3D_Spectrum").getall("Axis_Array")
     bands, lines, samples = (int(axs[i]["elements"]) for i in range(3))
     return bands, lines, samples
+
+
+def record_step(out, prev, step: str, method: str, t0: float, cfg=None, fields=(), **inputs):
+    """`out` carrying `prev`'s attrs and its provenance list plus one entry for this step.
+
+    `t0` is the step's `time.monotonic()` start; `fields` names the `cfg` fields the step read.
+    """
+    entry = {
+        "step": step,
+        "method": method,
+        "cfg": {f: getattr(cfg, f) for f in fields},
+        "version": IIRSPY_VERSION,
+        "inputs": inputs,
+        "wall_s": round(time.monotonic() - t0, 3),
+    }
+    prov = [*json.loads(prev.attrs.get("provenance", "[]")), entry]
+    out.attrs = {**prev.attrs, **out.attrs, "provenance": json.dumps(prov, default=str)}
+    return out
 
 
 def provenance(**extra) -> dict:

@@ -1,13 +1,15 @@
 """P0 basis: lut_median and G1-table calibration, HSRS flux with distance scaling, refl CLI configs."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
 
-from iirspy import L0, iirs, instrument
+from iirspy import L0, instrument
 from iirspy.cli import refl
-from iirspy.l1 import radiometry
+from iirspy.l1 import calibrate, empirical, radiometry
 from iirspy.l1.config import L1Config
 from iirspy.l2 import solar
 
@@ -25,7 +27,7 @@ def l0(tmp_path, monkeypatch):
     sat = xr.DataArray(np.full(256, 1e9), coords={"band": coords["band"]})
     monkeypatch.setattr(radiometry, "get_gain_offset", lambda *a, **k: (gain, offset))
     monkeypatch.setattr(instrument, "get_saturation_radiance", lambda *a, **k: sat)
-    monkeypatch.setattr(L0, "_start_time", lambda self: "2020-12-02T15:27:48")
+    monkeypatch.setattr(radiometry.pdr, "open", lambda f: SimpleNamespace(metaget=lambda k: "2020-12-02T15:27:48"))
     monkeypatch.setattr(instrument, "get_exposure_duration", lambda *a: 1.0)
     dn = xr.DataArray(
         rng.uniform(1, 100, (3, 6, 250)).astype("float32"),
@@ -41,7 +43,10 @@ def l0(tmp_path, monkeypatch):
 
 
 def _cal(l0, **kw):
-    return l0.calibrate_to_rad(**{**P0_KW, "empirical": False, "interp_bands": None, "interp_spatial": False, **kw})
+    cfg = L1Config.resolve(
+        "iirspy", **{**P0_KW, "empirical": False, "interp_bands": None, "interp_spatial": False, **kw}
+    )
+    return calibrate(l0.img, cfg, qub=l0.qub)
 
 
 def test_p0_and_identity_g1_table(l0, tmp_path):
@@ -59,7 +64,7 @@ def test_p0_and_identity_g1_table(l0, tmp_path):
     rad_t = _cal(obj, calib=str(ft.with_name("g1b.npz")))
     np.testing.assert_allclose(rad_t.values, rad.values, rtol=1e-6)
     assert rad_t.attrs["calib_table_version"] == "t" and len(rad_t.attrs["calib_table_sha256"]) == 64
-    assert iirs._read_g1_table(ft, pd.Timestamp("2020-12-02T15:27:48Z"))[3]["calib_table_epoch"] == "2019-01-01"
+    assert radiometry._read_g1_table(ft, pd.Timestamp("2020-12-02T15:27:48Z"))[3]["calib_table_epoch"] == "2019-01-01"
     with pytest.MonkeyPatch.context() as mp:  # table gain is in e1 (1 ms) units, scaled by exposure like the LUT
         mp.setattr(instrument, "get_exposure_duration", lambda *a: 10.0)
         rad_e3 = _cal(obj, calib=str(ft.with_name("g1b.npz")))
@@ -80,17 +85,19 @@ def test_g1_table_mask_union_and_open_ended_warning(tmp_path):
         mask=m,
         epoch_start=["2019-01-01", "2019-07-01", "2020-01-01"],
     )
-    tm = iirs._read_g1_table(ft, pd.Timestamp("2020-01-02"))[2]
+    tm = radiometry._read_g1_table(ft, pd.Timestamp("2020-01-02"))[2]
     assert bool((instrument.load_bad_pixel_mask() | tm)[5, 7])
     with pytest.warns(UserWarning, match="past the last epoch"):
-        iirs._read_g1_table(ft, pd.Timestamp("2021-01-01"))
+        radiometry._read_g1_table(ft, pd.Timestamp("2021-01-01"))
 
 
 def test_attach_empirical_frames_does_not_apply(l0, monkeypatch):
     obj, *_ = l0
     ones = xr.DataArray(np.full((3, 250), 0.5), coords={"band": BANDS, "x": obj.img.x.values})
-    monkeypatch.setattr(radiometry, "load_reference_flat", lambda *a, **k: None)
-    monkeypatch.setattr(iirs, "empirical_frames", lambda *a, **k: (ones * 0, ones, ones, None, {"note": 1}))
+    monkeypatch.setattr(empirical, "load_reference_flat", lambda *a, **k: None)
+    monkeypatch.setattr(
+        empirical, "empirical_frames", lambda *a, **k: (ones * 0, ones, ones, None, {"has_shadow": False})
+    )
     base = _cal(obj, calib="lut_median")
     att = _cal(obj, calib="lut_median", attach_empirical_frames=True)
     assert {"empirical_dark", "empirical_flat", "empirical_smile"} <= set(att.coords) and "empirical_notes" in att.attrs

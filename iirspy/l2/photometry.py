@@ -21,10 +21,12 @@ Angle conventions match the IIRS spm:
 """
 
 import functools
+import time
 
 import numpy as np
 import xarray as xr
 
+from iirspy import io
 from iirspy.instrument import PKG_DATA
 
 M3_DATA = PKG_DATA.joinpath("m3")
@@ -247,3 +249,48 @@ def besse_rescale(refl, photom, g, wl):
     g_dims = getattr(g, "dims", ("y",))
     f_ratio = xr.DataArray(besse_phase(np.asarray(g), wl.values), dims=("band", *g_dims))
     return refl * xl_ref * f_ratio
+
+
+def slope_az_from_geom(geom):
+    """Facet (slope, aspect, lit, sun) from `geom.obs`, as `load_slope_az` takes."""
+    o = geom.obs
+    sun = (o.sun_azimuth.values, 90 - o.sun_zenith.values)
+    return o.facet_slope.values, o.facet_aspect.values, o.lit_frac.values, sun
+
+
+def photometric(rad, cfg, *, ws=None, inc, geom=None, **_):
+    """Divide by the disk function times the lit fraction; facet terms come from `geom` when it has topo."""
+    t0 = time.monotonic()
+    slope_az = slope_az_from_geom(geom) if cfg.use_slope_az and geom is not None and geom.has_topo else None
+    photfn, g, floors = photometric_factor(
+        inc,
+        rad.solar_az if "solar_az" in rad.coords else 0.0,
+        slope_az,
+        like=rad.isel(band=0, drop=True),
+        photom=cfg.photom,
+        cos_min=cfg.cos_min,
+        min_lit=cfg.min_lit,
+    )
+    # photfn is numpy (topo); unchunked, dividing by it makes an eager (y, x, band) float64 cube
+    if rad.chunks is not None and hasattr(photfn, "chunk"):
+        photfn = photfn.chunk({"y": rad.chunksizes["y"]})
+    out = rad / photfn
+    out = out.assign_coords(phase_g=g) if cfg.phase else out
+    out.attrs |= {
+        **floors,
+        "slope_az_used": slope_az is not None,
+        "inc_min_deg": float(inc.min()),
+        "inc_max_deg": float(inc.max()),
+        "inc_mean_deg": float(inc.mean()),
+    }
+    fields = ("photom", "use_slope_az", "cos_min", "min_lit")
+    return io.record_step(out, rad, "photometric", str(cfg.photom), t0, cfg, fields, geom=geom and geom.method)
+
+
+def phase(rad, cfg, *, ws=None, **_):
+    """Rescale onto Besse's 30 deg phase reference."""
+    if not cfg.phase:
+        return rad
+    t0 = time.monotonic()
+    out = besse_rescale(rad.drop_vars("phase_g"), cfg.photom, rad.phase_g, rad.wl)
+    return io.record_step(out, rad, "phase", "besse", t0, cfg, ("photom",))

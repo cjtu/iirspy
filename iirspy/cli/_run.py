@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime
+import errno
 import hashlib
 import json
 import os
@@ -350,3 +352,43 @@ def ensure_frame_offsets(job: Job, dest: Path | None = None) -> Path:
 def predates_frames(fgcps: Path, fframes: Path) -> bool:
     """Whether `fgcps` was solved before `fframes` existed, i.e. on a cube whose groups were not re-timed."""
     return not fframes.exists() or fgcps.stat().st_mtime < fframes.stat().st_mtime
+
+
+def keep(ws: Workspace, dest_dir: str | None, *files: Path) -> None:
+    """Copy products out of the work dir into `dest_dir` (a no-op without one)."""
+    if not dest_dir:
+        return
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        shutil.copyfile(f, dest / f.name)
+    ws.log(f"kept {len(files)} file(s) -> {dest}")
+
+
+def is_disk_full(exc: BaseException) -> bool:
+    """Whether `exc` is a quota / ENOSPC failure, as an OSError errno or as a message-only GDAL error."""
+    if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        return True
+    msg = str(exc).lower()
+    return "disk quota exceeded" in msg or "no space left on device" in msg
+
+
+def file_info(f, sha=False) -> dict:
+    """Path and mtime (UTC) of an input, plus its sha256 when `sha`."""
+    f = Path(f)
+    mtime = datetime.datetime.fromtimestamp(f.stat().st_mtime, datetime.UTC).isoformat(timespec="seconds")
+    return {"path": str(f), "mtime": mtime, **({"sha256": hashlib.sha256(f.read_bytes()).hexdigest()} if sha else {})}
+
+
+def resource_report(img) -> str:
+    """Whether the cube's y-blocks keep `ncpu` dask threads busy, and the peak RSS against the Slurm allocation."""
+    import resource
+
+    n, ny, nx = img.shape
+    ychunks = img.chunks[img.dims.index("y")] if img.chunks is not None else (ny,)
+    block_mb = n * max(ychunks) * nx * 4 / 2**20
+    busy = "ok" if len(ychunks) >= ncpu() else "STARVED: fewer blocks than cores"
+    peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    limit = os.environ.get("SLURM_MEM_PER_NODE")
+    of = f" of --mem={int(limit) / 1024:.0f}G ({100 * peak_mb / int(limit):.0f}%)" if limit else ""
+    return f"L1 {img.shape} in {len(ychunks)} y-blocks of <={block_mb:.0f} MB for {ncpu()} workers ({busy}); peak RSS {peak_mb:.0f} MB{of}"

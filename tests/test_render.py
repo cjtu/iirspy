@@ -6,6 +6,7 @@ import rasterio
 import xarray as xr
 
 from iirspy import georef, io
+from iirspy.georef.geometry import Geometry, quality
 from iirspy.iirs import IIRSData
 
 
@@ -20,12 +21,24 @@ def _synthetic_loc(ny, nx, x0=500.0, dx=30.0, y0=3500.0, dy=-50.0, pole="south")
     return loc, x, y
 
 
-def _bound_inst(img, loc):
-    inst = SimpleNamespace(img=img, _loc_cache={"south": loc})
-    inst.glt = MethodType(IIRSData.glt, inst)
+def _geom(loc):
+    shape = loc.lon.shape
+    return Geometry.from_arrays(
+        "sid",
+        "south",
+        0,
+        "arosics",
+        {"lon": loc.lon.values, "lat": loc.lat.values, "radius": np.full(shape, 1737400.0)},
+        {},
+        np.zeros(shape, "uint16"),
+        quality("arosics", "pass"),
+    )
+
+
+def _bound_inst(img):
+    inst = SimpleNamespace(img=img)
     inst.to_geotiff = MethodType(IIRSData.to_geotiff, inst)
     inst._cube_scan0 = MethodType(IIRSData._cube_scan0, inst)
-    inst._read_loc = MethodType(IIRSData._read_loc, inst)
     inst._render = MethodType(IIRSData._render, inst)
     return inst
 
@@ -33,10 +46,8 @@ def _bound_inst(img, loc):
 def test_glt_recovers_known_camera_pixels_from_a_planar_loc():
     ny, nx = 6, 5
     loc, x, y = _synthetic_loc(ny, nx, dx=2000.0, dy=-2000.0)
-    inst = _bound_inst(img=xr.DataArray(np.zeros((1, ny, nx), "float32"), dims=("band", "y", "x")), loc=loc)
-
-    crs = georef.stereo_crs("south")
-    table, tr = inst.glt(crs, res=2000.0)
+    geom = _geom(loc)
+    table, tr = geom.glt(geom.grid(2000.0))
     assert table.shape == (2, ny, nx)
     assert (table[0] >= 0).all()
     for r in range(ny):
@@ -52,11 +63,9 @@ def test_to_geotiff_places_pixel_values_at_the_expected_map_cell(tmp_path):
     loc, x, y = _synthetic_loc(ny, nx, dx=2000.0, dy=-2000.0)
     cube = np.arange(ny * nx, dtype="float32").reshape(1, ny, nx)
     img = xr.DataArray(cube, dims=("band", "y", "x"), coords={"band": [1]})
-    inst = _bound_inst(img, loc)
-
-    crs = georef.stereo_crs("south")
+    geom = _geom(loc)
     fout = tmp_path / "render.tif"
-    inst.to_geotiff(str(fout), crs, res=2000.0, full_bands=False)
+    _bound_inst(img).to_geotiff(str(fout), geom=geom, grid=geom.grid(2000.0), full_bands=False)
 
     with rasterio.open(fout) as src:
         data = src.read(1)
@@ -71,9 +80,8 @@ def test_to_geotiff_from_a_saved_glt_renders_only_the_cropped_cubes_scans(tmp_pa
     ny, nx = 6, 5
     loc, x, y = _synthetic_loc(ny, nx, dx=2000.0, dy=-2000.0)
     crs = georef.stereo_crs("south")
-    table, tr = _bound_inst(xr.DataArray(np.zeros((1, ny, nx), "float32"), dims=("band", "y", "x")), loc).glt(
-        crs, res=2000.0
-    )
+    geom = _geom(loc)
+    table, tr = geom.glt(geom.grid(2000.0))
     fglt = tmp_path / "glt.tif"
     with rasterio.open(
         fglt, "w", driver="GTiff", height=ny, width=nx, count=2, dtype="int32", crs=crs, transform=tr
@@ -82,7 +90,7 @@ def test_to_geotiff_from_a_saved_glt_renders_only_the_cropped_cubes_scans(tmp_pa
 
     cube = np.arange(ny * nx, dtype="float32").reshape(1, ny, nx)
     full = xr.DataArray(cube, dims=("band", "y", "x"), coords={"band": [1], "y": np.arange(ny), "x": np.arange(nx)})
-    inst = _bound_inst(full.isel(y=slice(2, 5)), loc=None)  # scans 2-4 only, as a lat crop leaves it
+    inst = _bound_inst(full.isel(y=slice(2, 5)))  # scans 2-4 only, as a lat crop leaves it
     fout = tmp_path / "render.tif"
     inst.to_geotiff(str(fout), glt=fglt, full_bands=False, row_block=1)
 
