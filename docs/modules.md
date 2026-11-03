@@ -13,3 +13,9 @@
 ::: iirspy.l2.polish
 
 ::: iirspy.georef.ancillary
+
+::: iirspy.workspace
+
+::: iirspy.l1.config
+
+::: iirspy.l2.config

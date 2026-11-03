@@ -14,7 +14,7 @@ import pytest
 import xarray as xr
 
 from iirspy import instrument
-from iirspy.iirs import _band_numbers
+from iirspy.io import band_numbers
 from iirspy.l1 import empirical as emp
 
 FIXTURE = Path(__file__).parent / "data" / "iirs_l0_subset.tif"
@@ -49,7 +49,7 @@ def synth_cube(nband=7, ny=600, nx=250, bands=None, dark_rows=200, seed=0, textu
 def real_cube():
     """The committed 7-band x 800-line x 250-sample raw-DN crop of a real IIRS scene."""
     da = xr.open_dataarray(FIXTURE, engine="rasterio")
-    return da.assign_coords(band=_band_numbers(da)).astype("float32")
+    return da.assign_coords(band=band_numbers(da)).astype("float32")
 
 
 # --- unit / smoke -----------------------------------------------------------------------------

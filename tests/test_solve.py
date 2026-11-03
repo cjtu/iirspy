@@ -1,11 +1,17 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from iirspy import io
+from iirspy.cli import _run, solve
 from iirspy.georef import arosics
+from iirspy.l1.frames import table_key
+from iirspy.workspace import Workspace
 
+WS = Workspace(Path("."), log=lambda msg: None)
 CFG0 = SimpleNamespace(min_match_frac=0.10)
 CONSENSUS = (160.0, -8720.0)
 SPAN = 130_000.0  # m, a typical chunk's along-track span
@@ -25,7 +31,7 @@ def _fit(rejected, shift, accepted=True, match_frac=0.6):
 def _outlier_strip(calls, seen):
     """Four chunks agreeing on `CONSENSUS`, except chunk 2 latches a spurious 15 km peak once."""
 
-    def fake_solve_one(c, seed, *_, pin_coarse=False):
+    def fake_solve_one(ws, sid, group, frames, kernels, c, seed, *_, pin_coarse=False):
         i = c["i"]
         calls.append((i, seed, pin_coarse))
         seen[i] = seen.get(i, 0) + 1
@@ -35,12 +41,12 @@ def _outlier_strip(calls, seen):
 
 
 def test_a_chunk_disagreeing_with_the_strip_is_reseeded_from_the_consensus(monkeypatch):
-    monkeypatch.setattr(arosics, "log", lambda msg: None)
-    monkeypatch.setattr(arosics, "GROUP", "equatorial")
     calls, seen = [], {}
     monkeypatch.setattr(arosics, "_solve_one", _outlier_strip(calls, seen))
 
-    results, info = arosics._solve_chunks(_chunks(4), CFG0, None, None, None, 0.0, {}, False)
+    results, info = arosics.solve_chunks(
+        WS, "sid", "equatorial", None, [], _chunks(4), CFG0, None, None, None, 0.0, {}, False
+    )
 
     assert all(v == list(CONSENSUS) for v in info["coarse_consensus_m"].values())
     assert info["consensus_outlier_anchors"] == {"along": [2], "cross": [2]} and not info["uncorrected"]
@@ -52,17 +58,17 @@ def test_a_chunk_disagreeing_with_the_strip_is_reseeded_from_the_consensus(monke
 
 
 def test_a_strip_with_no_corroborated_chunk_is_left_uncorrected(monkeypatch):
-    monkeypatch.setattr(arosics, "log", lambda msg: None)
-    monkeypatch.setattr(arosics, "GROUP", "equatorial")
     calls = []
 
-    def fake_solve_one(c, seed, *_):
+    def fake_solve_one(ws, sid, group, frames, kernels, c, seed, *_):
         calls.append(c["i"])
         # Coarse accepted, but the match rate never corroborated it -- so it cannot vote.
         return {"chunk": c, "gcps": {}, "fit": _fit(True, (9920.0, -320.0), match_frac=0.004)}
 
     monkeypatch.setattr(arosics, "_solve_one", fake_solve_one)
-    _, info = arosics._solve_chunks(_chunks(3), CFG0, None, None, None, 0.0, {}, False)
+    _, info = arosics.solve_chunks(
+        WS, "sid", "equatorial", None, [], _chunks(3), CFG0, None, None, None, 0.0, {}, False
+    )
 
     assert info["uncorrected"] and info["coarse_consensus_m"] is None
     assert calls == [0, 1, 2]
@@ -70,25 +76,21 @@ def test_a_strip_with_no_corroborated_chunk_is_left_uncorrected(monkeypatch):
 
 def test_polar_strips_are_reseeded_too(monkeypatch):
     """Polar shifts are near-constant in their own grid frame (run 2: p50 0.40 km per strip)."""
-    monkeypatch.setattr(arosics, "log", lambda msg: None)
-    monkeypatch.setattr(arosics, "GROUP", "south")
     calls, seen = [], {}
     monkeypatch.setattr(arosics, "_solve_one", _outlier_strip(calls, seen))
 
-    results, _ = arosics._solve_chunks(_chunks(4), CFG0, None, None, None, 0.0, {}, False)
+    results, _ = arosics.solve_chunks(WS, "sid", "south", None, [], _chunks(4), CFG0, None, None, None, 0.0, {}, False)
 
     assert seen == {0: 1, 1: 1, 2: 2, 3: 1}
     assert results[2]["fit"]["shift_dev_m"] == 0.0
 
 
 def _replay(monkeypatch, strip, s0, t):
-    """Run `_solve_chunks` over recorded (match_frac, total_shift_m) per chunk, planned at `s0` [km] along unit
+    """Run `solve_chunks` over recorded (match_frac, total_shift_m) per chunk, planned at `s0` [km] along unit
     track `t`; a pinned re-solve lands on its seed."""
-    monkeypatch.setattr(arosics, "log", lambda msg: None)
-    monkeypatch.setattr(arosics, "GROUP", "south")
     pinned = {}
 
-    def fake_solve_one(c, seed, *_, pin_coarse=False):
+    def fake_solve_one(ws, sid, group, frames, kernels, c, seed, *_, pin_coarse=False):
         frac, shift = strip[c["i"]]
         if pin_coarse:
             pinned[c["i"]] = seed
@@ -97,7 +99,7 @@ def _replay(monkeypatch, strip, s0, t):
 
     monkeypatch.setattr(arosics, "_solve_one", fake_solve_one)
     chunks = [{"i": i, "s0": v * 1e3, "s1": v * 1e3 + 138_000.0, "t": t} for i, v in enumerate(s0)]
-    return pinned, arosics._solve_chunks(chunks, CFG0, None, None, None, 0.0, {}, False)[1]
+    return pinned, arosics.solve_chunks(WS, "sid", "south", None, [], chunks, CFG0, None, None, None, 0.0, {}, False)[1]
 
 
 def test_a_line_timing_drift_is_followed_along_track(monkeypatch):
@@ -146,8 +148,6 @@ def test_a_registered_chunk_anchors_even_when_its_coarse_peak_was_refused(monkey
     chunk that actually registered (ch6, 0.167) refused its peak and kept its zero seed. Requiring
     both left the strip with no anchor and shipped the 15 km chunks uncorrected.
     """
-    monkeypatch.setattr(arosics, "log", lambda msg: None)
-    monkeypatch.setattr(arosics, "GROUP", "equatorial")
     strip = [
         (0.013, False, (0.0, 0.0)),
         (0.012, False, (0.0, 0.0)),
@@ -159,7 +159,7 @@ def test_a_registered_chunk_anchors_even_when_its_coarse_peak_was_refused(monkey
     ]
     pinned = []
 
-    def fake_solve_one(c, seed, *_, pin_coarse=False):
+    def fake_solve_one(ws, sid, group, frames, kernels, c, seed, *_, pin_coarse=False):
         frac, accepted, shift = strip[c["i"]]
         if pin_coarse:
             pinned.append(c["i"])
@@ -167,7 +167,9 @@ def test_a_registered_chunk_anchors_even_when_its_coarse_peak_was_refused(monkey
         return {"chunk": c, "gcps": {}, "fit": _fit(frac < 0.10, shift, accepted, frac)}
 
     monkeypatch.setattr(arosics, "_solve_one", fake_solve_one)
-    results, info = arosics._solve_chunks(_chunks(7), CFG0, None, None, None, 0.0, {}, False)
+    results, info = arosics.solve_chunks(
+        WS, "sid", "equatorial", None, [], _chunks(7), CFG0, None, None, None, 0.0, {}, False
+    )
 
     assert all(v == [0.0, 0.0] for v in info["coarse_consensus_m"].values()) and not info["uncorrected"]
     assert pinned == [3, 5]  # the two mis-latched chunks, and only those
@@ -175,21 +177,21 @@ def test_a_registered_chunk_anchors_even_when_its_coarse_peak_was_refused(monkey
 
 
 def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeypatch):
-    monkeypatch.setattr(arosics, "log", lambda msg: None)
-    monkeypatch.setattr(arosics, "SID", "20201202T2319552644")  # "" -> glob "**.spm", ValueError on py3.12
-
     def boom(*args, **kwargs):
         raise RuntimeError("rebuild-attempted")
 
     # Ancillary re-stage runs unconditionally even on a cache hit -- stub it out, and instead
-    # detect a rebuild by the next real step past the cache check, `_stage_inputs`.
-    monkeypatch.setattr(arosics.io, "extract", lambda *a, **k: [])
-    monkeypatch.setattr(arosics, "_stage_inputs", boom)
-    monkeypatch.setattr(arosics.ck, "ancillary", lambda sid: {"geometry/calibrated": None})
+    # detect a rebuild by the next real step past the cache check, `stage_inputs`.
+    monkeypatch.setattr(_run.io, "extract", lambda *a, **k: [])
+    monkeypatch.setattr(_run, "stage_inputs", boom)
+    monkeypatch.setattr(_run.ck, "ancillary", lambda sid, paths: {"geometry/calibrated": None})
 
     ffr = tmp_path / "frames.csv"
     ffr.write_text("kind,line,group,bands,value\n")
-    monkeypatch.setattr(arosics, "FRAMES", ffr)
+    paths = io.Paths(tmp_path, (tmp_path,), (), tmp_path, tmp_path)
+    job = _run.Job(
+        "20201202T2319552644", "south", tmp_path / "x.zip", tmp_path / "stage", tmp_path / "x.log", paths, WS, ffr
+    )
     ftif = tmp_path / "l1.tif"
     ftif.write_bytes(b"stub")
     fmeta = ftif.with_suffix(".meta.json")
@@ -198,49 +200,47 @@ def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeyp
             "scan0": 0,
             "lat_range": [10.0, 20.0],
             "bands": [1, 2],
-            "calibrate_kwargs": {**arosics.CALIBRATE_KWS, "frame_offsets": str(ffr), "empirical": True},
-            "frames": arosics._frames_key(),
+            "calibrate_kwargs": {**_run.CALIBRATE_KWS, "frame_offsets": str(ffr), "empirical": True},
+            "frames": table_key(ffr),
             "crop_geom": "label",
         })
     )
 
     # Matching kwargs (the default) -> cache hit, no rebuild attempted.
-    assert arosics.build_l1((10.0, 20.0), [1, 2], ftif) == (ftif, 0, (10.0, 20.0))
+    assert _run.build_l1(job, (10.0, 20.0), [1, 2], ftif) == (ftif, 0, (10.0, 20.0))
 
     # Cropped with a different geometry csv than the solve now uses -> cache miss.
-    monkeypatch.setattr(arosics.ck, "ancillary", lambda sid: {"geometry/calibrated": tmp_path / "x_g_grd_d18.csv"})
+    monkeypatch.setattr(_run.ck, "ancillary", lambda sid, paths: {"geometry/calibrated": tmp_path / "x_g_grd_d18.csv"})
     with pytest.raises(RuntimeError, match="rebuild-attempted"):
-        arosics.build_l1((10.0, 20.0), [1, 2], ftif)
-    monkeypatch.setattr(arosics.ck, "ancillary", lambda sid: {"geometry/calibrated": None})
+        _run.build_l1(job, (10.0, 20.0), [1, 2], ftif)
+    monkeypatch.setattr(_run.ck, "ancillary", lambda sid, paths: {"geometry/calibrated": None})
 
     # Different calibrate_kwargs to the same path -> cache miss, must not return the stale cube.
     with pytest.raises(RuntimeError, match="rebuild-attempted"):
-        arosics.build_l1((10.0, 20.0), [1, 2], ftif, calibrate_kwargs={"empirical": False})
+        _run.build_l1(job, (10.0, 20.0), [1, 2], ftif, calibrate_kwargs={"empirical": False})
 
     # A different frame table -> cache miss.
     ffr.write_text("kind,line,group,bands,value\ndrop,5,3,13-16,1\n")
     with pytest.raises(RuntimeError, match="rebuild-attempted"):
-        arosics.build_l1((10.0, 20.0), [1, 2], ftif)
+        _run.build_l1(job, (10.0, 20.0), [1, 2], ftif)
 
     # Pre-existing meta.json with no recorded calibrate_kwargs (written before this check existed)
     # is treated as unknown, not as "assume production defaults" -> also rebuilds.
     fmeta.write_text(json.dumps({"scan0": 0, "lat_range": [10.0, 20.0], "bands": [1, 2]}))
     with pytest.raises(RuntimeError, match="rebuild-attempted"):
-        arosics.build_l1((10.0, 20.0), [1, 2], ftif)
+        _run.build_l1(job, (10.0, 20.0), [1, 2], ftif)
 
 
-def test_keep_products_lands_only_what_is_new(tmp_path, monkeypatch):
-    monkeypatch.setattr(arosics, "SID", "s")
-    monkeypatch.setattr(arosics, "GROUP", "equatorial")
+def test_keep_products_lands_only_what_is_new(tmp_path):
     out, dest = tmp_path / "out", tmp_path / "keep"
     out.mkdir()
     (out / "s_equatorial.gcps").write_text("gcps")
-    assert [f.name for f in arosics.keep_products(out, dest)] == ["s_equatorial.gcps"]
+    assert [f.name for f in solve.keep_products("s", "equatorial", out, dest)] == ["s_equatorial.gcps"]
     (out / "s_equatorial_glt.tif").write_text("glt")
-    assert [f.name for f in arosics.keep_products(out, dest)] == ["s_equatorial_glt.tif"]
-    assert arosics.keep_products(out, dest) == []
+    assert [f.name for f in solve.keep_products("s", "equatorial", out, dest)] == ["s_equatorial_glt.tif"]
+    assert solve.keep_products("s", "equatorial", out, dest) == []
     (out / "s_equatorial.gcps").write_text("re-solved")
-    assert [f.name for f in arosics.keep_products(out, dest)] == ["s_equatorial.gcps"]
+    assert [f.name for f in solve.keep_products("s", "equatorial", out, dest)] == ["s_equatorial.gcps"]
     assert (dest / "s_equatorial.gcps").read_text() == "re-solved"
 
 

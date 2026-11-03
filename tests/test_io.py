@@ -9,7 +9,7 @@ import pytest
 import xarray as xr
 
 from iirspy import L0, L1, L2, instrument, io
-from iirspy.iirs import _apply_envi_start, _band_numbers
+from iirspy.io import apply_envi_start, band_numbers
 
 BASENAME = "20201202T1527488942"
 FULL = [1, 2, 3]
@@ -59,7 +59,7 @@ def test_roundtrip_preserves_bands_and_data(cls, ext, bands, tmp_path):
 
     back = xr.open_dataarray(fout, engine="rasterio")
     np.testing.assert_allclose(back.values, inst.img.values, rtol=1e-6)
-    assert list(_band_numbers(back)) == bands
+    assert list(band_numbers(back)) == bands
     if ext == ".tif":  # ENVI BIL carries no transform, so absolute lines survive only in GeoTIFF
         np.testing.assert_allclose(back.y.values, inst.img.y.values)
 
@@ -97,7 +97,7 @@ def test_snr_sidecar_is_written_by_the_same_driver_as_its_cube(ext, tmp_path):
     fsnr = tmp_path / f"cube_snr{ext}"
     assert fsnr.exists(), "the sidecar must take the cube's own format, not always ENVI"
 
-    back = _apply_envi_start(xr.open_dataarray(fsnr, engine="rasterio").sortby("y").sortby("x"))
+    back = apply_envi_start(xr.open_dataarray(fsnr, engine="rasterio").sortby("y").sortby("x"))
     np.testing.assert_allclose(back.y.values, inst.img.y.values)
     np.testing.assert_allclose(back.x.values, inst.img.x.values)
     np.testing.assert_allclose(np.asarray(back.values).reshape(ny, nx), snr)

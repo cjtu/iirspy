@@ -7,8 +7,8 @@ import xarray as xr
 
 from iirspy import L0, iirs, instrument
 from iirspy.cli import refl
-from iirspy.config import L1Config
 from iirspy.l1 import radiometry
+from iirspy.l1.config import L1Config
 from iirspy.l2 import solar
 
 BASENAME = "20201202T1527488942"

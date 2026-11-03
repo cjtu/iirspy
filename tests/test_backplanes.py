@@ -5,7 +5,7 @@ import json
 import numpy as np
 import rasterio
 
-from iirspy import instrument
+from iirspy import instrument, io
 from iirspy.georef import arosics, georef
 from iirspy.georef import backplanes as bp
 from iirspy.georef import chunks as ck
@@ -23,21 +23,33 @@ def test_xyz_round_trips_group_crs_for_every_pole():
         assert abs(r2 - georef.MOON_RADIUS_M) < 1e-6
 
 
-def _write_group(root, sid, group, scan0, rows, cols):
-    d = ck.recal_dir(sid)
+def _write_group(paths, sid, group, scan0, rows, cols):
+    d = ck.recal_dir(sid, paths)
     d.mkdir(parents=True, exist_ok=True)
     gcps = {(r, c): (1000.0 * c, -1000.0 * r + 10.0 * group.__hash__() % 7) for r in rows for c in cols}
-    arosics._save_gcps(arosics.merged_gcps_path(sid, group), gcps)
+    arosics.save_gcps(ck.merged_gcps_path(sid, group, paths), gcps)
     chunks = [{"i": 0, "row0": min(rows), "row1": max(rows)}]
     (d / f"{sid}_{group}_solve_summary.json").write_text(json.dumps({"scan0": scan0, "chunks": chunks}))
     return gcps
 
 
-def test_group_info_row_range_uses_gcps_extent_not_the_full_chunk_plan(tmp_path, monkeypatch):
-    monkeypatch.setattr(ck, "RECAL_ROOT", tmp_path / "recal")
+def _paths(tmp_path, **kw):
+    archive = tmp_path / "archive"
+    return io.Paths(**{
+        "archive": archive,
+        "anc_roots": (archive,),
+        "dem_roots": (),
+        "spice": tmp_path / "spice",
+        "recal_root": tmp_path / "recal",
+        **kw,
+    })
+
+
+def test_group_info_row_range_uses_gcps_extent_not_the_full_chunk_plan(tmp_path):
+    paths = _paths(tmp_path)
     sid = "20210101T0000000000"
-    _write_group(tmp_path, sid, "south", scan0=500, rows=range(0, 11, 5), cols=range(0, 3))
-    gi = bp.group_info(sid, "south")
+    _write_group(paths, sid, "south", scan0=500, rows=range(0, 11, 5), cols=range(0, 3))
+    gi = bp.group_info(sid, "south", paths)
     assert gi.scan0 == 500
     assert gi.row_range == (500, 510)
     assert gi.chunk_rows == [(0, 500, 510)]
@@ -46,13 +58,13 @@ def test_group_info_row_range_uses_gcps_extent_not_the_full_chunk_plan(tmp_path,
 # ------------------------------------------------------------------------------------------
 # LOC
 # ------------------------------------------------------------------------------------------
-def _write_plain_group(sid, group, scan0, rows, cols):
+def _write_plain_group(paths, sid, group, scan0, rows, cols):
     """Like `_write_group` but with plain x=1000*col, y=-1000*row, no per-group hash offset, so
     two groups can share the same ground truth for a seam-blend test."""
-    d = ck.recal_dir(sid)
+    d = ck.recal_dir(sid, paths)
     d.mkdir(parents=True, exist_ok=True)
     gcps = {(r, c): (1000.0 * c, -1000.0 * r) for r in rows for c in cols}
-    arosics._save_gcps(arosics.merged_gcps_path(sid, group), gcps)
+    arosics.save_gcps(ck.merged_gcps_path(sid, group, paths), gcps)
     chunks = [{"i": 0, "row0": min(rows), "row1": max(rows)}]
     (d / f"{sid}_{group}_solve_summary.json").write_text(json.dumps({"scan0": scan0, "chunks": chunks}))
     return gcps
@@ -73,18 +85,18 @@ def _write_dem_tif(path, elev_m, x_range, y_range, ps=200.0):
 
 
 def test_group_loc_samples_constant_dem_elevation(tmp_path, monkeypatch):
-    monkeypatch.setattr(ck, "RECAL_ROOT", tmp_path / "recal")
+    paths = _paths(tmp_path)
     sid = "20210101T0000000000"
     rows, cols = range(0, 21, 10), range(0, 3)
-    _write_plain_group(sid, "south", scan0=100, rows=rows, cols=cols)
+    _write_plain_group(paths, sid, "south", scan0=100, rows=rows, cols=cols)
 
     dem = _write_dem_tif(tmp_path / "dem.tif", elev_m=500.0, x_range=(-2000, 4000), y_range=(-22000, 2000))
     monkeypatch.setattr(
-        ck, "bands", lambda: {"south": {"group": "south", "lat_range": (-90.0, 90.0), "dem_near": str(dem)}}
+        ck, "bands", lambda dem_roots: {"south": {"group": "south", "lat_range": (-90.0, 90.0), "dem_near": str(dem)}}
     )
 
-    gcps_file = arosics._load_gcps(arosics.merged_gcps_path(sid, "south"))
-    lon, lat, radius = bp._group_loc_core(gcps_file, "south", row_block=8)
+    gcps_file = arosics.load_gcps(ck.merged_gcps_path(sid, "south", paths))
+    lon, lat, radius = bp.group_loc_core(gcps_file, "south", paths.dem_roots, row_block=8)
     assert lon.shape == (21, 3)
     assert np.isfinite(lon).all() and np.isfinite(lat).all()
     np.testing.assert_allclose(radius, georef.MOON_RADIUS_M + 500.0, atol=1.0)
@@ -265,7 +277,7 @@ def test_build_qa_bit_packing_no_geometry_and_shadow_lit_disagreement():
     lit = np.array([[1.0, 1.0], [0.1, 0.1], [0.9, 0.9]])  # row1 in geometric shadow, row2 lit
     snr = np.array([[0.0, 0.0], [5.0, 5.0], [0.1, 0.1]])  # row1 also reads as lit -> bit4&5 disagree
     obs = {"bands": {"lit_frac": lit, "snr": snr}, "groups": {}}
-    qa = bp.build_qa("dummy_sid", loc, obs, saturation=None)
+    qa = bp.build_qa("dummy_sid", loc, obs, None, saturation=None)
 
     no_geom = 1 << bp.QA_BITS["no_geometry"]
     shadow = 1 << bp.QA_BITS["in_geometric_shadow"]
@@ -322,7 +334,7 @@ def test_write_qa_tags_name_every_bit(tmp_path):
         assert tags["GEOM_SHADOW_LIT"] == str(bp.GEOM_SHADOW_LIT)
 
 
-def test_spm_archive_then_stage_then_zip(tmp_path, monkeypatch):
+def test_spm_archive_then_stage_then_zip(tmp_path):
     import zipfile
 
     sid, rel = "20231203T0022175440", "miscellaneous/raw/20231203/ch2_iir_nri_20231203T0022175440_d_img_d18.spm"
@@ -330,18 +342,17 @@ def test_spm_archive_then_stage_then_zip(tmp_path, monkeypatch):
     (archive / "zips").mkdir(parents=True)
     with zipfile.ZipFile(archive / "zips" / f"ch2_iir_nri_{sid}_d_img_d18.zip", "w") as zf:
         zf.writestr(rel, "spm")
-    monkeypatch.setattr(ck, "ARCHIVE", archive)
-    monkeypatch.setattr(ck, "ANC_ROOTS", [archive])
+    paths = _paths(tmp_path)
 
-    assert ck.spm(sid) is None  # no stage: never extracts
-    assert ck.spm(sid, stage) == stage / rel  # extracted from the zip
+    assert ck.spm(sid, paths) is None  # no stage: never extracts
+    assert ck.spm(sid, paths, stage) == stage / rel  # extracted from the zip
     assert (stage / rel).read_text() == "spm"
     (archive / rel).parent.mkdir(parents=True)
     (archive / rel).write_text("archived")
-    assert ck.spm(sid, stage) == archive / rel  # archive wins
+    assert ck.spm(sid, paths, stage) == archive / rel  # archive wins
 
 
-def test_label_comes_from_the_nri_zip_like_the_spm(tmp_path, monkeypatch):
+def test_label_comes_from_the_nri_zip_like_the_spm(tmp_path):
     import zipfile
 
     sid, rel = "20231203T0022175440", "data/raw/20231203/ch2_iir_nri_20231203T0022175440_d_img_d18.xml"
@@ -350,8 +361,7 @@ def test_label_comes_from_the_nri_zip_like_the_spm(tmp_path, monkeypatch):
     with zipfile.ZipFile(archive / "zips" / f"ch2_iir_nri_{sid}_d_img_d18.zip", "w") as zf:
         zf.writestr(rel, "<label/>")
         zf.writestr("data/raw/20231203/x.qub", "cube")
-    monkeypatch.setattr(ck, "ARCHIVE", archive)
-    monkeypatch.setattr(ck, "ANC_ROOTS", [archive])
+    paths = _paths(tmp_path)
 
-    assert ck.label(sid, stage) == stage / rel
+    assert ck.label(sid, paths, stage) == stage / rel
     assert not (stage / "data/raw/20231203/x.qub").exists()  # the label only, never the cube

@@ -18,7 +18,7 @@ from iirspy.georef import chunks as ck
 from iirspy.georef.georef import (
     MOON_RADIUS_M,
     GeorefConfig,
-    _enu,
+    enu,
     load_lola_elev,
     lonlat_to_xyz,
     read_band,
@@ -26,7 +26,6 @@ from iirspy.georef.georef import (
     stereo_crs,
     xy_to_lonlat,
 )
-from iirspy.iirs import _apply_envi_start
 from iirspy.instrument import PAN_BANDS
 from iirspy.l1 import radiometry
 from iirspy.l1.empirical import (
@@ -52,7 +51,7 @@ class GroupInfo:
     chunk_rows: list[tuple[int, int, int]]  # (chunk i, absolute row0, absolute row1)
 
 
-def group_info(sid: str, group: str) -> GroupInfo:
+def group_info(sid: str, group: str, paths: io.Paths) -> GroupInfo:
     """Absolute-scan row range and per-chunk row ranges for one solved group.
 
     The solve summary is authoritative: `<sid>_<group>_chunks.json` holds the same pre-solve `chunks` plan, but only
@@ -60,12 +59,12 @@ def group_info(sid: str, group: str) -> GroupInfo:
     own row extent (not the chunk plan) sets `row_range`, since a partial merge can fall short of
     the last planned chunk; `chunk_rows` is the plan's chunks clipped to that same extent.
     """
-    f = ck.recal_dir(sid) / f"{sid}_{group}_solve_summary.json"
+    f = ck.recal_dir(sid, paths) / f"{sid}_{group}_solve_summary.json"
     if not f.exists():
         raise FileNotFoundError(f"{f} missing: {sid}/{group} was not merged (partial --chunks run?)")
     data = json.loads(f.read_text())
     scan0 = int(data["scan0"])
-    gcps = arosics._load_gcps(arosics.merged_gcps_path(sid, group))
+    gcps = arosics.load_gcps(ck.merged_gcps_path(sid, group, paths))
     rows = [int(r) for r, _c in gcps]
     row_range = (scan0 + min(rows), scan0 + max(rows))
     chunk_rows = [
@@ -89,10 +88,10 @@ def chunk_overlaps(gi: GroupInfo) -> list[tuple[int, int, int, int]]:
 # ------------------------------------------------------------------------------------------
 # LOC: lon/lat/radius at every camera pixel
 # ------------------------------------------------------------------------------------------
-def _dem_band(group: str, lat: float) -> dict:
+def _dem_band(group: str, lat: float, dem_roots: tuple[Path, ...]) -> dict:
     """The `chunks.bands()` entry covering `lat` within `group`; clamped to the nearest band's
     `lat_range` if `lat` falls outside every one (LOC extrapolating past the solved edge)."""
-    resolved = ck.bands()
+    resolved = ck.bands(dem_roots)
     cands = [b for b in resolved.values() if b["group"] == group]
     inside = [b for b in cands if b["lat_range"][0] <= lat <= b["lat_range"][1]]
     if inside:
@@ -100,14 +99,16 @@ def _dem_band(group: str, lat: float) -> dict:
     return min(cands, key=lambda b: min(abs(lat - b["lat_range"][0]), abs(lat - b["lat_range"][1])))
 
 
-def _sample_radius(x: np.ndarray, y: np.ndarray, lat: np.ndarray, group: str) -> np.ndarray:
+def _sample_radius(
+    x: np.ndarray, y: np.ndarray, lat: np.ndarray, group: str, dem_roots: tuple[Path, ...]
+) -> np.ndarray:
     """LOLA radius [m from Moon centre] at every (x, y) in `group`'s stereo CRS.
 
     DEM band picked once from this block's median latitude, not per pixel: a block only crosses
     a band boundary near the transition itself, and `_dem_band` already falls back to the nearest
     band there, so the height error at that seam is bounded by the DEM tiers' own overlap.
     """
-    band = _dem_band(group, float(np.nanmedian(lat)))
+    band = _dem_band(group, float(np.nanmedian(lat)), dem_roots)
     with rasterio.open(band["dem_near"]) as src:
         b, px = src.bounds, abs(src.res[0])
     # Clamped into the DEM so a block wholly past its edge (an equatorial strip's first rows south of
@@ -126,7 +127,14 @@ def _sample_radius(x: np.ndarray, y: np.ndarray, lat: np.ndarray, group: str) ->
     return np.asarray(MOON_RADIUS_M + h)
 
 
-def _group_loc_core(gcps: dict, group: str, nrow: int | None = None, ncol: int | None = None, row_block: int = 500):
+def group_loc_core(
+    gcps: dict,
+    group: str,
+    dem_roots: tuple[Path, ...],
+    nrow: int | None = None,
+    ncol: int | None = None,
+    row_block: int = 500,
+):
     """(lon, lat, radius) at every camera pixel centre of one group's GCP lattice, crop-relative rows.
 
     x/y are an interpolating bicubic spline on the merged (row, col) lattice, which the solve always
@@ -168,7 +176,7 @@ def _group_loc_core(gcps: dict, group: str, nrow: int | None = None, ncol: int |
         x, y = at(np.arange(r0, r1) + 0.5)
         lo, la = xy_to_lonlat(x, y, pole=group)
         lon[r0:r1], lat[r0:r1] = lo, la
-        radius[r0:r1] = _sample_radius(x, y, la, group)
+        radius[r0:r1] = _sample_radius(x, y, la, group, dem_roots)
     return lon, lat, radius
 
 
@@ -187,14 +195,14 @@ def _tie_point_residual(fits: list[dict]) -> dict[str, float] | None:
 
 
 def _tags_to_attrs(tags: dict) -> dict:
-    """`tags` ready for `da.attrs`: dict/list values json.dumps'ed so `_save_geotiff`/
+    """`tags` ready for `da.attrs`: dict/list values json.dumps'ed so `io.write_camera_product`/
     `write_envi_hdr` (which only round-trip scalar attrs) both carry every tag."""
     return {k: (json.dumps(v) if isinstance(v, dict | list) else v) for k, v in tags.items()}
 
 
 def _backplane_da(bands: list, names: list[str], units: list[str], row0: int, tags: dict) -> xr.DataArray:
     """(band, y, x) DataArray for a camera-space backplane: `bands` stacked in order, `names`/
-    `units` as non-dimension coords on `band` (`_save_geotiff`'s band-label branch for a product
+    `units` as non-dimension coords on `band` (`io.write_camera_product`'s band-label branch for a product
     with no `wl`), `y`/`x` absolute pixel-centre coords (`row0`=absolute scan row of row 0),
     matching the convention an L1 cube's own `y`/`x` use (see `IIRSData._cube_scan0`)."""
     arr = np.stack(bands)
@@ -223,12 +231,13 @@ def write_loc(
     dtype: str = "float32",
     row0: int = 0,
     fits: list[dict] | None = None,
+    dem_roots: tuple[Path, ...] = (),
 ) -> Path:
     """Write `<sid>_loc.tif`/`.img`: 3 bands lon [deg, 0-360 E], lat [deg, planetocentric], radius
     [m from Moon centre], matching the M3 LOC band order/units. Full strip rows x 250, camera
     space: no CRS or transform. `dtype` defaults f32 (ULP <=0.9 m lon, 0.23 m lat, 0.125 m radius,
     well under the ~80 m pixel this backs); computed in f64 and cast only here -- note the shared
-    GeoTIFF writer (`iirs._save_geotiff`) always writes float dtypes as float32, so `dtype="float64"`
+    GeoTIFF writer (`io.write_camera_product`) always writes float dtypes as float32, so `dtype="float64"`
     only affects the pre-write cast, not the file actually written. `compress`/`predictor`/`dtype`
     are exposed, not frozen. `row0` is this array's absolute scan row 0 (0 for the current
     full-strip callers). `fits` are the solve's per-chunk fits, for the tie-point residual tags.
@@ -252,7 +261,7 @@ def write_loc(
         "TIE_POINT_RESIDUAL_P50_M": tp["p50_m"] if tp else "unavailable",
         "TIE_POINT_RESIDUAL_P95_M": tp["p95_m"] if tp else "unavailable",
         "PROVENANCE_IIRSPY_VERSION": io.IIRSPY_VERSION,
-        "PROVENANCE_DEM_ROOTS": ":".join(str(p) for p in ck._DEM_ROOTS),
+        "PROVENANCE_DEM_ROOTS": ":".join(str(p) for p in dem_roots),
     }
     da = _backplane_da(
         [np.asarray(lon, dtype=dtype), np.asarray(lat, dtype=dtype), np.asarray(radius, dtype=dtype)],
@@ -273,7 +282,7 @@ def _read_backplane(path: Path) -> tuple[xr.DataArray, list[str], dict]:
     header parser silently drops any value containing "=" (e.g. an inequality in free text), a
     format limitation, not something this merge can recover.
     """
-    da = _apply_envi_start(xr.open_dataarray(path, engine="rasterio"))
+    da = io.apply_envi_start(xr.open_dataarray(path, engine="rasterio"))
     with rasterio.open(path) as src:
         names = [src.descriptions[i] or f"band{i + 1}" for i in range(src.count)]
         tags = {**src.tags(ns="ENVI"), **src.tags()}
@@ -284,7 +293,7 @@ def read_loc(path: Path) -> xr.Dataset:
     """`<sid>_loc.tif`/`.img` back as an `xr.Dataset` (lon, lat, radius), dims `("y", "x")` matching
     how `IIRSData`/`L1` name a camera-space cube's own dims (`iirs.py`'s `y`=scan row, `x`=camera
     col). `y`/`x` coords are the absolute scan row and camera column, not a pixel index restarting
-    at 0 -- via `iirs._apply_envi_start`, the same convention `L1.from_file` uses. Also reads ISSDC's
+    at 0 -- via `io.apply_envi_start`, the same convention `L1.from_file` uses. Also reads ISSDC's
     ndi `_d_loc_` backplane (Longitude/Latitude/Radius/Height).
     """
     da, names, tags = _read_backplane(path)
@@ -337,6 +346,7 @@ def _row_geometry(
     radius: np.ndarray,
     scan0: int,
     kernels: list[Path],
+    paths: io.Paths,
     stage: Path | None = None,
 ):
     """Per-pixel sun/sensor terms (IIRS OBS bands 1-7) for one row block, from its own loc (lon, lat,
@@ -346,7 +356,7 @@ def _row_geometry(
     the generic kernels; the spacecraft comes from `georef.sc_positions_km` (CH2 SPK, else the .spm). Whatever
     cannot be computed -- no label, no kernels, no spacecraft state -- is left NaN.
 
-    Azimuth/zenith are in the local topocentric (east, north, up) frame at each pixel (`georef._enu`),
+    Azimuth/zenith are in the local topocentric (east, north, up) frame at each pixel (`georef.enu`),
     azimuth clockwise from local north. Distances are true per-pixel (Sun/spacecraft minus this pixel's
     body-fixed XYZ), so they carry the small topocentric parallax across the scene.
     """
@@ -355,7 +365,7 @@ def _row_geometry(
     ny, nx = lon.shape
     sun_az, sun_zen, sun_dist_au, sens_az, sens_zen, sens_dist_m = (np.full((ny, nx), np.nan) for _ in range(6))
     sc_xyz_km = np.full((3, ny), np.nan)
-    flabel = ck.label(sid, stage)
+    flabel = ck.label(sid, paths, stage)
     if flabel is None or not kernels:
         return sun_az, sun_zen, sun_dist_au, sens_az, sens_zen, sens_dist_m, "none", sc_xyz_km
 
@@ -363,12 +373,12 @@ def _row_geometry(
         sp.furnsh(str(k))
     scans = scan0 + np.arange(ny)
     ets = [sp.str2et(u) for u in ancillary.scan_utc(flabel, scans)]
-    sc_xyz_km, sc_source = sc_positions_km(flabel, ck.spm(sid, stage), scans)
+    sc_xyz_km, sc_source = sc_positions_km(flabel, ck.spm(sid, paths, stage), scans)
     xyz_km = np.stack(lonlat_to_xyz(lon, lat, radius)) / 1000.0  # (3, ny, nx)
     for r, et in enumerate(ets):
         if not np.isfinite(lon[r]).any():
             continue
-        east, north, up = _enu(lon[r], lat[r])  # each (3, nx)
+        east, north, up = enu(lon[r], lat[r])  # each (3, nx)
         p = xyz_km[:, r, :]
         d_sun = np.asarray(sp.spkpos("SUN", et, "IAU_MOON", "LT+S", "MOON")[0])[:, None] - p
         dist_sun = np.linalg.norm(d_sun, axis=0)
@@ -398,14 +408,14 @@ def _facet_cos_i(sun_zen, sun_az, facet_slope, facet_aspect):
     return np.clip(np.cos(z) * np.cos(s) + np.sin(z) * np.sin(s) * np.cos(daz), -1.0, 1.0)
 
 
-def _read_group_topo(sid: str, group: str) -> dict | None:
+def _read_group_topo(sid: str, group: str, paths: io.Paths) -> dict | None:
     """`<sid>_<group>_topo.tif` (slope, aspect, lit_frac), or `None` if not on disk for this group.
 
     `aspect` there is map-grid-referenced (the DEM gradient's own projected rows/cols), not the
     local-true-north the M3 OBS convention needs — `build_obs` corrects it with the same
     grid/true-north offset `georef.sun_geometry` derives for the hillshade renderer.
     """
-    return _read_topo(ck.recal_dir(sid) / f"{sid}_{group}_topo.tif")
+    return _read_topo(ck.recal_dir(sid, paths) / f"{sid}_{group}_topo.tif")
 
 
 def _read_topo(f: Path) -> dict | None:
@@ -416,14 +426,14 @@ def _read_topo(f: Path) -> dict | None:
         return {src.descriptions[i]: src.read(i + 1) for i in range(src.count)}
 
 
-def _l1_rad_path(sid: str, group: str) -> Path:
-    return ck.recal_dir(sid, "data/recalibrated") / f"{sid}_{group}_l1_rad.tif"
+def _l1_rad_path(sid: str, group: str, paths: io.Paths) -> Path:
+    return ck.recal_dir(sid, paths, "data/recalibrated") / f"{sid}_{group}_l1_rad.tif"
 
 
-def _group_snr(sid: str, group: str) -> np.ndarray | None:
+def _group_snr(sid: str, group: str, paths: io.Paths) -> np.ndarray | None:
     """Broadband SNR over `PAN_BANDS`, from the group's own recalibrated L1 cube, or
     `None` if that cube is not on disk (a group processed only through geometry)."""
-    return _l1_snr(_l1_rad_path(sid, group))
+    return _l1_snr(_l1_rad_path(sid, group, paths))
 
 
 def _l1_snr(f: Path) -> np.ndarray | None:
@@ -441,16 +451,16 @@ def _l1_snr(f: Path) -> np.ndarray | None:
     return np.asarray(broadband_snr(P, d0, d1).values, dtype="float32")
 
 
-def _pan_incomplete(sid: str, group: str) -> np.ndarray | None:
+def _pan_incomplete(sid: str, group: str, paths: io.Paths) -> np.ndarray | None:
     """Any-PAN-band-NaN mask from the group's L1 cube, or `None` if it is not on disk."""
-    f = _l1_rad_path(sid, group)
+    f = _l1_rad_path(sid, group, paths)
     if not f.exists():
         return None
     bands = [read_band(f, b) for b in PAN_BANDS]
     return np.isnan(np.stack(bands)).any(0)
 
 
-def _pan_saturation_mask(sid: str, group: str, stage_dir: Path) -> np.ndarray | None:
+def _pan_saturation_mask(sid: str, group: str, stage_dir: Path, paths: io.Paths) -> np.ndarray | None:
     """True where any `PAN_BANDS` band's raw DN, run through the per-scene per-element
     gain/offset LUT, reaches its saturation radiance — the comparison `IIRSData.calibrate_to_rad`
     makes just before it NaNs the pixel out (that pre-NaN radiance is never itself exposed, and the
@@ -460,8 +470,8 @@ def _pan_saturation_mask(sid: str, group: str, stage_dir: Path) -> np.ndarray | 
     Needs the nri raw cube, extracted here restricted to `PAN_BANDS` (a cube already staged with a
     superset, e.g. a solve's, is reused). `None` if the nri bundle is not archived for `sid`.
     """
-    fzip = ck.nri_zip(sid)
-    fgeom = ck.ancillary(sid)["geometry/calibrated"]
+    fzip = ck.nri_zip(sid, paths)
+    fgeom = ck.ancillary(sid, paths)["geometry/calibrated"]
     if fzip is None or fgeom is None:
         return None
     from iirspy import L0
@@ -471,8 +481,8 @@ def _pan_saturation_mask(sid: str, group: str, stage_dir: Path) -> np.ndarray | 
     if not (stage_dir / f"data/raw/{day}/{fzip.stem}.qub").exists():
         io.extract(fzip, stage_dir, bands=PAN_BANDS)
     lat_range = ck.l1_lat_range(group)
-    scan0 = arosics._scene_scan0(fgeom, lat_range)
-    gi = group_info(sid, group)
+    scan0 = arosics.scene_scan0(fgeom, lat_range)
+    gi = group_info(sid, group, paths)
     l0 = L0(sid, str(stage_dir), chunk={"band": -1, "y": 1024, "x": -1})
     # `y` is the native absolute Scan number, same crop `build_l1` makes off the geometry csv.
     l0.img = l0.img.sel(y=slice(scan0, gi.row_range[1] - gi.row_range[0] + scan0), band=PAN_BANDS)
@@ -482,10 +492,10 @@ def _pan_saturation_mask(sid: str, group: str, stage_dir: Path) -> np.ndarray | 
     return np.asarray((rad >= sat.sel(band=PAN_BANDS)).any("band").compute().values)
 
 
-def _kernels_or_none(day: str) -> list[Path]:
-    """`ck.kernels(day)`, or [] when there is no SPICE tree: `_row_geometry` then leaves sun/sensor NaN."""
+def _kernels_or_none(day: str, paths: io.Paths) -> list[Path]:
+    """`ck.kernels(day, paths)`, or [] when there is no SPICE tree: `_row_geometry` then leaves sun/sensor NaN."""
     try:
-        return ck.kernels(day)
+        return ck.kernels(day, paths)
     except FileNotFoundError:
         return []
 
@@ -508,12 +518,12 @@ OBS_NAMES = [
 ]
 
 
-def _group_obs(sid, group, lon, lat, radius, scan0, topo, snr, stage_dir) -> tuple[dict, str, np.ndarray]:
+def _group_obs(sid, group, lon, lat, radius, scan0, topo, snr, paths, stage_dir) -> tuple[dict, str, np.ndarray]:
     """One group's OBS bands (all but `tie_dist`) over its own rows, which start at absolute Scan `scan0`:
     ({name: (ny, nx)}, spacecraft source, (3, ny) spacecraft km). `topo`/`snr` may be `None` (-> NaN)."""
     ny, nx = lon.shape
     s_az, s_zen, s_dist, e_az, e_zen, e_dist, sc_source, sc_xyz_km = _row_geometry(
-        sid, lon, lat, radius, scan0, _kernels_or_none(sid[:8]), stage_dir
+        sid, lon, lat, radius, scan0, _kernels_or_none(sid[:8], paths), paths, stage_dir
     )
     nan = np.full((ny, nx), np.nan, "float32")
     slope = aspect = lit_frac = cos_i = nan
@@ -544,7 +554,7 @@ def _group_obs(sid, group, lon, lat, radius, scan0, topo, snr, stage_dir) -> tup
     return bands, sc_source, sc_xyz_km
 
 
-def build_obs(sid: str, loc: dict, stage_dir: Path | None = None) -> dict:
+def build_obs(sid: str, loc: dict, paths: io.Paths, stage_dir: Path | None = None) -> dict:
     """Every OBS band, assembled group by group over `loc` (`lon`/`lat`/`radius`/`groups`).
     Overlap rows between two groups take the earlier group's own value (first-owner-wins).
     """
@@ -556,7 +566,7 @@ def build_obs(sid: str, loc: dict, stage_dir: Path | None = None) -> dict:
     sc_xyz_km_full = np.full((3, ny), np.nan)
 
     for g in groups:
-        gi = group_info(sid, g)
+        gi = group_info(sid, g, paths)
         r0, r1 = gi.row_range[0], gi.row_range[1] + 1
         write = ~(owner[r0:r1] != "")
         owner[r0:r1] = np.where(write, g, owner[r0:r1])
@@ -569,8 +579,9 @@ def build_obs(sid: str, loc: dict, stage_dir: Path | None = None) -> dict:
             loc["lat"][r0:r1],
             loc["radius"][r0:r1],
             r0,
-            _read_group_topo(sid, g),
-            _group_snr(sid, g),
+            _read_group_topo(sid, g, paths),
+            _group_snr(sid, g, paths),
+            paths,
             stage_dir,
         )
         sources.add(sc_source)
@@ -578,7 +589,7 @@ def build_obs(sid: str, loc: dict, stage_dir: Path | None = None) -> dict:
         for name, full in bands.items():
             out[name][r0:r1] = np.where(write[:, None], full, out[name][r0:r1])
 
-    out["tie_dist"] = _tie_dist(sid, groups, ny, nx)
+    out["tie_dist"] = _tie_dist(sid, groups, ny, nx, paths)
     return {
         "bands": out,
         "groups": loc["groups"],
@@ -587,7 +598,7 @@ def build_obs(sid: str, loc: dict, stage_dir: Path | None = None) -> dict:
     }
 
 
-def scene_obs(sid, group, gcps, shape, scan0, ftopo=None, fl1=None, stage_dir=None) -> dict:
+def scene_obs(sid, group, gcps, shape, scan0, paths, ftopo=None, fl1=None, stage_dir=None) -> dict:
     """`build_obs` for one solved group straight from refl's own inputs, with no LOC product: pixel
     positions from the GCP lattice (`georef.camera_xy`, the same positions the topo samples) plus the
     LOLA radius, topo from `ftopo`, SNR from the L1 cube `fl1`. `gcps` rows are relative to `scan0`."""
@@ -599,7 +610,7 @@ def scene_obs(sid, group, gcps, shape, scan0, ftopo=None, fl1=None, stage_dir=No
     radius = np.empty((ny, nx))
     for r0 in range(0, ny, 500):
         sl = slice(r0, r0 + 500)
-        radius[sl] = _sample_radius(x[sl], y[sl], lat[sl], group)
+        radius[sl] = _sample_radius(x[sl], y[sl], lat[sl], group, paths.dem_roots)
     bands, sc_source, sc_xyz_km = _group_obs(
         sid,
         group,
@@ -609,6 +620,7 @@ def scene_obs(sid, group, gcps, shape, scan0, ftopo=None, fl1=None, stage_dir=No
         scan0,
         _read_topo(ftopo) if ftopo else None,
         _l1_snr(fl1) if fl1 else None,
+        paths,
         stage_dir,
     )
     bands = {n: np.asarray(a, "float32") for n, a in bands.items()}
@@ -625,7 +637,7 @@ def scene_obs(sid, group, gcps, shape, scan0, ftopo=None, fl1=None, stage_dir=No
     }
 
 
-def _tie_dist(sid: str, groups: list[str], ny: int, nx: int) -> np.ndarray:
+def _tie_dist(sid: str, groups: list[str], ny: int, nx: int, paths: io.Paths) -> np.ndarray:
     """Camera-space Euclidean distance [m] from every pixel to the nearest GCP lattice node of its
     owning group, `IIRS_GSD_M` per row/col unit. The solve does not persist its raw AROSICS tie-point
     detections separately from the lattice it fits through them, so this is distance to the nearest
@@ -633,8 +645,8 @@ def _tie_dist(sid: str, groups: list[str], ny: int, nx: int) -> np.ndarray:
     """
     out = np.full((ny, nx), np.nan, "float32")
     for g in groups:
-        gi = group_info(sid, g)
-        gcps = arosics._load_gcps(arosics.merged_gcps_path(sid, g))
+        gi = group_info(sid, g, paths)
+        gcps = arosics.load_gcps(ck.merged_gcps_path(sid, g, paths))
         pts = np.array([(gi.scan0 + r, c) for r, c in gcps], dtype="float64")
         if len(pts) == 0:
             continue
@@ -730,13 +742,13 @@ QA_BITS = {
 }
 
 
-def _extrapolated_mask(sid: str, groups: dict[str, tuple[int, int]], ny: int, nx: int) -> np.ndarray:
+def _extrapolated_mask(sid: str, groups: dict[str, tuple[int, int]], ny: int, nx: int, paths: io.Paths) -> np.ndarray:
     """True where a pixel lies outside the convex hull of its owning group's own GCP lattice
     (row, col), i.e. the LOC is extrapolating rather than interpolating."""
     out = np.zeros((ny, nx), dtype=bool)
     for g in groups:
-        gi = group_info(sid, g)
-        gcps = arosics._load_gcps(arosics.merged_gcps_path(sid, g))
+        gi = group_info(sid, g, paths)
+        gcps = arosics.load_gcps(ck.merged_gcps_path(sid, g, paths))
         pts = np.array([(r, c) for r, c in gcps], dtype="float64")
         if len(pts) < 4:
             continue
@@ -748,7 +760,9 @@ def _extrapolated_mask(sid: str, groups: dict[str, tuple[int, int]], ny: int, nx
     return out
 
 
-def build_qa(sid: str, loc: dict, obs: dict, saturation: dict[str, np.ndarray | None] | None = None) -> np.ndarray:
+def build_qa(
+    sid: str, loc: dict, obs: dict, paths: io.Paths, saturation: dict[str, np.ndarray | None] | None = None
+) -> np.ndarray:
     """The uint16 QA bit field, from `loc`, `obs`, and per-group PAN saturation
     masks (`saturation`, keyed by group; `None`/missing group -> bit 6 left 0 for that group's rows,
     since `SATURATION_CHECK` records whether it was actually evaluated)."""
@@ -757,10 +771,10 @@ def build_qa(sid: str, loc: dict, obs: dict, saturation: dict[str, np.ndarray | 
     groups = loc["groups"]
 
     qa[np.isnan(loc["lon"])] |= 1 << QA_BITS["no_geometry"]
-    qa[_extrapolated_mask(sid, groups, ny, nx)] |= 1 << QA_BITS["gcp_extrapolated"]
+    qa[_extrapolated_mask(sid, groups, ny, nx, paths)] |= 1 << QA_BITS["gcp_extrapolated"]
 
     for g in groups:
-        gi = group_info(sid, g)
+        gi = group_info(sid, g, paths)
         for lo, hi, _ia, _ib in chunk_overlaps(gi):
             qa[lo:hi] |= 1 << QA_BITS["in_gcp_chunk_overlap"]
     for seam in loc.get("seams", ()):
@@ -773,9 +787,9 @@ def build_qa(sid: str, loc: dict, obs: dict, saturation: dict[str, np.ndarray | 
     qa[np.nan_to_num(snr, nan=-np.inf) >= SHADOW_SNR] |= 1 << QA_BITS["is_lit"]
 
     for g in groups:
-        gi = group_info(sid, g)
+        gi = group_info(sid, g, paths)
         r0, r1 = gi.row_range[0], gi.row_range[1] + 1
-        pan_bad = _pan_incomplete(sid, g)
+        pan_bad = _pan_incomplete(sid, g, paths)
         if pan_bad is not None:
             n = min(r1 - r0, pan_bad.shape[0])
             bit = 1 << QA_BITS["pan_incomplete"]

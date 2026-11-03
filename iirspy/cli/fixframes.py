@@ -6,8 +6,7 @@ The frame table comes from the nri or nci cube, built here when absent; an ndi n
 import argparse
 from pathlib import Path
 
-from iirspy.georef import arosics
-from iirspy.georef import chunks as ck
+from iirspy.cli._run import frame_offsets_path, paths_from_env
 from iirspy.iirs import L0, L1, L2
 from iirspy.l1 import frames
 
@@ -15,16 +14,17 @@ LEVELS = {"nri": L0, "nci": L1, "ndi": L2}
 
 
 def main(argv=None):
+    paths = paths_from_env()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("sid")
     ap.add_argument("--product", required=True, choices=LEVELS, help="level of the input cube")
-    ap.add_argument("--directory", default=ck.ARCHIVE, help="ISSDC tree holding it (default IIRS_ARCHIVE)")
+    ap.add_argument("--directory", default=paths.archive, help="ISSDC tree holding it (default IIRS_ARCHIVE)")
     ap.add_argument("--table", help="frame table (default: the strip's <sid>_frames_offsets.csv beside its GCPs)")
     ap.add_argument("--fill-frames", action="store_true", help="rebuild the lost frames instead of leaving NaN")
     ap.add_argument("--out", required=True, help="output .tif")
     args = ap.parse_args(argv)
     cube = LEVELS[args.product](args.sid, args.directory)
-    table = Path(args.table or arosics.frame_offsets_path(args.sid))
+    table = Path(args.table or frame_offsets_path(args.sid, paths))
     if args.product != "ndi" and not table.exists():
         frames.build_table(cube.qub, table)
     cube.fix_frames(table, args.fill_frames)

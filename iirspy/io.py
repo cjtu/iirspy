@@ -1,6 +1,7 @@
 import hashlib
 import re
 import warnings
+from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,34 @@ try:
     IIRSPY_VERSION = metadata.version("iirspy")
 except metadata.PackageNotFoundError:  # running from a source tree not pip-installed
     IIRSPY_VERSION = "0+source"
+
+
+@dataclass(frozen=True)
+class Paths:
+    archive: Path
+    anc_roots: tuple[Path, ...]
+    dem_roots: tuple[Path, ...]
+    spice: Path
+    recal_root: Path
+
+
+def band_numbers(img):
+    """Original IIRS band numbers, from the GeoTIFF band_numbers tag or ENVI band names, else 1..N."""
+    for attr in ("band_numbers", "band_names"):
+        val = img.attrs.get(attr, "")
+        if isinstance(val, str) and all(b.strip().isdigit() for b in val.split(",")):
+            return [int(b) for b in val.split(",")]
+    return img.band.values
+
+
+def apply_envi_start(da):
+    """Shift x/y by the ENVI `x start`/`y start` offset, which GDAL reports but does not apply."""
+    for dim, attr in (("x", "x_start"), ("y", "y_start")):
+        start = da.attrs.get(attr)
+        # Only when the file carried no transform (coords still 0-based); else it is already applied
+        if start is not None and float(da[dim][0]) < 1:
+            da = da.assign_coords({dim: da[dim].values + int(start) - 1})
+    return da
 
 
 def extract(fzip, out_dir, **kw):

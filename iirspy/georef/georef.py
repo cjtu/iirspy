@@ -24,7 +24,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
@@ -49,6 +48,7 @@ from scipy.ndimage import (
 )
 from scipy.spatial import cKDTree
 
+from iirspy import io
 from iirspy.georef import ancillary
 
 AROSICS_ENV = os.environ.get("IIRSPY_AROSICS_ENV", "arosics")  # conda env iirspy.georef.coreg runs in
@@ -374,7 +374,7 @@ def lambert_shade(dem, pixel_size, sun_az, sun_elev):
 # ------------------------------------------------------------------------------------------
 # 3. Reference hillshade
 # ------------------------------------------------------------------------------------------
-def _enu(lon, lat):
+def enu(lon, lat):
     """East, north, up unit vectors at a body-fixed lon/lat (degrees), scalar or same-shape arrays.
 
     Stacked on axis 0, so a (3,) result for scalar input and a (3, ...) result for array input --
@@ -412,7 +412,7 @@ def sun_geometry(fgeom, flabel, cfg, kernels=None):
     u = np.asarray(v) / np.linalg.norm(v)
     cx, cy = (cfg.aoi[0] + cfg.aoi[2]) / 2, (cfg.aoi[1] + cfg.aoi[3]) / 2
     clon, clat = to_lonlat(cfg.pole).transform(cx, cy)
-    east, north, up = _enu(clon, clat)
+    east, north, up = enu(clon, clat)
     lon0 = stereo_crs(cfg.pole).to_dict().get("lon_0", 0.0)
     # True-north bearing -> grid bearing needs (clon - lon0) added at the south pole but SUBTRACTED
     # at the north pole: true north points radially *outward* from a south-pole-centred map but
@@ -478,7 +478,7 @@ def scan_order_reversed(fgeom, flabel, fspm=None, kernels=None, use_spk: bool = 
     def misfit_km(at):
         p, src = sc_positions_km(flabel, fspm, at, use_spk)
         if src == "none":
-            sys.exit(f"no CH2 SPK coverage and no .spm state for {flabel}: cannot test scan order")
+            raise FileNotFoundError(f"no CH2 SPK coverage and no .spm state for {flabel}: cannot test scan order")
         n = p.T / np.linalg.norm(p, axis=0)[:, None]
         return float(np.median(MOON_RADIUS_M / 1e3 * np.arccos(np.clip(np.sum(u * n, axis=1), -1, 1)))), src
 
@@ -514,7 +514,7 @@ def sun_geometry_rows(gcps, shape, flabel, cfg, scan0, kernels=None):
     for r in range(ny):
         v, _ = sp.spkpos("SUN", sp.str2et(utc[r]), "IAU_MOON", "LT+S", "MOON")
         u = np.asarray(v) / np.linalg.norm(v)
-        east, north, up = _enu(lon[r], lat[r])  # each (3, nx): this row's local frame per column
+        east, north, up = enu(lon[r], lat[r])  # each (3, nx): this row's local frame per column
         az[r] = (np.degrees(np.arctan2(u @ east, u @ north)) + grid_sign * (lon[r] - lon0)) % 360
         el[r] = np.degrees(np.arcsin(u @ up))
     return az, el
@@ -835,7 +835,9 @@ def _split_run(r0, r1, max_rows=2000):
     return list(zip(edges[:-1].tolist(), edges[1:].tolist(), strict=True))
 
 
-def scene_topo(sid, group, gcps, shape, fgeom, flabel, cfg, kernels, topo_dir, scan0=0, overwrite=False) -> Path:
+def scene_topo(
+    sid, group, gcps, shape, fgeom, flabel, cfg, kernels, topo_dir, dem_roots, scan0=0, overwrite=False
+) -> Path:
     """The scene's camera-space topo product (slope/aspect/lit + per-pixel sun), built if not there.
 
     Splits the strip into `_split_run`-sized pieces, each its own band (see `_row_bands`), its own
@@ -858,11 +860,11 @@ def scene_topo(sid, group, gcps, shape, fgeom, flabel, cfg, kernels, topo_dir, s
     f.parent.mkdir(parents=True, exist_ok=True)
 
     ny, nx = shape
-    resolved = ck.bands()
+    resolved = ck.bands(dem_roots)
     band_of_row = _row_bands(gcps, ny, cfg)
     pieces: list[tuple[int, int, str]] = []
     for name in dict.fromkeys(band_of_row.tolist()):
-        for a, z in ck._runs(band_of_row == name):
+        for a, z in ck.true_runs(band_of_row == name):
             pieces.extend((a2, z2, name) for a2, z2 in _split_run(a, z))
     pieces.sort(key=lambda p: p[0])
 
@@ -1795,9 +1797,7 @@ def warp(cube, reg, cfg, resampling=Resampling.bilinear, window=None):
     """
     if isinstance(cube, str | Path):
         da = xr.open_dataarray(cube, engine="rasterio")
-        from iirspy.iirs import _band_numbers
-
-        da = da.assign_coords(band=_band_numbers(da))
+        da = da.assign_coords(band=io.band_numbers(da))
     else:
         da = cube
     if "band" not in da.dims:
@@ -2084,80 +2084,13 @@ def geoloc_vrt(cube_path, loc: xr.Dataset, crs, out_dir) -> Path:
     return Path(out)
 
 
-def _gcps_and_aoi(fgcps: Path) -> tuple[list[GroundControlPoint], tuple[float, float, float, float]]:
+def gcps_and_aoi(fgcps: Path) -> tuple[list[GroundControlPoint], tuple[float, float, float, float]]:
     """GroundControlPoints from a merged `.gcps` file, plus the AOI their own x/y span."""
     from iirspy.georef import arosics
 
-    merged = arosics._load_gcps(fgcps)
+    merged = arosics.load_gcps(fgcps)
     if not merged:
-        sys.exit(f"{fgcps} has no GCPs")
+        raise ValueError(f"{fgcps} has no GCPs")
     gcps = [GroundControlPoint(row=float(r), col=float(c), x=float(x), y=float(y)) for (r, c), (x, y) in merged.items()]
     xs, ys = [g.x for g in gcps], [g.y for g in gcps]
     return gcps, (min(xs), min(ys), max(xs), max(ys))
-
-
-def _glt_parser():
-    import argparse
-
-    from iirspy.georef import chunks as ck
-
-    ap = argparse.ArgumentParser(description="Build a scene's GLT from its merged GCPs.")
-    ap.add_argument("sid", help="scene id, e.g. 20210103T1829495344")
-    ap.add_argument("--group", required=True, choices=list(ck.GROUPS))
-    ap.add_argument("--gcps", default=None, help="merged .gcps (default the iirs-solve-scene --keep layout)")
-    ap.add_argument(
-        "--out",
-        default=None,
-        help="directory to write <sid>_<group>_glt.tif into (default alongside the GCPs, "
-        "geometry/recalibrated/<day> under IIRS_RECAL_ROOT)",
-    )
-    ap.add_argument(
-        "--scan0",
-        type=int,
-        default=0,
-        help="first Scan of the L1 crop the GCP rows are relative to",
-    )
-    return ap
-
-
-def main(argv: list[str] | None = None) -> None:
-    from dataclasses import replace
-
-    from iirspy.georef import arosics
-    from iirspy.georef import chunks as ck
-
-    args = _glt_parser().parse_args(argv)
-    fgcps = Path(args.gcps) if args.gcps else arosics.merged_gcps_path(args.sid, args.group)
-    if not fgcps.is_file() or fgcps.stat().st_size == 0:
-        sys.exit(f"{fgcps} missing or empty -- {args.sid} {args.group} is not solved yet")
-
-    gcps, aoi = _gcps_and_aoi(fgcps)
-    lat_range = ck.l1_lat_range(args.group)
-    cfg = replace(ck.chunk_cfg(args.group), aoi=aoi, lat_band=lat_range)
-    # The lattice spans the camera region the TPS was fitted over, so no cube is needed.
-    shape = (int(max(g.row for g in gcps)) + 1, int(max(g.col for g in gcps)) + 1)
-    glt = make_glt(gcps, cfg, shape, scan0=args.scan0)
-
-    out = Path(args.out) if args.out else ck.recal_dir(args.sid)
-    out.mkdir(parents=True, exist_ok=True)
-    f = save_glt(
-        out / f"{args.sid}_{args.group}_glt.tif",
-        glt,
-        cfg,
-        args.sid,
-        args.group,
-        args.scan0,
-        lat_range,
-        shape,
-        n_gcps=len(gcps),
-    )
-    valid = int((glt[0] >= 0).sum())
-    print(
-        f"{f} {glt.shape[1]}x{glt.shape[2]} px, {valid / glt[0].size:.1%} inside footprint, "
-        f"{f.stat().st_size / 1e6:.1f} MB, camera {shape}, {len(gcps)} gcps",
-        flush=True,
-    )
-
-
-if __name__ == "__main__":
-    main()

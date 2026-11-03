@@ -4,13 +4,13 @@ Determines which latitude band a row falls into, which LOLA DEM to use as refere
 the strip into chunks (`plan_chunks`), which SPICE kernels cover the observation (`kernels`), and
 what `GeorefConfig` a chunk starts from (`chunk_cfg`).
 
-Stateless: no scene is read and nothing is written. Paths come from `IIRS_ARCHIVE`,
-`IIRS_DEM_ROOTS`, `IIRS_SPICE` and `IIRS_ANC_ROOTS`.
+Stateless: no scene is read and nothing is written. Every data tree is passed in as an `io.Paths`
+(or its `dem_roots`).
 """
 
 from __future__ import annotations
 
-import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import pairwise
@@ -23,34 +23,21 @@ from iirspy import io
 from iirspy.georef.ancillary import read_geom_csv
 from iirspy.georef.georef import MOON_RADIUS_M, GeorefConfig, to_stereo
 
-ARCHIVE = Path(os.environ.get("IIRS_ARCHIVE", "/mnt/d/ddata/moon/ch2_iirs"))
-ANC_ROOTS = [Path(p) for p in os.environ["IIRS_ANC_ROOTS"].split(":")] if "IIRS_ANC_ROOTS" in os.environ else [ARCHIVE]
-
 # Minimum correlation against the reference for a solve to count as registered. `converged` alone
 # does not imply it.
 GOOD_CORR = 0.85
 
-# Searched in order, first hit wins; COG rebuilds shadow the original GDR JP2s.
-_DEM_ROOTS = [
-    Path(p) for p in os.environ.get("IIRS_DEM_ROOTS", "/mnt/d/ddata/moon/lro_lola:/mnt/d/ddata/moon/lro_wac").split(":")
-]
 
-# Kernel tree holding lsk/, pck/, sclk/, fk/ and spk/.
-SPICE = Path(os.environ.get("IIRS_SPICE", str(ARCHIVE / "spice")))
-
-# Our own re-solved products, laid out like the archive's own `<category>/<level>/<day>/` tree so
-# the two read the same way -- but not under IIRS_ARCHIVE, since these are derived, not PDS-shipped.
-RECAL_ROOT = Path(os.environ.get("IIRS_RECAL_ROOT", str(Path.home() / "data" / "ch2_iirs")))
-
-
-def _dem(sub: str, name: str) -> str:
+def _dem(sub: str, name: str, dem_roots: tuple[Path, ...]) -> str:
     """Path to a LOLA product by its bare product name, preferring a COG over the GDR JP2.
+
+    Searched across `dem_roots` in order, first hit wins; COG rebuilds shadow the original GDR JP2s.
 
     Matched case-insensitively, returning the directory's real entry: PDS ships these labels as
     both `_JP2.LBL` and `_jp2.lbl`, a difference a case-insensitive drvfs mount hides and ext4
     does not.
     """
-    for root in _DEM_ROOTS:
+    for root in dem_roots:
         d = root / sub
         if not d.is_dir():
             continue
@@ -59,7 +46,7 @@ def _dem(sub: str, name: str) -> str:
             hit = entries.get(leaf.lower())
             if hit is not None:
                 return str(hit)
-    raise FileNotFoundError(f"{name} not found under any of {[str(r) for r in _DEM_ROOTS]}")
+    raise FileNotFoundError(f"{name} not found under any of {[str(r) for r in dem_roots]}")
 
 
 _POLAR = "LOLA_GDR/POLAR"
@@ -68,9 +55,9 @@ _WAC_MOSAIC = "LRO_WAC_Mosaic_Global_303ppd_v3"
 
 
 @lru_cache
-def wac_mosaic() -> str | None:
+def wac_mosaic(dem_roots: tuple[Path, ...]) -> str | None:
     try:
-        return _dem("", _WAC_MOSAIC)
+        return _dem("", _WAC_MOSAIC, dem_roots)
     except FileNotFoundError:
         return None
 
@@ -175,7 +162,7 @@ L1_BUFFER_DEG = 1.0
 
 
 @lru_cache
-def bands() -> dict[str, dict]:
+def bands(dem_roots: tuple[Path, ...]) -> dict[str, dict]:
     """`BANDS` with each band's `near`/`far` product names resolved to `dem_near`/`dem_far` paths.
 
     Raises `FileNotFoundError` if a LOLA product is missing.
@@ -183,8 +170,8 @@ def bands() -> dict[str, dict]:
     return {
         name: {
             **{k: v for k, v in e.items() if k not in ("near", "far")},
-            "dem_near": _dem(*e["near"]),
-            "dem_far": _dem(*e["far"]),
+            "dem_near": _dem(e["near"][0], e["near"][1], dem_roots),
+            "dem_far": _dem(e["far"][0], e["far"][1], dem_roots),
         }
         for name, e in BANDS.items()
     }
@@ -223,56 +210,65 @@ def group_xy_half(group: str) -> tuple[float, float]:
     return max(halves, key=lambda h: h[0])
 
 
-def chunk_cfg(group: str) -> GeorefConfig:
+def chunk_cfg(group: str, dem_roots: tuple[Path, ...]) -> GeorefConfig:
     """`group`'s base `GeorefConfig`. Callers replace `aoi`, `dem_near` and `dem_far` per chunk."""
-    primary = bands()[GROUP_PRIMARY_BAND[group]]
+    primary = bands(dem_roots)[GROUP_PRIMARY_BAND[group]]
     return GeorefConfig(
         pole=group,
         dem_near=primary["dem_near"],
         dem_far=primary["dem_far"],
-        wac_mosaic=wac_mosaic(),
+        wac_mosaic=wac_mosaic(dem_roots),
         row_step=ROW_STEP,
     )
 
 
-def kernels(day: str) -> list[Path]:
-    """`io.spice_kernels(day)` from the `SPICE` tree."""
-    return io.spice_kernels(day, SPICE)
+def kernels(day: str, paths: io.Paths) -> list[Path]:
+    """`io.spice_kernels(day)` from the `paths.spice` tree."""
+    return io.spice_kernels(day, paths.spice)
 
 
-def _one(pattern: str, roots: list[Path] | None = None) -> Path | None:
-    """First match for `pattern` under `roots` (default `ANC_ROOTS`).
+def _one(pattern: str, roots: Sequence[Path]) -> Path | None:
+    """First match for `pattern` under `roots`.
 
     Globbed, never rebuilt by hand: the detector suffix is not always `d32` (`20231222T0751377198`
     is `d18`).
     """
-    for root in roots or ANC_ROOTS:
+    for root in roots:
         hits = sorted(root.glob(pattern))
         if hits:
             return hits[0]
     return None
 
 
-def recal_dir(sid: str, tree: str = "geometry/recalibrated") -> Path:
-    """`sid`'s day dir in one of this pipeline's product trees: `<tree>/<day>` under `RECAL_ROOT`.
+def recal_dir(sid: str, paths: io.Paths, tree: str = "geometry/recalibrated") -> Path:
+    """`sid`'s day dir in one of this pipeline's product trees: `<tree>/<day>` under `paths.recal_root`.
+
+    Laid out like the archive's own `<category>/<level>/<day>/` tree so the two read the same way,
+    but separate from `paths.archive`: these are derived, not PDS-shipped.
 
     Flat like PRADAN's own `<tree>/<level>/<day>/`: every file in it is named `<sid>_<group>_*`, so
     scenes and groups share the dir. Trees: `geometry/recalibrated` (solve: GCPs, chunk fits, GLT,
     LOC, topo, summary, log), `data/recalibrated` (L1 radiance), `data/rederived` (L2, OBS).
     """
-    return RECAL_ROOT / tree / sid[:8]
+    return paths.recal_root / tree / sid[:8]
 
 
-def ancillary(sid: str) -> dict[str, Path | None]:
+def merged_gcps_path(sid: str, group: str, paths: io.Paths) -> Path:
+    """Where `sid`/`group`'s merged GCPs land once solved -- the durable `--keep` layout every
+    cluster script and CLI default assumes, independent of any particular run's `--out`."""
+    return recal_dir(sid, paths) / f"{sid}_{group}.gcps"
+
+
+def ancillary(sid: str, paths: io.Paths) -> dict[str, Path | None]:
     """The geometry csv and spm for `sid`, plus this pipeline's own recalibrated GCPs/GLT per
     group -- each `None` if not on disk yet."""
     day = sid[:8]
     out: dict[str, Path | None] = {
-        "geometry/calibrated": _one(f"geometry/calibrated/{day}/ch2_iir_nci_{sid}_g_grd_*.csv"),
-        "miscellaneous/raw": spm(sid),
+        "geometry/calibrated": _one(f"geometry/calibrated/{day}/ch2_iir_nci_{sid}_g_grd_*.csv", paths.anc_roots),
+        "miscellaneous/raw": spm(sid, paths),
     }
     for group in GROUPS:
-        d = recal_dir(sid)
+        d = recal_dir(sid, paths)
         gcps = d / f"{sid}_{group}.gcps"
         glt = d / f"{sid}_{group}_glt.tif"
         out[f"geometry/recalibrated/gcps_{group}"] = gcps if gcps.is_file() and gcps.stat().st_size > 0 else None
@@ -280,56 +276,56 @@ def ancillary(sid: str) -> dict[str, Path | None]:
     return out
 
 
-def nri_zip(sid: str) -> Path | None:
+def nri_zip(sid: str, paths: io.Paths) -> Path | None:
     """The nri bundle for `sid`, searched recursively since `zips/` nests some by region."""
-    hits = sorted((ARCHIVE / "zips").rglob(f"ch2_iir_nri_{sid}_d_img_*.zip"))
+    hits = sorted((paths.archive / "zips").rglob(f"ch2_iir_nri_{sid}_d_img_*.zip"))
     return hits[0] if hits else None
 
 
 NCI_MEMBERS = ("*.qub", "*.hdr", "*.xml", "*.csv", "*.spm", "*.oat", "*.oath", "*.lbr")
 
 
-def nci_zip(sid: str) -> Path | None:
-    """The nci (ISSDC L1) bundle for `sid` under `ARCHIVE/zips`, searched recursively."""
-    hits = sorted((ARCHIVE / "zips").rglob(f"ch2_iir_nci_{sid}_d_img_*.zip"))
+def nci_zip(sid: str, paths: io.Paths) -> Path | None:
+    """The nci (ISSDC L1) bundle for `sid` under `paths.archive/zips`, searched recursively."""
+    hits = sorted((paths.archive / "zips").rglob(f"ch2_iir_nci_{sid}_d_img_*.zip"))
     return hits[0] if hits else None
 
 
-def ensure_nci(sid: str) -> Path:
-    """`sid`'s nci qub under `ARCHIVE/data/calibrated`, unzipping its bundle into the ISSDC tree under `ARCHIVE` first if absent."""
+def ensure_nci(sid: str, paths: io.Paths) -> Path:
+    """`sid`'s nci qub under `paths.archive/data/calibrated`, unzipping its bundle into the ISSDC tree there first if absent."""
     pat = f"data/calibrated/{sid[:8]}/ch2_iir_nci_{sid}_d_img_*.qub"
-    if found := _one(pat, [ARCHIVE]):
+    if found := _one(pat, [paths.archive]):
         return found
-    if (fzip := nci_zip(sid)) is None:
+    if (fzip := nci_zip(sid, paths)) is None:
         raise FileNotFoundError(
-            f"no nci cube or zip for {sid} under {ARCHIVE} (zips/nci/ch2_iir_nci_{sid}_d_img_*.zip)"
+            f"no nci cube or zip for {sid} under {paths.archive} (zips/nci/ch2_iir_nci_{sid}_d_img_*.zip)"
         )
-    io.extract(fzip, ARCHIVE, include=NCI_MEMBERS, exclude=())
-    if not (found := _one(pat, [ARCHIVE])):
-        raise RuntimeError(f"{fzip} extracted, but no {pat} appeared under {ARCHIVE}")
+    io.extract(fzip, paths.archive, include=NCI_MEMBERS, exclude=())
+    if not (found := _one(pat, [paths.archive])):
+        raise RuntimeError(f"{fzip} extracted, but no {pat} appeared under {paths.archive}")
     return found
 
 
-def _nri_file(pat: str, sid: str, stage: Path | None) -> Path | None:
-    """`pat` under `ANC_ROOTS`, then `stage`, else extracted (that file type only) from the nri zip into `stage`.
+def _nri_file(pat: str, sid: str, paths: io.Paths, stage: Path | None) -> Path | None:
+    """`pat` under `paths.anc_roots`, then `stage`, else extracted (that file type only) from the nri zip into `stage`.
 
     It rides inside the nri zip, so an archive copy is a shortcut, not a requirement.
     """
-    roots = [*ANC_ROOTS, Path(stage)] if stage else ANC_ROOTS
-    if (found := _one(pat, roots)) or stage is None or (fzip := nri_zip(sid)) is None:
+    roots = [*paths.anc_roots, Path(stage)] if stage else paths.anc_roots
+    if (found := _one(pat, roots)) or stage is None or (fzip := nri_zip(sid, paths)) is None:
         return found
     io.extract(fzip, stage, include=("*" + Path(pat).suffix,))
     return _one(pat, [Path(stage)])
 
 
-def spm(sid: str, stage: Path | None = None) -> Path | None:
+def spm(sid: str, paths: io.Paths, stage: Path | None = None) -> Path | None:
     """`sid`'s nri .spm (spacecraft state, Moon-centred J2000, ~40 ms records). See `_nri_file`."""
-    return _nri_file(f"miscellaneous/raw/{sid[:8]}/ch2_iir_nri_{sid}_d_img_*.spm", sid, stage)
+    return _nri_file(f"miscellaneous/raw/{sid[:8]}/ch2_iir_nri_{sid}_d_img_*.spm", sid, paths, stage)
 
 
-def label(sid: str, stage: Path | None = None) -> Path | None:
+def label(sid: str, paths: io.Paths, stage: Path | None = None) -> Path | None:
     """`sid`'s nri PDS4 label, the only scan-line clock (`scan_utc`). See `_nri_file`."""
-    return _nri_file(f"data/raw/{sid[:8]}/ch2_iir_nri_{sid}_d_img_*.xml", sid, stage)
+    return _nri_file(f"data/raw/{sid[:8]}/ch2_iir_nri_{sid}_d_img_*.xml", sid, paths, stage)
 
 
 def strip_backbone(fgeom: Path, lat_min: float = -90.0, lat_max: float = 90.0):
@@ -388,12 +384,12 @@ def _even_chunks(length_m: float, width_range_km: tuple[float, float], overlap_f
     return [(i * step, min(i * step + w, length_m)) for i in range(n)]
 
 
-def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
+def true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
     """[(start, stop), ...] per contiguous run of True in a 1D bool array, stop exclusive.
 
-    >>> _runs(np.array([False, True, True, False, True]))
+    >>> true_runs(np.array([False, True, True, False, True]))
     [(1, 3), (4, 5)]
-    >>> _runs(np.array([False, False]))
+    >>> true_runs(np.array([False, False]))
     []
     """
     d = np.diff(np.concatenate(([0], mask.astype(int), [0])))
@@ -424,7 +420,7 @@ def _band_runs(lat: np.ndarray, s: np.ndarray) -> list[_Run]:
     runs = []
     for name, b in BANDS.items():
         lo, hi = b["lat_range"]
-        for a, z in _runs((lat >= lo) & (lat <= hi)):
+        for a, z in true_runs((lat >= lo) & (lat <= hi)):
             runs.append(_Run(float(s[a]), float(s[z - 1]), name))
     runs.sort(key=lambda r: (r.s_lo, r.s_hi))
 
@@ -454,7 +450,12 @@ def _chunk_aoi(df, scans_in_chunk, band: dict) -> tuple[float, float, float, flo
     return (float(x0), float(y0), float(x1), float(y1))
 
 
-def plan_chunks(fgeom: Path, width_range_km: tuple[float, float] = (100.0, 150.0), overlap_frac: float = 0.10):
+def plan_chunks(
+    fgeom: Path,
+    dem_roots: tuple[Path, ...],
+    width_range_km: tuple[float, float] = (100.0, 150.0),
+    overlap_frac: float = 0.10,
+):
     """Chunk plan for a strip: one `_even_chunks` pass per contiguous run of each band it crosses,
     so no chunk straddles a band edge and none needs more than one DEM tier.
 
@@ -478,7 +479,7 @@ def plan_chunks(fgeom: Path, width_range_km: tuple[float, float] = (100.0, 150.0
     df = read_geom_csv(fgeom)
     df["Longitude"] = (df["Longitude"] + 180) % 360 - 180
 
-    resolved = bands()
+    resolved = bands(dem_roots)
     chunks: list[dict] = []
     for run in _band_runs(lat, s):
         b = resolved[run.band]

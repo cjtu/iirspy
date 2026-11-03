@@ -1,6 +1,6 @@
 # Calibration configs
 
-`L0.calibrate` converts raw counts to L1 radiance and `L1.calibrate` converts L1 radiance to L2 reflectance (I/F). Each method choice is one field of a frozen config, `iirspy.config.L1Config` or `iirspy.config.L2Config`. Named presets bundle the fields, and keyword overrides replace single fields.
+`L0.calibrate` converts raw counts to L1 radiance and `L1.calibrate` converts L1 radiance to L2 reflectance (I/F). Each method choice is one field of a frozen config, `iirspy.l1.config.L1Config` or `iirspy.l2.config.L2Config`. Named presets bundle the fields, and keyword overrides replace single fields.
 
 ```python
 import iirspy
@@ -57,7 +57,7 @@ These are keyword arguments of `L1.calibrate`, not config fields, so they are no
 
 ```python
 from iirspy.l2 import photometry
-from iirspy.config import L2Config
+from iirspy.l2.config import L2Config
 
 slope, aspect = photometry.slope_az_from_dem(dem)
 l2 = l1.calibrate("iirspy", photom="lunar_lambert", cos_min=0.0872, slope_az=(slope, aspect))

@@ -14,6 +14,7 @@ spectrum. ISSDC's nci carries the same defects uncorrected.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import warnings
@@ -333,6 +334,11 @@ def build_table(src, fcsv) -> Path:
     tmp.write_text("\n".join(lines) + "\n")
     os.replace(tmp, out)
     return out
+
+
+def table_key(fcsv) -> str:
+    """Content hash of a frame table, so a cache built on another (or no) table never matches."""
+    return hashlib.sha256(Path(fcsv).read_bytes()).hexdigest()[:12]
 
 
 def read_table(fcsv):

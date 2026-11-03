@@ -232,7 +232,7 @@ def test_scene_topo_assembles_pieces_with_no_blending_and_exact_per_row_sun(tmp_
     # bands() resolves real DEM paths on disk for every band; scene_topo only needs the names, and
     # render_topo (mocked below) never opens dem_near/dem_far, so a placeholder dict skips the DEM tree.
     monkeypatch.setattr(
-        ck, "bands", lambda: {"equatorial": {**ck.BANDS["equatorial"], "dem_near": "x", "dem_far": "x"}}
+        ck, "bands", lambda dem_roots: {"equatorial": {**ck.BANDS["equatorial"], "dem_near": "x", "dem_far": "x"}}
     )
 
     calls = []
@@ -261,7 +261,7 @@ def test_scene_topo_assembles_pieces_with_no_blending_and_exact_per_row_sun(tmp_
         ),
     )
 
-    f = georef.scene_topo("sid", "equatorial", gcps, (ny, nx), "fgeom", "flabel", cfg, [], tmp_path)
+    f = georef.scene_topo("sid", "equatorial", gcps, (ny, nx), "fgeom", "flabel", cfg, [], tmp_path, ())
 
     assert len(calls) >= 2  # the strip really did split into multiple pieces
 
@@ -275,7 +275,7 @@ def test_scene_topo_assembles_pieces_with_no_blending_and_exact_per_row_sun(tmp_
     # Recompute the expected piece boundaries the same way scene_topo does, and check every row's
     # slope matches its own piece's constant gradient -- concatenation, no cross-piece blending.
     band_of_row = georef._row_bands(gcps, ny, cfg)
-    pieces = [p for a, z in ck._runs(band_of_row == "equatorial") for p in georef._split_run(a, z)]
+    pieces = [p for a, z in ck.true_runs(band_of_row == "equatorial") for p in georef._split_run(a, z)]
     assert len(pieces) == len(calls)
     for (a, z), val in zip(pieces, calls, strict=True):
         want = np.degrees(np.arctan(abs(val)))

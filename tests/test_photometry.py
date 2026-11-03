@@ -66,8 +66,8 @@ def _synthetic_l1(ny=4, nx=3):
 
 
 def _refl(rad, slope_az=None, **kw):
-    from iirspy.config import L2Config
     from iirspy.iirs import L2
+    from iirspy.l2.config import L2Config
 
     return L2.__new__(L2)._compute_reflectance(rad, None, L2Config(flux=1.0, **kw), slope_az=slope_az)
 

@@ -13,11 +13,12 @@ import xarray as xr
 from rioxarray.exceptions import NoDataInBounds
 
 from iirspy import instrument, io
-from iirspy.config import CALIB, POLISH, L1Config, L2Config
 from iirspy.georef import ancillary
 from iirspy.l1 import empirical, frames, radiometry
+from iirspy.l1.config import CALIB, L1Config
 from iirspy.l1.empirical import empirical_frames
 from iirspy.l2 import photometry, polish, solar, thermal
+from iirspy.l2.config import POLISH, L2Config
 
 # Skip div 0 and 0/0 warnings
 np.seterr(divide="ignore", invalid="ignore")
@@ -93,25 +94,6 @@ def _loc_extent(loc, lonlatextent):
     if not rows.size:
         raise ValueError(f"no pixels of the _d_loc_ inside {lonlatextent}")
     return (0, lon.shape[1] - 1, int(rows[0]), int(rows[-1]) + 1)
-
-
-def _band_numbers(img):
-    """Original IIRS band numbers, from the GeoTIFF band_numbers tag or ENVI band names, else 1..N."""
-    for attr in ("band_numbers", "band_names"):
-        val = img.attrs.get(attr, "")
-        if isinstance(val, str) and all(b.strip().isdigit() for b in val.split(",")):
-            return [int(b) for b in val.split(",")]
-    return img.band.values
-
-
-def _apply_envi_start(da):
-    """Shift x/y by the ENVI `x start`/`y start` offset, which GDAL reports but does not apply."""
-    for dim, attr in (("x", "x_start"), ("y", "y_start")):
-        start = da.attrs.get(attr)
-        # Only when the file carried no transform (coords still 0-based); else it is already applied
-        if start is not None and float(da[dim][0]) < 1:
-            da = da.assign_coords({dim: da[dim].values + int(start) - 1})
-    return da
 
 
 def _chunks(nband, ny, nx, chunk=True):
@@ -300,7 +282,7 @@ class IIRSData(ABC):
         # Read image
         self.img = xr.open_dataarray(self.qub, engine="rasterio")
         # Band subsets are not 1-indexed; without their true numbers every sel(band=N) is off
-        self.img = self.img.assign_coords(band=_band_numbers(self.img))
+        self.img = self.img.assign_coords(band=io.band_numbers(self.img))
         self.shape = self.img.shape
         self.nband, self.ny, self.nx = self.shape
 
@@ -330,12 +312,12 @@ class IIRSData(ABC):
         chunk : bool or dict
             Chunk image automatically (default: True). Or supply dict of x,y,band chunk sizes (see dask).
         """
-        da = _apply_envi_start(xr.open_dataarray(path, engine="rasterio").sortby("y").sortby("x"))
+        da = io.apply_envi_start(xr.open_dataarray(path, engine="rasterio").sortby("y").sortby("x"))
         nband, ny, nx = da.shape
         chunk = _chunks(nband, ny, nx, chunk)
         if chunk:
             da = da.chunk(chunk)
-        bands = np.asarray(_band_numbers(da), dtype=int)
+        bands = np.asarray(io.band_numbers(da), dtype=int)
         da = da.assign_coords(band=bands, wl=("band", instrument.get_wls()[bands - 1]))
         if cls._NATIVE_SCALE != 1.0:
             da = da * cls._NATIVE_SCALE
@@ -752,7 +734,7 @@ class L0(IIRSData):
         Parameters
         ----------
         config : str or L1Config
-            Preset name or config (see `iirspy.config.L1Config`); `overrides` replace single fields.
+            Preset name or config (see `iirspy.l1.config.L1Config`); `overrides` replace single fields.
         empirical_kws : dict or None
             Extra keyword arguments for empirical.empirical_frames, e.g. dark_yrange/flat_yrange
             (positional row ranges into this cube) or apply_smile=True.
@@ -1014,7 +996,7 @@ class L1(IIRSData):
         # replace any None in extent with values from xy_extent
         self.extent = tuple(xy if ex is None else ex for ex, xy in zip(self.extent, xy_extent, strict=False))
         # ...but the geometry csv spans the whole strip and the cube may be a crop: with no extent
-        # given, take the line range from the image (`_apply_envi_start` put y in strip numbering).
+        # given, take the line range from the image (`io.apply_envi_start` put y in strip numbering).
         if all(e is None for e in xyextent) and all(e is None for e in lonlatextent):
             # floor/ceil, not int(): rasterio hands back pixel-CENTRE coords (0.5 .. n-0.5), so
             # truncating both ends drops a row and a column off the crop.
@@ -1070,7 +1052,7 @@ class L1(IIRSData):
     def calibrate(self, config="iirspy", *, inc=None, slope_az=None, sun_az_offset=0.0, **overrides):
         """Calibrate to an L2 reflectance object (requires the SPM file for solar angles).
 
-        `config` is an `L2Config` or a preset name (see `iirspy.config.L2Config`); `overrides`
+        `config` is an `L2Config` or a preset name (see `iirspy.l2.config.L2Config`); `overrides`
         replace individual fields, e.g. `calibrate("issdc", polish=None)`. The keywords are
         per-scene inputs: `inc` (solar incidence [deg], per line or per pixel, default the spm's),
         `slope_az` (camera-space slope/aspect[/lit], see `photometry.load_slope_az`; make one from
@@ -1187,7 +1169,7 @@ class L2(IIRSData):
         return instance
 
     def _compute_reflectance(self, rad, qub_path, cfg, inc=None, slope_az=None, sun_az_offset=0.0):
-        """I/F reflectance from radiance, with each step chosen by `cfg` (see `iirspy.config.L2Config`).
+        """I/F reflectance from radiance, with each step chosen by `cfg` (see `iirspy.l2.config.L2Config`).
 
         Steps, in order: solar flux at the scene's distance, thermal removal, polish,
         photometric normalization, Besse phase, spectral smoothing, clip. Polish is folded into

@@ -6,8 +6,9 @@ import pytest
 import xarray as xr
 
 from iirspy import instrument
-from iirspy.config import L1Config, L2Config
+from iirspy.l1.config import L1Config
 from iirspy.l2 import polish
+from iirspy.l2.config import L2Config
 
 L2_REPRO = os.environ.get("IIRS_L2_REPRO")  # cached NCI/NDI windows, see test_issdc_preset_reproduces_ndi
 
