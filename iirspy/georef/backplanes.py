@@ -12,19 +12,10 @@ from scipy.interpolate import RectBivariateSpline
 from scipy.ndimage import map_coordinates
 from scipy.spatial import Delaunay, cKDTree
 
-import iirspy.utils as utils
-from iirspy import chunks as ck
-from iirspy import solve
-from iirspy.empirical import (
-    MIN_ROWS,
-    PAN_BANDS,
-    SHADOW_SNR,
-    broadband_snr,
-    detect_dark_rows,
-    longest_run,
-    refine_dark_block,
-)
-from iirspy.georef import (
+from iirspy import instrument, io
+from iirspy.georef import ancillary, arosics
+from iirspy.georef import chunks as ck
+from iirspy.georef.georef import (
     MOON_RADIUS_M,
     GeorefConfig,
     _enu,
@@ -35,8 +26,17 @@ from iirspy.georef import (
     stereo_crs,
     xy_to_lonlat,
 )
-from iirspy.iirs import _apply_envi_start, _write_camera_product
-from iirspy.utils import IIRSPY_VERSION
+from iirspy.iirs import _apply_envi_start
+from iirspy.instrument import PAN_BANDS
+from iirspy.l1 import radiometry
+from iirspy.l1.empirical import (
+    MIN_ROWS,
+    SHADOW_SNR,
+    broadband_snr,
+    detect_dark_rows,
+    longest_run,
+    refine_dark_block,
+)
 
 IIRS_GSD_M = GeorefConfig().iirs_gsd_m
 DEM_MARGIN_M = 2_000.0  # bbox pad for a DEM window read around one row block's ground footprint
@@ -65,7 +65,7 @@ def group_info(sid: str, group: str) -> GroupInfo:
         raise FileNotFoundError(f"{f} missing: {sid}/{group} was not merged (partial --chunks run?)")
     data = json.loads(f.read_text())
     scan0 = int(data["scan0"])
-    gcps = solve._load_gcps(solve.merged_gcps_path(sid, group))
+    gcps = arosics._load_gcps(arosics.merged_gcps_path(sid, group))
     rows = [int(r) for r, _c in gcps]
     row_range = (scan0 + min(rows), scan0 + max(rows))
     chunk_rows = [
@@ -251,7 +251,7 @@ def write_loc(
         "PRECISION": f"{dtype}; ULP up to 0.9 m lon, 0.23 m lat, 0.125 m radius" if dtype == "float32" else dtype,
         "TIE_POINT_RESIDUAL_P50_M": tp["p50_m"] if tp else "unavailable",
         "TIE_POINT_RESIDUAL_P95_M": tp["p95_m"] if tp else "unavailable",
-        "PROVENANCE_IIRSPY_VERSION": IIRSPY_VERSION,
+        "PROVENANCE_IIRSPY_VERSION": io.IIRSPY_VERSION,
         "PROVENANCE_DEM_ROOTS": ":".join(str(p) for p in ck._DEM_ROOTS),
     }
     da = _backplane_da(
@@ -261,7 +261,7 @@ def write_loc(
         row0,
         tags,
     )
-    return Path(_write_camera_product(da, fout, compress=compress, predictor=predictor))
+    return Path(io.write_camera_product(da, fout, compress=compress, predictor=predictor))
 
 
 def _read_backplane(path: Path) -> tuple[xr.DataArray, list[str], dict]:
@@ -342,7 +342,7 @@ def _row_geometry(
     """Per-pixel sun/sensor terms (IIRS OBS bands 1-7) for one row block, from its own loc (lon, lat,
     radius): sun and sensor azimuth/zenith [deg], sun distance [AU], sensor range [m].
 
-    Row times come from the nri label (`utils.scan_utc`), never from .spm row numbers. The sun needs only
+    Row times come from the nri label (`ancillary.scan_utc`), never from .spm row numbers. The sun needs only
     the generic kernels; the spacecraft comes from `georef.sc_positions_km` (CH2 SPK, else the .spm). Whatever
     cannot be computed -- no label, no kernels, no spacecraft state -- is left NaN.
 
@@ -362,7 +362,7 @@ def _row_geometry(
     for k in kernels:
         sp.furnsh(str(k))
     scans = scan0 + np.arange(ny)
-    ets = [sp.str2et(u) for u in utils.scan_utc(flabel, scans)]
+    ets = [sp.str2et(u) for u in ancillary.scan_utc(flabel, scans)]
     sc_xyz_km, sc_source = sc_positions_km(flabel, ck.spm(sid, stage), scans)
     xyz_km = np.stack(lonlat_to_xyz(lon, lat, radius)) / 1000.0  # (3, ny, nx)
     for r, et in enumerate(ets):
@@ -421,13 +421,13 @@ def _l1_rad_path(sid: str, group: str) -> Path:
 
 
 def _group_snr(sid: str, group: str) -> np.ndarray | None:
-    """Broadband SNR over `empirical.PAN_BANDS`, from the group's own recalibrated L1 cube, or
+    """Broadband SNR over `PAN_BANDS`, from the group's own recalibrated L1 cube, or
     `None` if that cube is not on disk (a group processed only through geometry)."""
     return _l1_snr(_l1_rad_path(sid, group))
 
 
 def _l1_snr(f: Path) -> np.ndarray | None:
-    """Broadband SNR over `empirical.PAN_BANDS` of the L1 cube `f`, or `None` if it is not on disk."""
+    """Broadband SNR over `PAN_BANDS` of the L1 cube `f`, or `None` if it is not on disk."""
     if not Path(f).exists():
         return None
     bands = [read_band(f, b) for b in PAN_BANDS]
@@ -451,7 +451,7 @@ def _pan_incomplete(sid: str, group: str) -> np.ndarray | None:
 
 
 def _pan_saturation_mask(sid: str, group: str, stage_dir: Path) -> np.ndarray | None:
-    """True where any `empirical.PAN_BANDS` band's raw DN, run through the per-scene per-element
+    """True where any `PAN_BANDS` band's raw DN, run through the per-scene per-element
     gain/offset LUT, reaches its saturation radiance — the comparison `IIRSData.calibrate_to_rad`
     makes just before it NaNs the pixel out (that pre-NaN radiance is never itself exposed, and the
     empirical correction's own dark/flat/smile terms are near-unity broadband scaling, so the
@@ -469,15 +469,15 @@ def _pan_saturation_mask(sid: str, group: str, stage_dir: Path) -> np.ndarray | 
     day = sid[:8]
     stage_dir = Path(stage_dir)
     if not (stage_dir / f"data/raw/{day}/{fzip.stem}.qub").exists():
-        utils.extract(fzip, stage_dir, bands=PAN_BANDS)
+        io.extract(fzip, stage_dir, bands=PAN_BANDS)
     lat_range = ck.l1_lat_range(group)
-    scan0 = solve._scene_scan0(fgeom, lat_range)
+    scan0 = arosics._scene_scan0(fgeom, lat_range)
     gi = group_info(sid, group)
     l0 = L0(sid, str(stage_dir), chunk={"band": -1, "y": 1024, "x": -1})
     # `y` is the native absolute Scan number, same crop `build_l1` makes off the geometry csv.
     l0.img = l0.img.sel(y=slice(scan0, gi.row_range[1] - gi.row_range[0] + scan0), band=PAN_BANDS)
-    gain, offset = utils.get_gain_offset(l0.qub, calib_dir=utils.DCALIB)
-    sat = utils.get_saturation_radiance(l0.qub, calib_dir=utils.DCALIB)
+    gain, offset = radiometry.get_gain_offset(l0.qub, calib_dir=instrument.DCALIB)
+    sat = instrument.get_saturation_radiance(l0.qub, calib_dir=instrument.DCALIB)
     rad = 10 * (l0.img * gain.sel(band=PAN_BANDS) + offset.sel(band=PAN_BANDS))
     return np.asarray((rad >= sat.sel(band=PAN_BANDS)).any("band").compute().values)
 
@@ -591,7 +591,7 @@ def scene_obs(sid, group, gcps, shape, scan0, ftopo=None, fl1=None, stage_dir=No
     """`build_obs` for one solved group straight from refl's own inputs, with no LOC product: pixel
     positions from the GCP lattice (`georef.camera_xy`, the same positions the topo samples) plus the
     LOLA radius, topo from `ftopo`, SNR from the L1 cube `fl1`. `gcps` rows are relative to `scan0`."""
-    from iirspy.georef import camera_xy
+    from iirspy.georef.georef import camera_xy
 
     ny, nx = shape
     x, y = camera_xy(gcps, shape)
@@ -634,7 +634,7 @@ def _tie_dist(sid: str, groups: list[str], ny: int, nx: int) -> np.ndarray:
     out = np.full((ny, nx), np.nan, "float32")
     for g in groups:
         gi = group_info(sid, g)
-        gcps = solve._load_gcps(solve.merged_gcps_path(sid, g))
+        gcps = arosics._load_gcps(arosics.merged_gcps_path(sid, g))
         pts = np.array([(gi.scan0 + r, c) for r, c in gcps], dtype="float64")
         if len(pts) == 0:
             continue
@@ -706,13 +706,13 @@ def write_obs(fout: Path, obs: dict, sid: str, compress: str = "ZSTD", predictor
         "QA_FILE": f"{sid}_qa.tif",
         "SKY_VIEW_STATUS": "reserved, NaN: the lit_frac horizon sweep only samples toward the sun's own azimuth",
         "TIE_DIST_DEFINITION": "distance to the nearest solved GCP lattice node, not the raw tie-point detection",
-        "PROVENANCE_IIRSPY_VERSION": IIRSPY_VERSION,
+        "PROVENANCE_IIRSPY_VERSION": io.IIRSPY_VERSION,
         "GROUPS": {g: list(r) for g, r in obs["groups"].items()},
     }
     names = [n for n, _u in names_units]
     units = [u for _n, u in names_units]
     da = _backplane_da([bands[n] for n in names], names, units, row0, tags)
-    return Path(_write_camera_product(da, fout, compress=compress, predictor=predictor))
+    return Path(io.write_camera_product(da, fout, compress=compress, predictor=predictor))
 
 
 # ------------------------------------------------------------------------------------------
@@ -736,7 +736,7 @@ def _extrapolated_mask(sid: str, groups: dict[str, tuple[int, int]], ny: int, nx
     out = np.zeros((ny, nx), dtype=bool)
     for g in groups:
         gi = group_info(sid, g)
-        gcps = solve._load_gcps(solve.merged_gcps_path(sid, g))
+        gcps = arosics._load_gcps(arosics.merged_gcps_path(sid, g))
         pts = np.array([(r, c) for r, c in gcps], dtype="float64")
         if len(pts) < 4:
             continue
@@ -813,7 +813,7 @@ def write_qa(
         "SHADOW_SNR": str(SHADOW_SNR),
         "SATURATION_CHECK": saturation_status,
         "GROUPS": {g: list(r) for g, r in groups.items()},
-        "PROVENANCE_IIRSPY_VERSION": IIRSPY_VERSION,
+        "PROVENANCE_IIRSPY_VERSION": io.IIRSPY_VERSION,
     }
     da = _backplane_da([qa], ["qa_bits"], [""], row0, tags)
-    return Path(_write_camera_product(da, fout, compress="ZSTD", predictor=2))
+    return Path(io.write_camera_product(da, fout, compress="ZSTD", predictor=2))

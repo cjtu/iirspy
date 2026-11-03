@@ -16,7 +16,7 @@ Typical use:
     scene_glt(sid, group, reg.gcps, cfg, scan0, glt_dir)   # project products by indexing
 
 The matcher needs `arosics`, which needs `osgeo.gdal`, which needs conda. `register` handles
-that (if arosics not importable it runs the solve in a conda env through :mod:`iirspy.coreg`).
+that (if arosics not importable it runs the solve in a conda env through :mod:`iirspy.georef.coreg`).
 """
 
 import importlib.util
@@ -49,15 +49,15 @@ from scipy.ndimage import (
 )
 from scipy.spatial import cKDTree
 
-import iirspy.utils as utils
+from iirspy.georef import ancillary
 
-AROSICS_ENV = os.environ.get("IIRSPY_AROSICS_ENV", "arosics")  # conda env iirspy.coreg runs in
+AROSICS_ENV = os.environ.get("IIRSPY_AROSICS_ENV", "arosics")  # conda env iirspy.georef.coreg runs in
 MAX_RAM_BYTES = float(os.environ.get("IIRSPY_MAX_RAM_BYTES", 4e9))  # past this, project() spills to disk
 
 MOON_RADIUS_M = 1737400.0
 SOLAR_RADIUS_DEG = 0.266  # nominal; the true value per epoch comes from SPICE
 LONLAT = CRS.from_authority("IAU", "30100")
-STEREO = CRS.from_wkt(utils.IIRS_PROJ_DICT["polarstereographicsouthpole"])
+STEREO = CRS.from_wkt(ancillary.IIRS_PROJ_DICT["polarstereographicsouthpole"])
 TO_STEREO = Transformer.from_crs(LONLAT, STEREO, always_xy=True)
 TO_LONLAT = Transformer.from_crs(STEREO, LONLAT, always_xy=True)
 GEOCENTRIC = CRS.from_proj4(f"+proj=geocent +a={MOON_RADIUS_M} +b={MOON_RADIUS_M} +units=m +no_defs")
@@ -81,7 +81,7 @@ def xyz_to_lonlat(x, y, z):
 def stereo_crs(pole: str = "south") -> CRS:
     """The IIRS projected CRS for `pole` ("south", "north", or "equatorial" equidistant cylindrical)."""
     key = "equatorial" if pole == "equatorial" else f"polarstereographic{pole}pole"
-    return CRS.from_wkt(utils.IIRS_PROJ_DICT[key])
+    return CRS.from_wkt(ancillary.IIRS_PROJ_DICT[key])
 
 
 @lru_cache
@@ -179,7 +179,7 @@ class GeorefConfig:
     gcp_row_margin: int = 250  # px, margin around gcp_rows to keep in the lattice; -1 = keep all rows
 
     def __post_init__(self):
-        # json round-trips (iirspy.coreg) stringify the keys of max_shift
+        # json round-trips (iirspy.georef.coreg) stringify the keys of max_shift
         self.max_shift = {int(k): v for k, v in self.max_shift.items()}
 
     def max_shift_for(self, k):
@@ -401,12 +401,12 @@ def sun_geometry(fgeom, flabel, cfg, kernels=None):
     for k in kernels or []:
         sp.furnsh(str(k))
 
-    df = utils.read_geom_csv(fgeom)
+    df = ancillary.read_geom_csv(fgeom)
     lon = np.where(df.Longitude > 180, df.Longitude - 360, df.Longitude)
     gx, gy = to_stereo(cfg.pole).transform(lon, df.Latitude.values)
     ins = (gx > cfg.aoi[0]) & (gx < cfg.aoi[2]) & (gy > cfg.aoi[1]) & (gy < cfg.aoi[3])
     scans = df.Scan.values[ins] if ins.any() else df.Scan.values
-    et = sp.str2et(utils.scan_utc(flabel, [int(np.median(scans))])[0])
+    et = sp.str2et(ancillary.scan_utc(flabel, [int(np.median(scans))])[0])
 
     v, _ = sp.spkpos("SUN", et, "IAU_MOON", "LT+S", "MOON")
     u = np.asarray(v) / np.linalg.norm(v)
@@ -437,7 +437,7 @@ def sc_positions_km(flabel, fspm, scans, use_spk: bool = True) -> tuple[np.ndarr
     """
     import spiceypy as sp
 
-    ets = [sp.str2et(u) for u in utils.scan_utc(flabel, scans)]
+    ets = [sp.str2et(u) for u in ancillary.scan_utc(flabel, scans)]
     if use_spk:
         try:
             return np.stack([sp.spkpos("CHANDRAYAAN-2", et, "IAU_MOON", "NONE", "MOON")[0] for et in ets], 1), "spk"
@@ -445,8 +445,8 @@ def sc_positions_km(flabel, fspm, scans, use_spk: bool = True) -> tuple[np.ndarr
             pass
     if fspm is None:
         return np.full((3, len(ets)), np.nan), "none"
-    spm = utils.load_iirs_spm(fspm)
-    t = utils.get_line_times(flabel)[scans]
+    spm = ancillary.load_iirs_spm(fspm)
+    t = ancillary.get_line_times(flabel)[scans]
     j2k = np.stack([np.interp(t, spm.timestamp, spm[k]) for k in ("scx", "scy", "scz")])
     return np.stack([np.asarray(sp.pxform("J2000", "IAU_MOON", et)) @ j2k[:, i] for i, et in enumerate(ets)], 1), "spm"
 
@@ -463,7 +463,7 @@ def scan_order_reversed(fgeom, flabel, fspm=None, kernels=None, use_spk: bool = 
 
     for k in kernels or []:
         sp.furnsh(str(k))
-    df = utils.read_geom_csv(fgeom)
+    df = ancillary.read_geom_csv(fgeom)
     c = (
         df[df.Pixel.isin(sorted(df.Pixel.unique())[2:4])]
         .groupby("Scan")[["Longitude", "Latitude"]]
@@ -491,7 +491,7 @@ def sun_geometry_rows(gcps, shape, flabel, cfg, scan0, kernels=None):
 
     Ground position comes from `camera_xy` (the solved GCP lattice).
 
-    `scan0` is the crop's first absolute Scan (`solve.build_l1`'s own return): `flabel` (the nri label) times
+    `scan0` is the crop's first absolute Scan (`arosics.build_l1`'s own return): `flabel` (the nri label) times
     absolute Scans, not this crop's own 0-based row numbering.
     """
     import spiceypy as sp
@@ -504,7 +504,7 @@ def sun_geometry_rows(gcps, shape, flabel, cfg, scan0, kernels=None):
     lon, lat = to_lonlat(cfg.pole).transform(x, y)
     lon = np.where(lon > 180, lon - 360, lon)
 
-    utc = utils.scan_utc(flabel, scan0 + np.arange(ny))
+    utc = ancillary.scan_utc(flabel, scan0 + np.arange(ny))
 
     lon0 = stereo_crs(cfg.pole).to_dict().get("lon_0", 0.0)
     grid_sign = 0.0 if cfg.pole == "equatorial" else (-1.0 if cfg.pole == "north" else 1.0)
@@ -667,7 +667,7 @@ def slope_aspect(gx, gy):
 
     Slope is measured from the local horizontal (the tangent plane, so the planet's curvature is
     already out of it) and aspect is the *downhill* azimuth, clockwise from grid north -- the
-    direction the facet faces, which is the convention iirspy.photometry.cos_angle expects.
+    direction the facet faces, which is the convention iirspy.l2.photometry.cos_angle expects.
     """
     return np.degrees(np.arctan(np.hypot(gx, gy))), np.degrees(np.arctan2(-gx, -gy)) % 360.0
 
@@ -755,11 +755,11 @@ def save_topo(fout, slope, aspect, lit, tags=None, sun_az=None, sun_elev=None):
     """Write the camera-space topo product: a 3- or 5-band float32 GeoTIFF, bands named for L2.
 
     `sun_az`/`sun_elev`, if given, land in extra bands 4-5: over a whole strip the tangent-plane
-    sun moves too much for `iirs.py`'s single-scalar-tag convention, so `iirspy.photometry.load_slope_az`
+    sun moves too much for `iirs.py`'s single-scalar-tag convention, so `iirspy.l2.photometry.load_slope_az`
     hands these back as (y, x) arrays instead. Either a per-row (y,) array (broadcast across x) or
     an already-per-pixel (y, x) one (`georef.sun_geometry_rows`'s own output) is accepted.
 
-    No CRS or transform -- this is camera space, and iirspy.photometry.load_slope_az matches it to the
+    No CRS or transform -- this is camera space, and iirspy.l2.photometry.load_slope_az matches it to the
     L1 cube by shape. Small enough (a few MB) to ship beside every L1.
     """
     bands = [("slope", slope), ("aspect", aspect), ("lit_frac", lit)]
@@ -794,7 +794,7 @@ def _row_bands(gcps, ny, cfg):
     the polar `lat_range` -- conservative at the transition, since the midlat DEM's wider
     `dem_range` already covers the whole group. Equatorial has one band; no split.
     """
-    from iirspy import chunks as ck
+    from iirspy.georef import chunks as ck
 
     if cfg.pole == "equatorial":
         return np.full(ny, "equatorial", dtype=object)
@@ -850,7 +850,7 @@ def scene_topo(sid, group, gcps, shape, fgeom, flabel, cfg, kernels, topo_dir, s
     """
     from dataclasses import replace
 
-    from iirspy import chunks as ck
+    from iirspy.georef import chunks as ck
 
     f = Path(topo_dir) / f"{sid}_{group}_topo.tif"
     if f.exists() and not overwrite:
@@ -1376,7 +1376,7 @@ def gcp_lattice(fgeom, ny, nx, cfg):
     if cfg.lat_band is None:
         raise ValueError("pass the crop the cube was built with as GeorefConfig.lat_band")
     extent = (-180, 180, *cfg.lat_band)
-    _, xyext = utils.parse_geom(fgeom, extent)
+    _, xyext = ancillary.parse_geom(fgeom, extent)
     scan0, n_geom_rows = xyext[2], xyext[3] - xyext[2] + 1
     if n_geom_rows < ny:
         raise ValueError(
@@ -1389,7 +1389,7 @@ def gcp_lattice(fgeom, ny, nx, cfg):
     rows = np.unique(np.r_[np.arange(r0, r1 + 1, cfg.row_step), r1])
     cols = np.unique(np.linspace(0, nx - 1, cfg.ncol).astype(int))
     # Cube row r is geometry Scan scan0 + r.
-    glon, glat, _ = utils.geom2grid(fgeom, extent, xs=cols, ys=scan0 + rows)
+    glon, glat, _ = ancillary.geom2grid(fgeom, extent, xs=cols, ys=scan0 + rows)
     jj, ii = np.meshgrid(rows, cols, indexing="ij")
     x, y = to_stereo(cfg.pole).transform(glon, glat)
     return jj, ii, x, y
@@ -1398,7 +1398,7 @@ def gcp_lattice(fgeom, ny, nx, cfg):
 def geom_csv_gcps(fgeom, cfg):
     """(gcps, scan0, camera_shape) of the supplied geometry csv alone over `cfg.lat_band`'s scans:
     the uncorrected ISSDC geolocation, ready for `make_glt(gcps, cfg, camera_shape, scan0)`."""
-    _, (_, x1, y0, y1) = utils.parse_geom(fgeom, (-180, 180, *cfg.lat_band))
+    _, (_, x1, y0, y1) = ancillary.parse_geom(fgeom, (-180, 180, *cfg.lat_band))
     shape = (y1 - y0 + 1, x1 + 1)  # both ends are geometry scans, so both are in
     return _to_gcps(*gcp_lattice(fgeom, *shape, cfg)), y0, shape
 
@@ -1534,9 +1534,9 @@ def arosics_python():
 
 
 def _register_subprocess(ftif, fgeom, flabel, cfg, kernels, reference, verbose):
-    """Run the solve through iirspy.coreg in the arosics environment; rebuild it from the json."""
+    """Run the solve through iirspy.georef.coreg in the arosics environment; rebuild it from the json."""
     py = arosics_python()
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[2]
     with tempfile.TemporaryDirectory() as tmp:
         ref = reference
         if ref is not None and not isinstance(ref, str | Path):
@@ -1555,7 +1555,7 @@ def _register_subprocess(ftif, fgeom, flabel, cfg, kernels, reference, verbose):
                 "out": str(out),
             })
         )
-        subprocess.run([str(py), "-m", "iirspy.coreg", str(job)], check=True, cwd=str(root))  # noqa: S603
+        subprocess.run([str(py), "-m", "iirspy.georef.coreg", str(job)], check=True, cwd=str(root))  # noqa: S603
         d = json.loads(out.read_text())
     xs, ys, tr, _ = grid_of(cfg)
     return Registration(
@@ -1671,7 +1671,7 @@ def register(ftif, fgeom, flabel, cfg, kernels=None, reference=None, verbose=Fal
 
     `reference` is the hillshade to match against, as an array or the path to one; without it the
     scene's own is rendered. When arosics is not importable the solve runs in the arosics conda
-    environment through :mod:`iirspy.coreg`.
+    environment through :mod:`iirspy.georef.coreg`.
     """
     if not _has_arosics():
         return _register_subprocess(ftif, fgeom, flabel, cfg, kernels, reference, verbose)
@@ -2086,9 +2086,9 @@ def geoloc_vrt(cube_path, loc: xr.Dataset, crs, out_dir) -> Path:
 
 def _gcps_and_aoi(fgcps: Path) -> tuple[list[GroundControlPoint], tuple[float, float, float, float]]:
     """GroundControlPoints from a merged `.gcps` file, plus the AOI their own x/y span."""
-    from iirspy import solve
+    from iirspy.georef import arosics
 
-    merged = solve._load_gcps(fgcps)
+    merged = arosics._load_gcps(fgcps)
     if not merged:
         sys.exit(f"{fgcps} has no GCPs")
     gcps = [GroundControlPoint(row=float(r), col=float(c), x=float(x), y=float(y)) for (r, c), (x, y) in merged.items()]
@@ -2099,7 +2099,7 @@ def _gcps_and_aoi(fgcps: Path) -> tuple[list[GroundControlPoint], tuple[float, f
 def _glt_parser():
     import argparse
 
-    from iirspy import chunks as ck
+    from iirspy.georef import chunks as ck
 
     ap = argparse.ArgumentParser(description="Build a scene's GLT from its merged GCPs.")
     ap.add_argument("sid", help="scene id, e.g. 20210103T1829495344")
@@ -2123,11 +2123,11 @@ def _glt_parser():
 def main(argv: list[str] | None = None) -> None:
     from dataclasses import replace
 
-    from iirspy import chunks as ck
-    from iirspy import solve
+    from iirspy.georef import arosics
+    from iirspy.georef import chunks as ck
 
     args = _glt_parser().parse_args(argv)
-    fgcps = Path(args.gcps) if args.gcps else solve.merged_gcps_path(args.sid, args.group)
+    fgcps = Path(args.gcps) if args.gcps else arosics.merged_gcps_path(args.sid, args.group)
     if not fgcps.is_file() or fgcps.stat().st_size == 0:
         sys.exit(f"{fgcps} missing or empty -- {args.sid} {args.group} is not solved yet")
 

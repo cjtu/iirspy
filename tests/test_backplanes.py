@@ -5,9 +5,10 @@ import json
 import numpy as np
 import rasterio
 
-from iirspy import backplanes as bp
-from iirspy import chunks as ck
-from iirspy import georef, solve
+from iirspy import instrument
+from iirspy.georef import arosics, georef
+from iirspy.georef import backplanes as bp
+from iirspy.georef import chunks as ck
 
 
 def test_xyz_round_trips_group_crs_for_every_pole():
@@ -26,7 +27,7 @@ def _write_group(root, sid, group, scan0, rows, cols):
     d = ck.recal_dir(sid)
     d.mkdir(parents=True, exist_ok=True)
     gcps = {(r, c): (1000.0 * c, -1000.0 * r + 10.0 * group.__hash__() % 7) for r in rows for c in cols}
-    solve._save_gcps(solve.merged_gcps_path(sid, group), gcps)
+    arosics._save_gcps(arosics.merged_gcps_path(sid, group), gcps)
     chunks = [{"i": 0, "row0": min(rows), "row1": max(rows)}]
     (d / f"{sid}_{group}_solve_summary.json").write_text(json.dumps({"scan0": scan0, "chunks": chunks}))
     return gcps
@@ -51,7 +52,7 @@ def _write_plain_group(sid, group, scan0, rows, cols):
     d = ck.recal_dir(sid)
     d.mkdir(parents=True, exist_ok=True)
     gcps = {(r, c): (1000.0 * c, -1000.0 * r) for r in rows for c in cols}
-    solve._save_gcps(solve.merged_gcps_path(sid, group), gcps)
+    arosics._save_gcps(arosics.merged_gcps_path(sid, group), gcps)
     chunks = [{"i": 0, "row0": min(rows), "row1": max(rows)}]
     (d / f"{sid}_{group}_solve_summary.json").write_text(json.dumps({"scan0": scan0, "chunks": chunks}))
     return gcps
@@ -82,7 +83,7 @@ def test_group_loc_samples_constant_dem_elevation(tmp_path, monkeypatch):
         ck, "bands", lambda: {"south": {"group": "south", "lat_range": (-90.0, 90.0), "dem_near": str(dem)}}
     )
 
-    gcps_file = solve._load_gcps(solve.merged_gcps_path(sid, "south"))
+    gcps_file = arosics._load_gcps(arosics.merged_gcps_path(sid, "south"))
     lon, lat, radius = bp._group_loc_core(gcps_file, "south", row_block=8)
     assert lon.shape == (21, 3)
     assert np.isfinite(lon).all() and np.isfinite(lat).all()
@@ -304,7 +305,7 @@ def test_write_obs_tags_include_bands_pan_bands_and_shadow_snr(tmp_path):
         tags = src.tags()
         assert tags["IIRS_PRODUCT"] == "OBS"
         assert "sun_azimuth" in tags["BANDS"] and "tie_dist" in tags["BANDS"]
-        assert tags["PAN_BANDS"] == ",".join(str(b) for b in bp.PAN_BANDS)
+        assert tags["PAN_BANDS"] == ",".join(str(b) for b in instrument.PAN_BANDS)
         assert tags["SHADOW_SNR"] == str(bp.SHADOW_SNR)
         assert src.descriptions[0] == "sun_azimuth"
         assert np.isnan(src.read(12)).all()  # sky_view reserved

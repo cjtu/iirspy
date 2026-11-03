@@ -34,10 +34,10 @@ dependencies = [
 ]
 
 [project.scripts]
-iirs-solve-scene = "iirspy.solve:main"
-iirs-compute-refl = "iirspy.refl:main"
-iirs-make-glt = "iirspy.georef:main"
-iirs-fix-frames = "iirspy.fixframes:main"
+iirs-solve-scene = "iirspy.georef.arosics:main"
+iirs-compute-refl = "iirspy.cli.refl:main"
+iirs-make-glt = "iirspy.georef.georef:main"
+iirs-fix-frames = "iirspy.cli.fixframes:main"
 
 [project.urls]
 Homepage = "https://cjtu.github.io/iirspy/"

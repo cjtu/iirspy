@@ -21,9 +21,9 @@ from typing import Any, ClassVar, Self
 
 import numpy as np
 
-from iirspy import photometry, utils
+from iirspy.l2 import photometry, polish
 
-POLISH = {"verma2022": utils.FPOLISH, "issdc_empirical": utils.FPOLISH_ISSDC_EMPIRICAL}
+POLISH = {"verma2022": polish.FPOLISH, "issdc_empirical": polish.FPOLISH_ISSDC_EMPIRICAL}
 FLUX = ("pradan", "hsrs", "noaa_cdr_mean", "noaa_cdr_monthly")
 CALIB = ("lut", "lut_median")
 SDIST = ("spice", "none")
@@ -71,8 +71,8 @@ class L1Config(_Config):
         interp_bands: Fill masked bands by interpolating across band (e.g. "linear"), or None.
         interp_spatial: Fill single-column all-band NaN gaps across x.
         fix_frames: Move each 4-band group onto true frames and null its lost frames (needs the
-            scene's frame table, see `iirspy.frames`).
-        fill_frames: Rebuild the nulled frames from each pixel's own spectrum (`iirspy.frames.fill`).
+            scene's frame table, see `iirspy.l1.frames`).
+        fill_frames: Rebuild the nulled frames from each pixel's own spectrum (`iirspy.l1.frames.fill`).
         bad_pixel_mask: Null the packaged bad detector elements.
         exclude_wl: Extra (lo, hi) wavelength ranges [nm] to null, or None.
         attach_snr: Attach the empirical broadband SNR as an `snr` coord (empirical scenes with shadow).
@@ -127,7 +127,7 @@ class L2Config(_Config):
         thermal_bands: (first, last) IIRS band numbers, 1-indexed and inclusive, whose mean
             brightness temperature is T.
         thermal_t_min: T [K] at or below which (or NaN) a pixel's T falls back to the flat-surface
-            equilibrium temperature at its incidence (`utils.flat_surface_temperature`).
+            equilibrium temperature at its incidence (`thermal.flat_surface_temperature`).
         clip_negative: Zero negative reflectance after smoothing.
         fill_nan: Value written over every NaN as the last step (ISSDC's ndi marks all nulls with 0), or None to keep NaN.
         polish: Per-band divisor: None, "verma2022", "issdc_empirical", or a csv path with `band`
@@ -138,7 +138,7 @@ class L2Config(_Config):
         cos_min: Floor on cos_inc and cos_view before the disk function (0 = none). Clamps.
         min_lit: Null pixels with less than this lit fraction (needs `slope_az`).
         smoothing: Spectral moving-average width in bands (0 = off).
-        smoothing_edges: End bands of the moving average (`utils.moving_average`).
+        smoothing_edges: End bands of the moving average (`polish.moving_average`).
     """
 
     flux: Any = "pradan"

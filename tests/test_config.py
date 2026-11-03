@@ -5,17 +5,18 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from iirspy import utils
+from iirspy import instrument
 from iirspy.config import L1Config, L2Config
+from iirspy.l2 import polish
 
 L2_REPRO = os.environ.get("IIRS_L2_REPRO")  # cached NCI/NDI windows, see test_issdc_preset_reproduces_ndi
 
 
 def test_polish_maps_by_band_number_not_position():
     """A cube with bands dropped must still get each band's own coefficient."""
-    table = utils.spectral_polish(np.arange(1, 257))
-    kept = np.setdiff1d(np.arange(1, 257), [*utils.OSF, *utils.INVALID, 100, 101])
-    np.testing.assert_array_equal(utils.spectral_polish(kept).values, table.sel(band=kept).values)
+    table = polish.spectral_polish(np.arange(1, 257))
+    kept = np.setdiff1d(np.arange(1, 257), [*instrument.OSF, *instrument.INVALID, 100, 101])
+    np.testing.assert_array_equal(polish.spectral_polish(kept).values, table.sel(band=kept).values)
     assert float(table.sel(band=1)) == 1.0  # verma2022 starts at band 8
 
 
@@ -75,7 +76,7 @@ def test_issdc_preset_reproduces_ndi():
     from iirspy.iirs import L2
 
     pad, n = 8, 256
-    wl = utils.get_wls()
+    wl = instrument.get_wls()
     short = (wl > 750) & (wl < 2300)
     meds = []
     for d in sorted(p for p in Path(L2_REPRO).iterdir() if (p / "nci.npz").exists() and (p / "ndi.npz").exists()):
@@ -87,7 +88,7 @@ def test_issdc_preset_reproduces_ndi():
             rad = _align(rfl[w], [r[w] for r in rads], pad, n)
             ny, nx = ref.shape[1:]
             coords = {"band": np.arange(1, 257), "wl": ("band", wl), "y": np.arange(ny), "x": np.arange(nx)}
-            da = xr.DataArray(rad * utils.RAD_NATIVE_SCALE, dims=("band", "y", "x"), coords=coords)
+            da = xr.DataArray(rad * instrument.RAD_NATIVE_SCALE, dims=("band", "y", "x"), coords=coords)
             da = da.assign_coords(solar_inc=("y", np.zeros(ny)), solar_az=("y", np.zeros(ny)))
             inc = xr.DataArray(sunzen[w, pad : pad + n], dims=("y", "x"))
             refl = L2.__new__(L2)._compute_reflectance(da, None, L2Config.preset("issdc"), inc=inc).values

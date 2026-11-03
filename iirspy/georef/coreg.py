@@ -10,7 +10,7 @@ environment. Create its environment once, from the repository root:
 arosics is not importable in the current one, and raises with the command above if the
 environment does not exist. To run a solve by hand:
 
-    conda run -n arosics python -m iirspy.coreg job.json
+    conda run -n arosics python -m iirspy.georef.coreg job.json
 
 `job.json` holds the scene paths and the GeorefConfig fields; the solved GCP lattice and the
 solve's stats are written as json to the path its "out" key names.
@@ -20,9 +20,9 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # runs without installing iirspy
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # runs without installing iirspy
 
-from iirspy.georef import GeorefConfig, register
+from iirspy.georef.georef import GeorefConfig, register
 
 
 def run_job(fjob):

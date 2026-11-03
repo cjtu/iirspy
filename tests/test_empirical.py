@@ -13,12 +13,13 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from iirspy import empirical as emp
+from iirspy import instrument
 from iirspy.iirs import _band_numbers
+from iirspy.l1 import empirical as emp
 
 FIXTURE = Path(__file__).parent / "data" / "iirs_l0_subset.tif"
 FIXTURE_BANDS = [10, 18, 26, 42, 110, 111, 112]
-PAN = [b for b in FIXTURE_BANDS if b in emp.PAN_BANDS]  # [10, 18, 26, 42]
+PAN = [b for b in FIXTURE_BANDS if b in instrument.PAN_BANDS]  # [10, 18, 26, 42]
 
 
 def synth_cube(nband=7, ny=600, nx=250, bands=None, dark_rows=200, seed=0, texture=0.0, pedestal=0.0):
@@ -56,7 +57,7 @@ def real_cube():
 
 def test_fixture_carries_pan_and_clean_bands(real_cube):
     assert list(real_cube.band.values) == FIXTURE_BANDS
-    assert emp.avail(real_cube, emp.PAN_BANDS) == PAN
+    assert emp.avail(real_cube, instrument.PAN_BANDS) == PAN
     assert emp.avail(real_cube, emp.clean_bands()) == [42, 110, 111, 112]
 
 

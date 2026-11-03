@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from iirspy import L0, L1, L2, utils
-from iirspy.iirs import _apply_envi_start, _band_numbers, _row_block
+from iirspy import L0, L1, L2, instrument, io
+from iirspy.iirs import _apply_envi_start, _band_numbers
 
 BASENAME = "20201202T1527488942"
 FULL = [1, 2, 3]
@@ -30,7 +30,7 @@ def cube(bands):
             "band": bands,
             "y": np.arange(ny) + Y0 + 0.5,
             "x": np.arange(nx) + 0.5,
-            "wl": ("band", utils.get_wls()[np.array(bands) - 1]),
+            "wl": ("band", instrument.get_wls()[np.array(bands) - 1]),
         },
     )
 
@@ -74,8 +74,8 @@ def test_from_file_preserves_bands_wls_and_absolute_lines(bands, ext, tmp_path):
 
     back = L1.from_file(fout, BASENAME, tmp_path)
     assert list(back.img.band.values) == bands
-    np.testing.assert_allclose(back.img.wl.values, utils.get_wls()[np.array(bands) - 1])
-    np.testing.assert_allclose(back.img.values, inst.img.values * utils.RAD_NATIVE_SCALE, rtol=1e-6)
+    np.testing.assert_allclose(back.img.wl.values, instrument.get_wls()[np.array(bands) - 1])
+    np.testing.assert_allclose(back.img.values, inst.img.values * instrument.RAD_NATIVE_SCALE, rtol=1e-6)
     # Absolute line/sample offset survives: GeoTIFF via the transform, ENVI via x start / y start
     np.testing.assert_allclose(back.img.y.values, inst.img.y.values)
     np.testing.assert_allclose(back.img.x.values, inst.img.x.values)
@@ -118,8 +118,8 @@ def test_write_block_tracks_chunking_and_pixels_do_not(chunk, tmp_path):
 
     back = L1.from_file(fout, BASENAME, tmp_path, chunk=chunk)
     ychunks = back.img.chunks[back.img.dims.index("y")] if back.img.chunks else None
-    assert _row_block(back.img) == (max(ychunks) if ychunks else _row_block(back.img.compute()))
-    assert _row_block(back.img, 7) == 7, "an explicit sub_rows still wins"
+    assert io.rows_per_block(back.img) == (max(ychunks) if ychunks else io.rows_per_block(back.img.compute()))
+    assert io.rows_per_block(back.img, 7) == 7, "an explicit sub_rows still wins"
 
     fout2 = tmp_path / "cube2.tif"
     back.save(fout2, snr_sidecar=False)

@@ -25,7 +25,7 @@ import functools
 import numpy as np
 import xarray as xr
 
-from iirspy.utils import PKG_DATA
+from iirspy.instrument import PKG_DATA
 
 M3_DATA = PKG_DATA.joinpath("m3")
 

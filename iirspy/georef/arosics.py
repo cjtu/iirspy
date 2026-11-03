@@ -1,7 +1,7 @@
 """Chunked AROSICS registration of one CRS group of one scene.
 
 Builds an L1 product cropped to the group's latitudes, splits it into chunks via
-`iirspy.chunks.plan_chunks`, solves each chunk against its own bounded hillshade, then merges the
+`iirspy.georef.chunks.plan_chunks`, solves each chunk against its own bounded hillshade, then merges the
 chunks with a cosine cross-fade over each row overlap and warps the merged result.
 
     iirs-solve-scene <sid> --group south|north|equatorial [--out WORKDIR] [--keep DIR] [--clean]
@@ -30,9 +30,10 @@ from pathlib import Path
 
 import numpy as np
 
-from iirspy import __version__, utils
-from iirspy import chunks as ck
+from iirspy import __version__, instrument, io
 from iirspy.config import CALIB
+from iirspy.georef import ancillary
+from iirspy.georef import chunks as ck
 
 WIDTH_RANGE_KM = (100.0, 150.0)
 OVERLAP_FRAC = 0.10
@@ -77,7 +78,7 @@ LOG = Path()
 STAGE = Path()
 # When this run must be finished by (`time.monotonic()`), or None for no limit. See `_time_left`.
 DEADLINE: float | None = None
-# The scene's frame table (`iirspy.frames`), set by `main` / `refl.main` before any L1 is built.
+# The scene's frame table (`iirspy.l1.frames`), set by `main` / `cli.refl.main` before any L1 is built.
 FRAMES = Path()
 
 
@@ -252,7 +253,7 @@ def _cube_bands(band: int) -> list[int]:
     (`_band_window` alone, via `output_bands`) -- PAN_BANDS beyond the window only feed the
     empirical dark/flat/smile derivation, which sees the full staged cube regardless.
     """
-    from iirspy.empirical import PAN_BANDS
+    from iirspy.instrument import PAN_BANDS
 
     return sorted(set(PAN_BANDS) | set(_band_window(band)))
 
@@ -268,7 +269,7 @@ def _stage_inputs(day: str, bands: list[int]) -> Path:
     if not raw_qub.exists():
         log(f"extracting {ZIP.name} ({len(bands)} bands) -> {STAGE}")
         with phase("extraction"):
-            utils.extract(ZIP, STAGE, bands=bands)
+            io.extract(ZIP, STAGE, bands=bands)
     for sub in (
         f"geometry/calibrated/{day}",
         f"miscellaneous/calibrated/{day}",
@@ -316,7 +317,7 @@ def build_l1(
     `out_bands` narrows what actually gets *written*, after `bands` has done its job of giving the
     dark/flat/smile search enough of the spectrum to work with -- a chunk solve only ever reads one
     band back out (`read_band(ftif, cfg.band)`), so writing all of `bands` to disk for that case is
-    pure I/O nobody uses. None (default, what `iirspy.refl` wants) writes every calibrated band.
+    pure I/O nobody uses. None (default, what `iirspy.cli.refl` wants) writes every calibrated band.
 
     l1_config (an `L1Config`) replaces CALIBRATE_KWS and calibrate_kwargs outright (`iirs-compute-refl`);
     its full resolved fields, plus a G1 table's content hash, are the cache key.
@@ -339,7 +340,7 @@ def build_l1(
     # Ancillary only (spm, oat, xml, csv -- excludes the qub by default): a few MB, so cheap enough
     # to always re-run even on an L1 cache hit. Without this, a cache hit skips `_stage_inputs`
     # below and STAGE never gets the spm the zip carries, since it does not live in ARCHIVE.
-    utils.extract(ZIP, STAGE)
+    io.extract(ZIP, STAGE)
     # The nri zip's own layout only ever yields .../raw, but iirspy.L1 (level=1) always looks
     # under .../calibrated -- for spm (calibrate()'s FileNotFoundError check) and for the xml
     # label (from_xarray's solar_inc/solar_az lookup, iirs.py `paths.get("qub"/"xml")` at
@@ -397,11 +398,11 @@ def build_l1(
             else l0.calibrate(l1_config, frame_offsets=str(FRAMES))
         )
     # l1.img already holds exactly `bands` -- that's what _stage_inputs staged.
-    _, xyext = utils.parse_geom(fgeom or l1.csv, latlonextent=(-180, 180, *lat_range))
+    _, xyext = ancillary.parse_geom(fgeom or l1.csv, latlonextent=(-180, 180, *lat_range))
     ymin, ymax = xyext[2], xyext[3]
     log(f"L1 crop lat={lat_range}: scan {ymin}-{ymax} ({ymax - ymin} rows)")
     l1.img = l1.img.sel(y=slice(ymin, ymax))
-    l1.img = l1.img / utils.RAD_NATIVE_SCALE
+    l1.img = l1.img / instrument.RAD_NATIVE_SCALE
     l1.img.attrs["units"] = "1000 mW/cm^2/sr/um"
     if out_bands is not None:
         l1.img = l1.img.sel(band=out_bands)
@@ -458,7 +459,7 @@ def build_l1_nci(
     with phase("nci L1 read + crop"):
         l1 = L1(SID, ck.ARCHIVE, lonlatextent=(-180, 180, *lat_range), chunk={"band": -1, "y": chunk_y, "x": -1})
         scan0 = int(l1.extent[2])
-        l1.img = l1.img.sel(band=bands) / utils.RAD_NATIVE_SCALE
+        l1.img = l1.img.sel(band=bands) / instrument.RAD_NATIVE_SCALE
         l1.img.attrs["units"] = "1000 mW/cm^2/sr/um"
         if fix_frames:
             l1.fix_frames(FRAMES, fill_frames)
@@ -480,7 +481,7 @@ def build_l1_nci(
 
 def _write_reversed_csv(fgeom: Path) -> Path:
     """`fgeom` with Scan renumbered max - Scan, in the recal tree where `ck.ancillary` prefers it."""
-    df = utils.read_geom_csv(fgeom)
+    df = ancillary.read_geom_csv(fgeom)
     df["Scan"] = df["Scan"].max() - df["Scan"]
     dst = ck.recal_dir(SID) / fgeom.name
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -500,7 +501,7 @@ def ensure_frame_offsets(dest: Path | None = None) -> Path:
     It needs every band of every line once (~1 min); nothing else in a run does, so it streams the zip rather than
     staging it.
     """
-    from iirspy import frames
+    from iirspy.l1 import frames
 
     f = frame_offsets_path(SID, dest)
     if not f.exists():
@@ -571,7 +572,7 @@ def _write_and_keep(summary: dict, dest: Path | None) -> None:
 def _scene_scan0(fgeom: Path, lat_range: tuple[float, float]) -> int:
     """First Scan of the group's L1 crop, from the geometry csv alone -- no cube needed."""
 
-    _, xyext = utils.parse_geom(fgeom, latlonextent=(-180, 180, *lat_range))
+    _, xyext = ancillary.parse_geom(fgeom, latlonextent=(-180, 180, *lat_range))
     return int(xyext[2])
 
 
@@ -603,7 +604,7 @@ def _peak_mb() -> float:
 
 def _make_loc(merged: dict, scan0: int, loc_dir: str, fits: list[dict], overwrite: bool = False) -> Path:
     """Write `<sid>_<group>_loc.tif` (lon, lat, LOLA radius per camera pixel) from the merged GCP lattice."""
-    from iirspy import backplanes
+    from iirspy.georef import backplanes
 
     floc = Path(loc_dir) / f"{SID}_{GROUP}_loc.tif"
     if floc.exists() and not overwrite:
@@ -658,7 +659,7 @@ def _glt_only(args, cfg0, fgeom, lat_range) -> bool:
 
 def _warp_merged(merged: dict, used_chunks: list[dict], cfg0, ftif: Path):
     """Warp the band once through the merged GCPs, cropped to the union of the solved chunk AOIs."""
-    from iirspy.georef import project, read_band, save_grid
+    from iirspy.georef.georef import project, read_band, save_grid
 
     gcps = _gcp_list(merged)
     final_cfg = replace(
@@ -884,7 +885,7 @@ def _solve_one(c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=F
     would not fit in the time left (see `--max-seconds`) -- stopping *before* a chunk rather than
     being killed inside one keeps every finished chunk's cache intact for the rerun.
     """
-    from iirspy.georef import (
+    from iirspy.georef.georef import (
         project,
         read_band,
         register,
@@ -1013,7 +1014,7 @@ def _reference_key(c: dict, reference: str) -> dict:
 
 def _save_reference(c: dict, cfg, ref, hs_info: dict, reference: str) -> None:
     """Write chunk `c`'s reference image and the key `_cached_reference` reads it back by."""
-    from iirspy.georef import save_grid
+    from iirspy.georef.georef import save_grid
 
     save_grid(_work(f"chunk{c['i']}_hs.tif"), ref, cfg)
     info = {k: hs_info[k] for k in ("az_grid", "elev", "lit_frac")}
@@ -1044,7 +1045,7 @@ def _cached_reference(c: dict, reference: str):
 
 def _solve_chunks_hillshade(chunks, cfg0, fgeom, flabel):
     """Render and save each chunk's reference hillshade only, no registration."""
-    from iirspy.georef import render_reference
+    from iirspy.georef.georef import render_reference
 
     for c in chunks:
         cfg = replace(cfg0, aoi=c["aoi"], dem_near=c["dem_near"], dem_far=c["dem_far"])
@@ -1419,7 +1420,7 @@ def _open_run(out: str | None, step: str = "solve") -> None:
 def main(argv: list[str] | None = None) -> None:
 
     from iirspy import georef
-    from iirspy.georef import read_band, scan_order_reversed
+    from iirspy.georef.georef import read_band, scan_order_reversed
 
     args = _parser().parse_args(argv)
 

@@ -3,7 +3,7 @@ import pytest
 from rasterio.control import GroundControlPoint
 from rasterio.transform import from_origin
 
-from iirspy import georef
+from iirspy.georef import georef
 
 
 def test_slope_aspect_on_a_known_plane():
@@ -40,7 +40,7 @@ def test_camera_xy_rejects_a_partial_lattice():
 
 def test_topo_product_round_trips_into_the_l2_reader(tmp_path):
     """save_topo -> photometry.load_slope_az must come back band-for-band, names and all."""
-    import iirspy.photometry as photometry
+    from iirspy.l2 import photometry
 
     slope = np.linspace(0, 30, 12).reshape(4, 3).astype("float32")
     aspect = np.linspace(0, 359, 12).reshape(4, 3).astype("float32")
@@ -89,7 +89,7 @@ def test_local_plane_extrapolates_the_local_gradient_and_stays_bounded():
     """`_local_plane` is the off-support fallback: local level + local slope, clipped."""
     from scipy.spatial import cKDTree
 
-    from iirspy.georef import _local_plane
+    from iirspy.georef.georef import _local_plane
 
     pts = np.stack(np.meshgrid(np.arange(5) * 1000.0, np.arange(5) * 1000.0), -1).reshape(-1, 2)
     disp = np.c_[1e-3 * pts[:, 0], np.full(len(pts), 7.0)]  # dx ramps 0->4 m, dy constant
@@ -191,7 +191,7 @@ def test_row_bands_falls_back_to_midlat_across_the_polar_seam():
     """A camera row is 'south' only if both bracketing lattice rows are fully inside -76.5..-90."""
     from dataclasses import replace
 
-    from iirspy import chunks as ck
+    from iirspy.georef import chunks as ck
 
     cfg = replace(georef.GeorefConfig(), pole="south")
     assert ck.BANDS["south"]["lat_range"] == (-90.0, -76.5)
@@ -222,7 +222,7 @@ def test_scene_topo_assembles_pieces_with_no_blending_and_exact_per_row_sun(tmp_
     exact per-pixel values passed straight through, not a piece-centroid interpolation."""
     from dataclasses import replace
 
-    from iirspy import chunks as ck
+    from iirspy.georef import chunks as ck
 
     ny, nx = 3500, 4  # > _split_run's max_rows -> at least 2 pieces, one band (equatorial, no split)
     rows = np.unique(np.r_[np.arange(0, ny, 25), ny - 1])

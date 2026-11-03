@@ -56,7 +56,7 @@ These are keyword arguments of `L1.calibrate`, not config fields, so they are no
 - `sun_az_offset`: degrees added to the SPM solar azimuth to reach the grid-north frame of `slope_az`.
 
 ```python
-from iirspy import photometry
+from iirspy.l2 import photometry
 from iirspy.config import L2Config
 
 slope, aspect = photometry.slope_az_from_dem(dem)

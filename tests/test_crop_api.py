@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from iirspy import L0, L1, L2, utils
+from iirspy import L0, L1, L2, instrument
+from iirspy.l1 import radiometry
 
 BASENAME = "20201202T1527488942"
 BANDS = [10, 18, 54]
@@ -21,7 +22,7 @@ def cube():
             "band": BANDS,
             "y": np.arange(ny) + Y0 + 0.5,
             "x": np.arange(nx) + 0.5,
-            "wl": ("band", utils.get_wls()[np.array(BANDS) - 1]),
+            "wl": ("band", instrument.get_wls()[np.array(BANDS) - 1]),
             "solar_inc": ("y", np.arange(ny, dtype="float64")),
         },
     )
@@ -43,7 +44,7 @@ def test_crop_save_from_file_roundtrip(cls, tmp_path):
     np.testing.assert_allclose(back.img.wl.values, sub.img.wl.values)
     np.testing.assert_allclose(back.img.y.values, sub.img.y.values)
     np.testing.assert_allclose(back.img.x.values, sub.img.x.values)
-    scale = utils.RAD_NATIVE_SCALE if cls is L1 else 1.0  # the L1 file is in native units
+    scale = instrument.RAD_NATIVE_SCALE if cls is L1 else 1.0  # the L1 file is in native units
     np.testing.assert_allclose(back.img.values, sub.img.values * scale, rtol=1e-6)
 
 
@@ -58,8 +59,8 @@ def test_cropped_l0_from_file_calibrates(tmp_path, monkeypatch):
     coords = {"band": 1 + np.arange(256), "x": 0.5 + np.arange(250)}
     gain = xr.DataArray(np.full((256, 250), 2.0), coords=coords)
     sat = xr.DataArray(np.full(256, 1e9), coords={"band": coords["band"]})
-    monkeypatch.setattr(utils, "get_gain_offset", lambda *a, **k: (gain, gain * 0 + 1))
-    monkeypatch.setattr(utils, "get_saturation_radiance", lambda *a, **k: sat)
+    monkeypatch.setattr(radiometry, "get_gain_offset", lambda *a, **k: (gain, gain * 0 + 1))
+    monkeypatch.setattr(instrument, "get_saturation_radiance", lambda *a, **k: sat)
     sub = L0.from_xarray(cube(), BASENAME, tmp_path).crop(y=(Y0 + 2.5, Y0 + 5.5), bands=[BANDS[0], BANDS[2]])
     l0 = L0.from_file(sub.save(tmp_path / "dn.tif", full_bands=False), BASENAME, tmp_path)
     kw = {
@@ -71,7 +72,7 @@ def test_cropped_l0_from_file_calibrates(tmp_path, monkeypatch):
         "interp_spatial": False,
     }
     rad = l0.calibrate_to_rad(**kw)
-    keep = ~rad.band.isin((*utils.OSF, *utils.INVALID))
+    keep = ~rad.band.isin((*instrument.OSF, *instrument.INVALID))
     expected = 10 * (2 * l0.img.where(keep, drop=True).values + 1)
     np.testing.assert_allclose(rad.where(keep, drop=True).values, expected, rtol=1e-6)
     assert isinstance(l0.calibrate(**kw), L1)

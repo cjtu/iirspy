@@ -1,6 +1,6 @@
 # Frame defects
 
-IIRS L0 data lose frames independently in each group of four bands. `iirspy.frames` detects the lost frames, and `L0.calibrate` re-times the affected rows onto their true frames and rebuilds the lost pixels. The correction is on by default in the `iirspy` preset.
+IIRS L0 data lose frames independently in each group of four bands. `iirspy.l1.frames` detects the lost frames, and `L0.calibrate` re-times the affected rows onto their true frames and rebuilds the lost pixels. The correction is on by default in the `iirspy` preset.
 
 ## Why it matters
 
@@ -32,7 +32,7 @@ Figure 3: The same correlation for bands 57-60 around line 53362. The best match
 
 ## Detection
 
-`iirspy.frames.build_table` makes one streamed pass over the whole raw cube. It builds a cross-track high-passed, normalised line profile for each group, then matches each group line by line against a reference group at offsets -5 to +5. The reference is bands 117-120 for reflected light and bands 201-204 for the thermal block (bands 173-252).
+`iirspy.l1.frames.build_table` makes one streamed pass over the whole raw cube. It builds a cross-track high-passed, normalised line profile for each group, then matches each group line by line against a reference group at offsets -5 to +5. The reference is bands 117-120 for reflected light and bands 201-204 for the thermal block (bands 173-252).
 
 A stride-4 pre-screen in 1000-line windows finds where the offset changes. Only those windows are matched per line, and change points are fitted jointly across groups. A drop in the reference group shows as most other groups stepping -1 together and is credited to the reference. Lags only accumulate, so each block is anchored with its least-lagged groups at 0.
 
@@ -40,7 +40,7 @@ Overwrites and black stripes come from exact or near-exact row repeats and all-z
 
 ### Offsets table
 
-The table is `<sid>_frames_offsets.csv`, one per strip. `L0.calibrate_to_rad` with `fix_frames` builds it from the full cube on first use and caches it beside the `.qub`, or takes an existing table as `frame_offsets`. A band-subset cube cannot be scanned; pass a table built from the full cube or zip with `iirspy.frames.build_table`. `iirs-solve-scene` keeps it beside the strip's GCPs and `_L1_b54.tif` in the geometry/recalibrated day directory, shared by all CRS groups.
+The table is `<sid>_frames_offsets.csv`, one per strip. `L0.calibrate_to_rad` with `fix_frames` builds it from the full cube on first use and caches it beside the `.qub`, or takes an existing table as `frame_offsets`. A band-subset cube cannot be scanned; pass a table built from the full cube or zip with `iirspy.l1.frames.build_table`. `iirs-solve-scene` keeps it beside the strip's GCPs and `_L1_b54.tif` in the geometry/recalibrated day directory, shared by all CRS groups.
 
 Table 1: Columns of `<sid>_frames_offsets.csv`.
 

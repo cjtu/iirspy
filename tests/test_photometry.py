@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from iirspy import photometry as ph
+from iirspy.l2 import photometry as ph
 
 
 def test_flat_slope_az_reproduces_cos_inc():

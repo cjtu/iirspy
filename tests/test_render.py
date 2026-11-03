@@ -5,7 +5,7 @@ import pytest
 import rasterio
 import xarray as xr
 
-from iirspy import georef, utils
+from iirspy import georef, io
 from iirspy.iirs import IIRSData
 
 
@@ -133,18 +133,18 @@ def test_get_iirs_paths_finds_reprocessed_products(tmp_path):
     (der / f"{p}_obs.tif").write_bytes(b"")
     (dat / f"{p}_l1_rad.tif").write_bytes(b"")
 
-    paths = utils.get_iirs_paths(tmp_path, basenames=[sid], exts=("gcps", "loc", "obs", "tif"), level=1)
+    paths = io.get_iirs_paths(tmp_path, basenames=[sid], exts=("gcps", "loc", "obs", "tif"), level=1)
     assert paths["gcps"][sid] == geo / f"{p}.gcps"
     assert paths["loc"][sid] == geo / f"{p}_loc.tif"
     assert paths["obs"][sid] == der / f"{p}_obs.tif"
     assert paths["tif"][sid] == dat / f"{p}_l1_rad.tif"
 
-    paths2 = utils.get_iirs_paths(tmp_path, basenames=[sid], exts=("tif",), level=2)
+    paths2 = io.get_iirs_paths(tmp_path, basenames=[sid], exts=("tif",), level=2)
     assert "tif" not in paths2
 
     # a second group makes group=None ambiguous; naming the group resolves it
     (geo / f"{sid}_equatorial_loc.tif").write_bytes(b"")
     with pytest.raises(ValueError, match="pass group="):
-        utils.get_iirs_paths(tmp_path, basenames=[sid], exts=("loc",))
-    paths3 = utils.get_iirs_paths(tmp_path, basenames=[sid], exts=("loc",), group="equatorial")
+        io.get_iirs_paths(tmp_path, basenames=[sid], exts=("loc",))
+    paths3 = io.get_iirs_paths(tmp_path, basenames=[sid], exts=("loc",), group="equatorial")
     assert paths3["loc"][sid] == geo / f"{sid}_equatorial_loc.tif"

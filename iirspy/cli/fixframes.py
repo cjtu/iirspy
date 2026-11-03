@@ -1,4 +1,4 @@
-"""Repair frame defects in an ISSDC nri, nci or ndi cube and write it in nci camera order (see `iirspy.frames`).
+"""Repair frame defects in an ISSDC nri, nci or ndi cube and write it in nci camera order (see `iirspy.l1.frames`).
 
 The frame table comes from the nri or nci cube, built here when absent; an ndi needs it from an earlier run.
 """
@@ -6,9 +6,10 @@ The frame table comes from the nri or nci cube, built here when absent; an ndi n
 import argparse
 from pathlib import Path
 
-from iirspy import chunks as ck
-from iirspy import frames, solve
+from iirspy.georef import arosics
+from iirspy.georef import chunks as ck
 from iirspy.iirs import L0, L1, L2
+from iirspy.l1 import frames
 
 LEVELS = {"nri": L0, "nci": L1, "ndi": L2}
 
@@ -23,7 +24,7 @@ def main(argv=None):
     ap.add_argument("--out", required=True, help="output .tif")
     args = ap.parse_args(argv)
     cube = LEVELS[args.product](args.sid, args.directory)
-    table = Path(args.table or solve.frame_offsets_path(args.sid))
+    table = Path(args.table or arosics.frame_offsets_path(args.sid))
     if args.product != "ndi" and not table.exists():
         frames.build_table(cube.qub, table)
     cube.fix_frames(table, args.fill_frames)

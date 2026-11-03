@@ -78,7 +78,7 @@ def test_clip_aoi_warps_onto_the_map_grid_and_matches_a_polygon_masked_apply_glt
     from rasterio.features import geometry_mask
     from rasterio.warp import transform_geom
 
-    from iirspy import georef
+    from iirspy.georef import georef
     from iirspy.iirs import IIRSData
 
     ny, nx = 10, 8

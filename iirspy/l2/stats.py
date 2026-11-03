@@ -15,7 +15,7 @@ import time
 import numpy as np
 import rasterio
 
-from iirspy import utils
+from iirspy.l2 import thermal
 
 TARGET_NM = (750, 1000, 1250, 1500, 1800, 2000, 2400, 2700, 3500, 4200, 4800)
 REF_NM, SSA_NM = 1500, 1000  # level / drift / correlation band, SSA band
@@ -166,11 +166,11 @@ def l2_stats(fl2, fl1, inc, lat, emi=None, phase=None, sdist=1.0, step=8, t_bins
     da = xr.DataArray(
         rad, dims=("band", "y", "x"), coords={"band": n1[np.array(tb) - 1], "wl": ("band", wl1[np.array(tb) - 1])}
     )
-    _, t_k = utils.thermal_radiance(
+    _, t_k = thermal.thermal_radiance(
         da, 1.0, (227, 247), inc=xr.DataArray(inc_s, dims=("y", "x")), sdist=sdist, t_min=0.0
     )
     temp = np.asarray(t_k)
-    teq = utils.flat_surface_temperature(inc_s, sdist)
+    teq = thermal.flat_surface_temperature(inc_s, sdist)
     out["T"] = {
         "median": float(np.nanmedian(temp[lit])),
         "p5": float(np.nanpercentile(temp[lit], 5)),

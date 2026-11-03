@@ -33,14 +33,15 @@ from functools import cache
 
 import numpy as np
 import xarray as xr
+from scipy.stats import norm
 
-import iirspy.utils as utils
+from iirspy import instrument
+from iirspy.instrument import PAN_BANDS
 
 # --- Parameters (single source: the functions below hold no bare numbers) ---------------------
-_OSF, _INV = set(utils.OSF), set(utils.INVALID)
+_OSF, _INV = set(instrument.OSF), set(instrument.INVALID)
 
 # Band selections
-PAN_BANDS = [b for b in range(10, 251, 8) if b not in _OSF and b not in _INV]  # broadband, beats single-band noise
 N_CLEAN_BANDS = 8  # how many least-bad bands clean_bands() picks for spatial-outlier detection
 
 # Residual-dark / shadow detection (location-agnostic: shadow is found wherever it is, if at all)
@@ -100,7 +101,7 @@ def clean_bands():
     These are the bands used to read scene structure rather than sensor response, so the fewer bad
     pixels they carry the better. Derived from the packaged mask so it tracks mask updates.
     """
-    mask = utils.load_bad_pixel_mask()
+    mask = instrument.load_bad_pixel_mask()
     bands, counts = mask.band.values, mask.sum("x").values
     ok = np.array([b not in _OSF and b not in _INV for b in bands])
     order = np.lexsort((bands[ok], counts[ok]))
@@ -340,7 +341,7 @@ def build_flat(img, dark, rs, lit, row_bright, ref_flat=None):
     emp_notes["flat_runs"][bin] is [first, last + 1] of the rows sampled in that bin; the rows
     are scattered within that span, not a solid block.
     """
-    bad = on_bands(utils.load_bad_pixel_mask(), img)
+    bad = on_bands(instrument.load_bad_pixel_mask(), img)
     ref_flat = None if ref_flat is None else on_bands(ref_flat, img)
     flats, runs_used, levels = [], {}, []
     for lo, hi in dn_bins(row_bright, lit):
@@ -479,7 +480,7 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
     rs = row_roughness(P)
     if flat_yrange is not None:
         a, b = int(flat_yrange[0]), int(flat_yrange[1])
-        bad = on_bands(utils.load_bad_pixel_mask(), img)
+        bad = on_bands(instrument.load_bad_pixel_mask(), img)
         unmasked = derive_sensor_flat(img, dark, np.arange(a, b))
         flat = unmasked.where(~bad).astype("float32")
         flat.attrs.update(unmasked=unmasked, bins=[unmasked])
@@ -498,3 +499,75 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
         smile, smile_notes = xr.ones_like(flat), {"smile_applied": False}
     emp_notes.update(smile_notes)
     return dark, flat, smile, snr, emp_notes
+
+
+def detect_stripes(da, sigma_threshold=1):
+    """
+    Detect vertical stripes for each individual band in a DataArray.
+
+    Parameters
+    ----------
+    da : xarray.DataArray
+        Input data array with dimensions ('band', 'y', 'x').
+    sigma_threshold : float, optional
+        The number of standard deviations to use as the threshold for detecting
+        anomalous pixels. Higher values are more conservative (default: 1).
+
+    Returns
+    -------
+    xarray.DataArray
+        Bool DataArray with dimensions ('band', 'x') indicating if is a stripe.
+    """
+    # Fraction of anomalous pixels to be considered a stripe, in terms of sigma
+    #  E.g. 68% for sigma=1, 95% for sigma=2, 99.7% for sigma=3, etc.
+    frac = norm().cdf(sigma_threshold) - norm().cdf(-sigma_threshold)
+    thresh = frac * len(da.y)  # threshold in num pixels
+
+    # Apply ufunc is hard to parse - applies the stripe detection band-wise
+    #   I.e. `for band in da: detect_stripes_2D(da[band])`
+    #   but with some fancy vectorizaiton and dask-delayed compute magic
+    out = xr.apply_ufunc(
+        detect_stripes_2D,
+        da,
+        thresh,
+        input_core_dims=[["y", "x"], []],
+        output_core_dims=[["x"]],
+        exclude_dims={"y"},
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[da.dtype],
+    )
+    return out
+
+
+def detect_stripes_2D(data, threshold):
+    """
+    Detect stripe along lines (y) in a 2D image (e.g. a single band from a data cube).
+
+    Defines a stripe as a line with more than thresh pixels lower or higher
+    than both adjacent pixels (e.g. a hot or cold line).
+
+    Parameters
+    ----------
+    data : 2D array
+        Numpy array image [lines (y), samples (x)]
+    thresh : num
+        Fraction of anomalous pixels to consider a line a stripe.
+
+    References
+    ----------
+    Yokoya, N., Miyamura, N., & Iwasaki, A. (2010). Preprocessing of
+        hyperspectral imagery with consideration of smile and keystone
+        properties. In Multispectral, Hyperspectral, and Ultraspectral Remote
+        Sensing Technology, Techniques, and Applications III (Vol. 7857,
+        pp. 73-81). SPIE.
+
+    """
+    # Make a left and right 2D image to compare with vector math
+    #  (duplicate left and right edge for simplicity)
+    data_l = np.insert(data[:, :-1], 0, data[:, 0], axis=1)
+    data_r = np.insert(data[:, 1:], -1, data[:, -1], axis=1)
+    # Number anomalous (larger or smaller than both neighbours)
+    num_anom = np.sum(((data < data_l) & (data < data_r)) | ((data > data_l) & (data > data_r)), axis=0)
+    is_stripe_x = num_anom > threshold  # 1D bool array along samples (x)
+    return is_stripe_x

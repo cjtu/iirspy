@@ -10,7 +10,7 @@ import rasterio
 from rasterio.control import GroundControlPoint
 from rasterio.warp import Resampling
 
-from iirspy import georef
+from iirspy.georef import georef
 
 CFG = georef.GeorefConfig(aoi=(0.0, 0.0, 4000.0, 4000.0), ps=40.0)
 NY, NX = 60, 20

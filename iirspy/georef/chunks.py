@@ -19,8 +19,9 @@ from pathlib import Path
 
 import numpy as np
 
-from iirspy import utils
-from iirspy.georef import MOON_RADIUS_M, GeorefConfig, to_stereo
+from iirspy import io
+from iirspy.georef.ancillary import read_geom_csv
+from iirspy.georef.georef import MOON_RADIUS_M, GeorefConfig, to_stereo
 
 ARCHIVE = Path(os.environ.get("IIRS_ARCHIVE", "/mnt/d/ddata/moon/ch2_iirs"))
 ANC_ROOTS = [Path(p) for p in os.environ["IIRS_ANC_ROOTS"].split(":")] if "IIRS_ANC_ROOTS" in os.environ else [ARCHIVE]
@@ -235,8 +236,8 @@ def chunk_cfg(group: str) -> GeorefConfig:
 
 
 def kernels(day: str) -> list[Path]:
-    """`utils.spice_kernels(day)` from the `SPICE` tree."""
-    return utils.spice_kernels(day, SPICE)
+    """`io.spice_kernels(day)` from the `SPICE` tree."""
+    return io.spice_kernels(day, SPICE)
 
 
 def _one(pattern: str, roots: list[Path] | None = None) -> Path | None:
@@ -303,7 +304,7 @@ def ensure_nci(sid: str) -> Path:
         raise FileNotFoundError(
             f"no nci cube or zip for {sid} under {ARCHIVE} (zips/nci/ch2_iir_nci_{sid}_d_img_*.zip)"
         )
-    utils.extract(fzip, ARCHIVE, include=NCI_MEMBERS, exclude=())
+    io.extract(fzip, ARCHIVE, include=NCI_MEMBERS, exclude=())
     if not (found := _one(pat, [ARCHIVE])):
         raise RuntimeError(f"{fzip} extracted, but no {pat} appeared under {ARCHIVE}")
     return found
@@ -317,7 +318,7 @@ def _nri_file(pat: str, sid: str, stage: Path | None) -> Path | None:
     roots = [*ANC_ROOTS, Path(stage)] if stage else ANC_ROOTS
     if (found := _one(pat, roots)) or stage is None or (fzip := nri_zip(sid)) is None:
         return found
-    utils.extract(fzip, stage, include=("*" + Path(pat).suffix,))
+    io.extract(fzip, stage, include=("*" + Path(pat).suffix,))
     return _one(pat, [Path(stage)])
 
 
@@ -327,7 +328,7 @@ def spm(sid: str, stage: Path | None = None) -> Path | None:
 
 
 def label(sid: str, stage: Path | None = None) -> Path | None:
-    """`sid`'s nri PDS4 label, the only scan-line clock (`utils.scan_utc`). See `_nri_file`."""
+    """`sid`'s nri PDS4 label, the only scan-line clock (`scan_utc`). See `_nri_file`."""
     return _nri_file(f"data/raw/{sid[:8]}/ch2_iir_nri_{sid}_d_img_*.xml", sid, stage)
 
 
@@ -337,7 +338,7 @@ def strip_backbone(fgeom: Path, lat_min: float = -90.0, lat_max: float = 90.0):
     Left in lon/lat rather than projected, since a strip can cross groups with different CRSs and
     arc length is measured on the sphere by `_haversine_m`.
     """
-    df = utils.read_geom_csv(fgeom)
+    df = read_geom_csv(fgeom)
     df["Longitude"] = (df["Longitude"] + 180) % 360 - 180
     df = df[(df.Latitude >= lat_min) & (df.Latitude <= lat_max)]
     g = df.groupby("Scan")[["Longitude", "Latitude"]].median().sort_index()
@@ -474,7 +475,7 @@ def plan_chunks(fgeom: Path, width_range_km: tuple[float, float] = (100.0, 150.0
         order = np.argsort(s)
         scans, lon, lat, s = scans[order], lon[order], lat[order], s[order]
 
-    df = utils.read_geom_csv(fgeom)
+    df = read_geom_csv(fgeom)
     df["Longitude"] = (df["Longitude"] + 180) % 360 - 180
 
     resolved = bands()
