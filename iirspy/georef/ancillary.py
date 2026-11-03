@@ -39,9 +39,10 @@ def get_spm_interpolator(fspm, col="sun_elev"):
     return make_interp_spline(spm_times, spm_vals, k=1)
 
 
-def geom2grid(fgeom, extent, xs=None, ys=None):
-    """Interpolate sparse geometry csv to full 2D lat and lon grids."""
-    df_buf, xyext = parse_geom(fgeom, extent)
+def geom2grid(fgeom, extent=(None, None, None, None), xs=None, ys=None, xyextent=(None, None, None, None)):
+    """Interpolate sparse geometry csv to full 2D lat and lon grids, from the csv points in `extent` (lon/lat)
+    or `xyextent` (Pixel/Scan), snapped outward to the point grid."""
+    df_buf, xyext = parse_geom(fgeom, extent, xyextent)
 
     # Add buffer to the extent to ensure edges are included in interpolator
     # NOTE: Makes almost no difference (pixel lvl offset, overall offset much larger)

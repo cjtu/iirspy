@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from iirspy import io
-from iirspy.cli import _run, solve
+from iirspy.cli import _run
 from iirspy.georef import arosics
 from iirspy.l1.frames import table_key
 from iirspy.workspace import Workspace
@@ -235,12 +235,12 @@ def test_keep_products_lands_only_what_is_new(tmp_path):
     out, dest = tmp_path / "out", tmp_path / "keep"
     out.mkdir()
     (out / "s_equatorial.gcps").write_text("gcps")
-    assert [f.name for f in solve.keep_products("s", "equatorial", out, dest)] == ["s_equatorial.gcps"]
+    assert [f.name for f in arosics.keep_products("s", "equatorial", out, dest)] == ["s_equatorial.gcps"]
     (out / "s_equatorial_glt.tif").write_text("glt")
-    assert [f.name for f in solve.keep_products("s", "equatorial", out, dest)] == ["s_equatorial_glt.tif"]
-    assert solve.keep_products("s", "equatorial", out, dest) == []
+    assert [f.name for f in arosics.keep_products("s", "equatorial", out, dest)] == ["s_equatorial_glt.tif"]
+    assert arosics.keep_products("s", "equatorial", out, dest) == []
     (out / "s_equatorial.gcps").write_text("re-solved")
-    assert [f.name for f in solve.keep_products("s", "equatorial", out, dest)] == ["s_equatorial.gcps"]
+    assert [f.name for f in arosics.keep_products("s", "equatorial", out, dest)] == ["s_equatorial.gcps"]
     assert (dest / "s_equatorial.gcps").read_text() == "re-solved"
 
 

@@ -11,7 +11,9 @@ raises `DeadlineReached` before starting.
 
 from __future__ import annotations
 
+import filecmp
 import json
+import shutil
 import time
 import traceback
 from dataclasses import replace
@@ -226,7 +228,7 @@ def geometry(
     beside `fgcps`. `shape` is the (ny, nx) of the L1 crop starting at absolute Scan `row0`; `fl1` the L1 cube
     for SNR and the PAN-incomplete flag."""
     from iirspy.georef import backplanes as bp
-    from iirspy.georef.geometry import Geometry, quality
+    from iirspy.georef.geometry import Geometry
     from iirspy.georef.georef import scene_topo
 
     t_start = time.time()
@@ -253,7 +255,6 @@ def geometry(
         qa |= bp.qa_mask("no_topo")
 
     grade = summary.get("solve_grade")
-    agree = [v["p95_m"] for v in summary.get("overlap_agreement", {}).values()]
     tie = bp._tie_point_residual(summary.get("per_chunk_fit", []))
     sidecars = {"gcps": fgcps, "summary": fsum if summary else None, "topo": ftopo}
     return Geometry.from_arrays(
@@ -264,7 +265,7 @@ def geometry(
         loc,
         obs["bands"],
         qa,
-        quality("arosics", GRADE_OF[grade], max(agree) if agree else None),
+        _quality(summary),
         sidecars={k: Path(v) for k, v in sidecars.items() if v},
         provenance=[
             {
@@ -282,6 +283,197 @@ def geometry(
             "PROVENANCE_DEM_ROOTS": ":".join(str(p) for p in paths.dem_roots),
         },
     )
+
+
+def _quality(summary: dict) -> dict:
+    from iirspy.georef.geometry import quality
+
+    agree = [v["p95_m"] for v in summary.get("overlap_agreement", {}).values()]
+    return quality("arosics", GRADE_OF[summary.get("solve_grade")], max(agree) if agree else None)
+
+
+# Copied to `keep`, each after the `<sid>_<group>` prefix every work-dir file carries. Everything else (chunk
+# gcps/fits/plan, hillshades, the L1 and its vrt) is the scratch restart cache.
+KEEP_GLOBS = (".gcps", "_glt.tif", "_loc.tif", "_solve_summary.json", "_solve.log", "_L1_b*.tif")
+
+
+def keep_products(sid: str, group: str, out: Path, dest: Path) -> list[Path]:
+    """Copy the durable products in `out` (see `KEEP_GLOBS`) to `dest`, skipping any already there unchanged.
+    Returns what was copied."""
+    dest.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for pattern in KEEP_GLOBS:
+        for f in sorted(out.glob(f"{sid}_{group}{pattern}")):
+            d = dest / f.name
+            if d.exists() and filecmp.cmp(f, d):
+                continue
+            shutil.copy2(f, d)
+            copied.append(f)
+    return copied
+
+
+def _write_and_keep(ws: Workspace, sid: str, group: str, summary: dict, dest: Path | None) -> None:
+    """Write the solve summary to the work dir and, with `dest`, copy the products there. Before LOC
+    (`summary["loc"]` None) any earlier solve's LOC is deleted from both, since it would pair with the wrong GCPs."""
+    if summary["loc"] is None:
+        for d in (ws.dir, dest or ws.dir):
+            (d / f"{sid}_{group}_loc.tif").unlink(missing_ok=True)
+    ws.path(f"{sid}_{group}_solve_summary.json").write_text(json.dumps(summary, indent=1, default=str))
+    if dest:
+        ws.log(f"kept {len(keep_products(sid, group, ws.dir, dest))} file(s) -> {dest}")
+
+
+def solve_group(
+    ws: Workspace,
+    *,
+    sid: str,
+    group: str,
+    row0: int,
+    shape: tuple[int, int],
+    paths,
+    cfg,
+    fgeom,
+    flabel,
+    kernels,
+    frames: Path,
+    ftif: Path,
+    only: str | None = None,
+    hillshade_only: bool = False,
+    decay_m: float | None = None,
+    tweaks: dict | None = None,
+):
+    """Plan the group's chunks (`only`: comma-separated indices) and solve them against `ftif`, the one-band L1 crop
+    starting at Scan `row0`. Unset `decay_m` and `tweaks` (keys of `TWEAK_DEFAULTS`) take `cfg`'s values.
+    Returns (chunks, results, consensus info); results are empty for `hillshade_only`."""
+    chunks = plan_group_chunks(ws, sid, group, fgeom, paths.dem_roots, row0, shape[0], only, cfg.niter)
+    decay_m = cfg.decay_m if decay_m is None else decay_m
+    tweaks = tweaks or {}
+    tweaks = {k: getattr(cfg, k) if tweaks.get(k) is None else tweaks[k] for k in TWEAK_DEFAULTS}
+    results, info = solve_chunks(
+        ws, sid, group, frames, kernels, chunks, cfg, ftif, fgeom, flabel, decay_m, tweaks, hillshade_only
+    )
+    return chunks, results, info
+
+
+def solve(
+    *,
+    ws: Workspace,
+    sid: str,
+    group: str,
+    row0: int,
+    shape: tuple[int, int],
+    paths,
+    cfg,
+    fgeom,
+    flabel,
+    kernels,
+    frames: Path,
+    ftif: Path,
+    scan_source: str,
+    lat_range: tuple[float, float],
+    keep: Path | None = None,
+    decay_m: float | None = None,
+    tweaks: dict | None = None,
+):
+    """Solve every chunk, merge with a cross-fade, warp, and write the merged GCPs, GLT, LOC and solve summary to
+    `ws.dir` (and `keep`, the GCPs and GLT before the LOC). Returns the group's `Geometry` with those as sidecars;
+    its LOC is read on demand."""
+    from iirspy import georef
+    from iirspy.georef.geometry import Geometry
+
+    t_start = time.time()
+    chunks, results, consensus_info = solve_group(
+        ws,
+        sid=sid,
+        group=group,
+        row0=row0,
+        shape=shape,
+        paths=paths,
+        cfg=cfg,
+        fgeom=fgeom,
+        flabel=flabel,
+        kernels=kernels,
+        frames=frames,
+        ftif=ftif,
+        decay_m=decay_m,
+        tweaks=tweaks,
+    )
+    if len(results) < min(2, len(chunks)):
+        raise RuntimeError("fewer than 2 chunks solved -- nothing to merge")
+
+    results.sort(key=lambda r: r["chunk"]["i"])
+    used_chunks = [r["chunk"] for r in results]
+    merged, agree_summary = merge_gcps(ws, results)
+
+    fgcps = ws.path(f"{sid}_{group}.gcps")
+    save_gcps(fgcps, merged)
+    ws.log(f"\nmerged gcps: {len(merged)} points -> {fgcps}")
+
+    # The L1 raster holds a geotransform for `row0`, so its GCPs ride in a sidecar; without it the kept
+    # raster is camera-space only and nothing but iirspy can place it.
+    ws.log(f"gcp vrt: {georef.save_gcp_vrt(ftif, gcp_list(merged), georef.stereo_crs(group))}")
+
+    final_cfg, final = warp_merged(ws, sid, group, merged, used_chunks, cfg, ftif)
+    final_shape = list(final.shape)
+    del final
+    fglt = make_glt(sid, group, merged, cfg, row0, str(ws.dir), overwrite=True)
+    ws.log(f"glt: {fglt}")
+
+    summary = {
+        "sid": sid,
+        "group": group,
+        "scan_source": scan_source,
+        "lat_range": lat_range,
+        "solve_lat_range": ck.group_lat_range(group),
+        "width_range_km": WIDTH_RANGE_KM,
+        "overlap_frac": OVERLAP_FRAC,
+        "n_chunks": len(chunks),
+        "n_chunks_solved": len(results),
+        "chunks": chunks,
+        "per_chunk_fit": [r["fit"] for r in results],
+        "overlap_agreement": agree_summary,
+        "solve_grade": solve_grade(agree_summary, max(c["p95_stop_m"] for c in used_chunks)),
+        **consensus_info,
+        "n_merged_gcps": len(merged),
+        "scan0": row0,
+        "glt": fglt.name,
+        "loc": None,
+        "final_aoi_m": final_cfg.aoi,
+        "final_shape": final_shape,
+        "total_s": round(time.time() - t_start, 1),
+    }
+    # Keep the GCPs and GLT before LOC: a LOC that dies (OOM, wall clock) must not take the solve with it.
+    _write_and_keep(ws, sid, group, summary, keep)
+    floc = make_loc(ws, sid, group, paths.dem_roots, merged, row0, str(ws.dir), [r["fit"] for r in results], True)
+    summary |= {"loc": floc.name, "total_s": round(time.time() - t_start, 1)}
+    ws.log(f"\ndone in {summary['total_s']}s.")
+    _write_and_keep(ws, sid, group, summary, keep)
+
+    return Geometry(
+        sid,
+        group,
+        row0,
+        "arosics",
+        _quality(summary),
+        sidecars={"gcps": fgcps, "glt": fglt, "loc": floc, "summary": ws.path(f"{sid}_{group}_solve_summary.json")},
+        provenance=[
+            {
+                "step": "georef",
+                "method": "arosics",
+                "version": IIRSPY_VERSION,
+                "inputs": {"solve_grade": summary["solve_grade"], "n_gcps": len(merged)},
+                "wall_s": summary["total_s"],
+            }
+        ],
+    )
+
+
+def run(*, merged: dict | None = None, ws: Workspace | None = None, **inputs):
+    """The `arosics` georef method: `geometry` from already-solved `merged` GCPs, else `solve` first."""
+    if merged is not None:
+        return geometry(merged=merged, ws=ws, **inputs)
+    assert ws is not None, "solving needs a Workspace"  # noqa: S101
+    return solve(ws=ws, **inputs)
 
 
 def warp_merged(ws: Workspace, sid: str, group: str, merged: dict, used_chunks: list[dict], cfg0, ftif: Path):

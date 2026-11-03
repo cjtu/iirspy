@@ -46,7 +46,7 @@ from iirspy.georef.georef import window_of as window_of
 from iirspy.georef.georef import xy_to_lonlat as xy_to_lonlat
 from iirspy.georef.georef import xyz_to_lonlat as xyz_to_lonlat
 
-GEOREF: dict[str, Callable[..., Geometry]] = {"issdc": issdc.geometry, "arosics": arosics.geometry}
+GEOREF: dict[str, Callable[..., Geometry]] = {"issdc": issdc.geometry, "arosics": arosics.run}
 
 
 def run_georef(method: str, *, ws=None, **inputs) -> Geometry:

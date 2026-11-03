@@ -12,7 +12,7 @@ def geometry(*, sid: str, group: str, fgeom, flabel, fspm, shape: tuple[int, int
     ny, nx = shape
     scans = row0 + np.arange(ny)
     tl = ancillary.get_line_times(flabel)[scans]
-    lon, lat, _ = ancillary.geom2grid(fgeom, (-180, 180, -90, 90), xs=np.arange(nx), ys=scans)
+    lon, lat, _ = ancillary.geom2grid(fgeom, xs=np.arange(nx), ys=scans, xyextent=(0, nx - 1, scans[0], scans[-1]))
 
     def per_line(col):
         return np.broadcast_to(ancillary.get_spm_interpolator(fspm, col)(tl)[:, None], (ny, nx))

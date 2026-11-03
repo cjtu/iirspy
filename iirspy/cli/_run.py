@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import datetime
 import errno
 import hashlib
@@ -7,14 +8,19 @@ import json
 import os
 import shutil
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, fields
 from pathlib import Path
+
+import numpy as np
+import rasterio
 
 from iirspy import instrument, io
 from iirspy.georef import ancillary
 from iirspy.georef import chunks as ck
-from iirspy.l1.config import CALIB
+from iirspy.l1.config import CALIB, L1Config
 from iirspy.l1.frames import table_key as frames_key
+from iirspy.l2.config import L2Config
 from iirspy.workspace import Workspace, ncpu, phase
 
 
@@ -354,6 +360,12 @@ def predates_frames(fgcps: Path, fframes: Path) -> bool:
     return not fframes.exists() or fgcps.stat().st_mtime < fframes.stat().st_mtime
 
 
+def clean_work(ws: Workspace, clean: bool) -> None:
+    if clean:
+        shutil.rmtree(ws.dir, ignore_errors=True)
+        print(f"removed work dir {ws.dir}", flush=True)
+
+
 def keep(ws: Workspace, dest_dir: str | None, *files: Path) -> None:
     """Copy products out of the work dir into `dest_dir` (a no-op without one)."""
     if not dest_dir:
@@ -392,3 +404,196 @@ def resource_report(img) -> str:
     limit = os.environ.get("SLURM_MEM_PER_NODE")
     of = f" of --mem={int(limit) / 1024:.0f}G ({100 * peak_mb / int(limit):.0f}%)" if limit else ""
     return f"L1 {img.shape} in {len(ychunks)} y-blocks of <={block_mb:.0f} MB for {ncpu()} workers ({busy}); peak RSS {peak_mb:.0f} MB{of}"
+
+
+def solve_quality(fgcps: Path) -> dict:
+    """converged/corr/n_merged_gcps/overlap agreement from the solve's own summary json, if kept
+    next to the GCPs -- so a suspect refl product points at the registration it was built on."""
+    fsummary = fgcps.parent / f"{fgcps.stem}_solve_summary.json"
+    if not fsummary.exists():
+        return {}
+    s = json.loads(fsummary.read_text())
+    fits = s.get("per_chunk_fit", [])
+    return {
+        "converged": all(f.get("converged") for f in fits) if fits else None,
+        "corr": [f.get("corr") for f in fits],
+        "n_merged_gcps": s.get("n_merged_gcps"),
+        "overlap_agreement": s.get("overlap_agreement"),
+    }
+
+
+def _json_value(v: str):
+    """A `--l2-<field>` value: JSON when it parses (numbers, true/false, null, lists), else the string."""
+    try:
+        return json.loads(v)
+    except json.JSONDecodeError:
+        return v
+
+
+def l2_config(args) -> L2Config:
+    """The preset `args.l2` with every given `--l2-<field>` applied."""
+    over = {f.name: getattr(args, f"l2_{f.name}") for f in fields(L2Config) if hasattr(args, f"l2_{f.name}")}
+    return L2Config.preset(args.l2, **over)
+
+
+def l1_config(args) -> L1Config:
+    """The preset `args.l1` with every given `--l1-<field>` and then `--fix-frames`/`--fill-frames` applied."""
+    over = {f.name: getattr(args, f"l1_{f.name}") for f in fields(L1Config) if hasattr(args, f"l1_{f.name}")}
+    over |= {k: v for k in ("fix_frames", "fill_frames") if (v := getattr(args, k)) is not None}
+    return L1Config.preset(args.l1, **over)
+
+
+def add_config_args(ap) -> None:
+    """`--fix-frames`/`--fill-frames`, `--l1` and `--l2` presets and one `--l1-<field>`/`--l2-<field>` override per config field."""
+    for step, h in (
+        ("fix", "move each 4-band group onto true frames"),
+        ("fill", "rebuild the lost frames (implies fix)"),
+    ):
+        ap.add_argument(
+            f"--{step}-frames",
+            nargs="?",
+            const=True,
+            type=_json_value,
+            default=None,
+            help=f"{h}; unset keeps the L1 preset (iirspy L1: on, issdc-nci: off)",
+        )
+    for level, cls in (("l1", L1Config), ("l2", L2Config)):
+        ap.add_argument(f"--{level}", default="iirspy", choices=list(cls.PRESETS), help=f"{cls.__name__} preset")
+        for f in fields(cls):
+            ap.add_argument(
+                f"--{level}-{f.name.replace('_', '-')}",
+                dest=f"{level}_{f.name}",
+                type=_json_value,
+                default=argparse.SUPPRESS,  # absent, not None: `--l2-polish null` is a real override
+                help=f"override {cls.__name__}.{f.name}",
+            )
+
+
+def write_refl_outputs(
+    job: Job,
+    args,
+    *,
+    l1,
+    l2,
+    geo,
+    ftif: Path,
+    fl2: Path,
+    fgcps: Path | None,
+    gcps,
+    cfg,
+    lat_range,
+    bands,
+    scan0: int,
+    gfiles: dict,
+    sun: tuple,
+    kernels: list,
+    fgeom: Path,
+    flabel: Path,
+    prov_kw: dict,
+    t_start: float,
+) -> None:
+    """L2 sanity stats, the summary and provenance json, tags on the L1/L2 rasters, and the `--keep`/`--keep-l1` copies."""
+    from iirspy.iirs import L2
+    from iirspy.l2 import stats as l2_stats
+
+    ws, sid, group = job.ws, job.sid, job.group
+    nci = args.l2 == "issdc-nci"
+    l2cfg = args.l2_config
+    ftopo = geo.sidecars.get("topo")
+    az, elev, r_sun = sun
+    t_stats = time.time()
+    try:
+        stats = l2_stats.l2_stats(
+            fl2,
+            ftif,
+            np.asarray(l2.img.solar_inc),
+            geo.loc.lat.values,
+            emi=geo.obs.sensor_zenith.values,
+            phase=geo.obs.phase.values,
+            sdist=float(l2.img.attrs["solar_distance_au"]),
+        )
+    except Exception as e:  # sanity stats must never fail a refl run
+        stats = {"error": f"{type(e).__name__}: {e}"}
+    ws.log(f"l2_stats: {time.time() - t_stats:.1f}s {stats.get('error', 'ok')}")
+    fglt = fgcps.parent / f"{sid}_{group}_glt.tif" if fgcps else None
+    if fglt is not None:
+        ws.log(f"glt: {fglt}" if fglt.is_file() else f"glt: {fglt} not found -- iirs-solve-scene should have built it")
+    resources = f"{resource_report(l1.img)}; ncpu={ncpu()}"
+    ws.log(resources)
+
+    notes = json.loads(l1.img.attrs["empirical_notes"]) if "empirical_notes" in l1.img.attrs else None
+    topo_tags = {}
+    if ftopo:
+        with rasterio.open(ftopo) as src:
+            topo_tags = {
+                "path": str(ftopo),
+                "bands_used": src.tags().get("bands_used"),
+                "n_pieces": src.tags().get("n_pieces"),
+            }
+    summary = {
+        "sid": sid,
+        "group": group,
+        "resources": resources,
+        "georef": geo.method,
+        "geometry_quality": geo.quality,
+        "gcps": str(fgcps) if fgcps else None,
+        "n_gcps": len(gcps) if gcps else None,
+        "solve_quality": solve_quality(fgcps) if fgcps else None,
+        "lat_range": list(lat_range),
+        "bands": bands,
+        "l2_preset": args.l2,
+        "l1_source": "issdc-nci" if nci else "iirspy",
+        "l2_config": l2cfg.to_attrs(),
+        "topo": topo_tags,
+        "aoi_m": list(cfg.aoi) if cfg else None,
+        "scan0": scan0,
+        "l1": ftif.name,
+        "l2": fl2.name,
+        "obs": gfiles["obs"].name,
+        "obs_sensor_source": geo.tags["SENSOR_SOURCE"],
+        "geometry": {k: f.name for k, f in gfiles.items()},
+        "glt": str(fglt) if fglt else None,
+        "sun_az_grid_deg": az,
+        "sun_elev_deg": elev,
+        "sun_angular_radius_deg": r_sun,
+        "l1_empirical_notes": notes,
+        "l2_diagnostics": {k: l2.img.attrs.get(k) for k in L2.DIAGNOSTICS},
+        "l2_stats": stats,
+        "total_s": round(time.time() - t_start, 1),
+    }
+    fsummary = ws.path(f"{sid}_{group}_refl_summary.json")
+    fsummary.write_text(json.dumps(summary, indent=1, default=str))
+    ws.log(f"\ndone in {summary['total_s']}s.")
+
+    prov_inputs = {
+        "nri_zip": file_info(job.zip),
+        "gcps": file_info(fgcps, sha=True) if fgcps else None,
+        "frames": {**file_info(job.frames), "key": frames_key(job.frames)} if job.frames else None,
+        "label": file_info(flabel),
+        "geometry_csv": file_info(fgeom),
+        "geometry": geo.provenance,
+        "spice_kernels": [str(k) for k in kernels],
+        "topo": file_info(ftopo) if ftopo else None,
+    }
+    prov = io.provenance(
+        **prov_kw,
+        l2_preset=args.l2,
+        l2_config=l2cfg.to_attrs(),
+        inputs=prov_inputs,
+        empirical_notes=notes,
+        steps=json.loads(l2.img.attrs["provenance"]),
+    )
+    fprov = ws.path(f"{sid}_{group}_provenance.json")
+    fprov.write_text(json.dumps(prov, indent=1, default=str))
+    for f in (ftif, fl2):
+        with rasterio.open(f, "r+") as dst:
+            dst.update_tags(IIRS_PROVENANCE=json.dumps(prov, default=str))
+
+    sidecars = [
+        f for f in (ftif.with_name(ftif.stem + "_empirical.npz"), ftif.with_name(ftif.stem + "_snr.tif")) if f.exists()
+    ]
+    vrt = lambda f: [f.with_suffix(".vrt")] if f.with_suffix(".vrt").exists() else []
+    keep(ws, args.keep_l1, ftif, *vrt(ftif), *sidecars, fprov)
+    keep(ws, args.keep, fl2, *vrt(fl2), *gfiles.values(), fsummary, fprov, job.logfile)
+    if ftopo and fgcps:  # geometry, so it lands beside the GCPs rather than with L2
+        keep(ws, str(fgcps.parent) if args.keep else None, ftopo)

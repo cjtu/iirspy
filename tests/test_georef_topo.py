@@ -16,21 +16,6 @@ def test_slope_aspect_on_a_known_plane():
     assert georef.slope_aspect(0.0, -np.tan(np.radians(10)))[0] == pytest.approx(10.0)
 
 
-def test_topo_product_round_trips_into_the_l2_reader(tmp_path):
-    """save_topo -> photometry.load_slope_az must come back band-for-band, names and all."""
-    from iirspy.l2 import photometry
-
-    slope = np.linspace(0, 30, 12).reshape(4, 3).astype("float32")
-    aspect = np.linspace(0, 359, 12).reshape(4, 3).astype("float32")
-    lit = np.linspace(0, 1, 12).reshape(4, 3).astype("float32")
-    f = georef.save_topo(tmp_path / "topo.tif", slope, aspect, lit, tags={"az_grid": 22.0, "elev": 3.6})
-    s, a, li, sun = photometry.load_slope_az(f)
-    assert sun == (22.0, 3.6)  # the frame slope/aspect live in must survive the write
-    np.testing.assert_allclose(s.values, slope)
-    np.testing.assert_allclose(a.values, aspect)
-    np.testing.assert_allclose(li.values, lit)
-
-
 def test_a_windowed_warp_is_the_same_pixels_as_the_full_one():
     """project() must be extent-independent: rasterio's default 0.125 px tolerance refits the TPS
     per destination chunk, so the chunking -- and the answer -- follows the output window."""

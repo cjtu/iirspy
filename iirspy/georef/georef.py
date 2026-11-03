@@ -718,12 +718,10 @@ def save_topo(fout, slope, aspect, lit, tags=None, sun_az=None, sun_elev=None):
     """Write the camera-space topo product: a 3- or 5-band float32 GeoTIFF, bands named for L2.
 
     `sun_az`/`sun_elev`, if given, land in extra bands 4-5: over a whole strip the tangent-plane
-    sun moves too much for `iirs.py`'s single-scalar-tag convention, so `iirspy.l2.photometry.load_slope_az`
-    hands these back as (y, x) arrays instead. Either a per-row (y,) array (broadcast across x) or
+    sun moves too much for a single-scalar tag. Either a per-row (y,) array (broadcast across x) or
     an already-per-pixel (y, x) one (`georef.sun_geometry_rows`'s own output) is accepted.
 
-    No CRS or transform -- this is camera space, and iirspy.l2.photometry.load_slope_az matches it to the
-    L1 cube by shape. Small enough (a few MB) to ship beside every L1.
+    No CRS or transform -- this is camera space. Small enough (a few MB) to ship beside every L1.
     """
     bands = [("slope", slope), ("aspect", aspect), ("lit_frac", lit)]
     if sun_az is not None:

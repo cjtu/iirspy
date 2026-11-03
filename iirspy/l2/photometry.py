@@ -140,44 +140,18 @@ def local_angles(slope, aspect, sun_az, sun_elev, view_az=0.0, view_elev=90.0):
     return cos_inc, cos_view, phase_angle(sun_az, sun_elev, view_az, view_elev)
 
 
-def _sun_tags(attrs):
-    """(azimuth, elevation) in the product's own frame from its tags, or None if it carries none."""
-    try:
-        return float(attrs["az_grid"]), float(attrs["elev"])
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
 def load_slope_az(slope_az, like=None):
-    """(slope, aspect, lit, sun) from a camera-space slope/aspect product; `lit` is 1.0 when it has none.
+    """(slope, aspect, lit, sun) from a `(slope, aspect[, lit[, sun]])` tuple; `lit` is 1.0 when absent.
 
-    `slope_az` is a raster with bands slope/aspect[/lit_frac], a tuple of
-    those DataArrays, or a Dataset carrying them as variables. `lit` is the fraction of the solar
-    disk the terrain leaves visible. `sun` is the (azimuth, elevation) the product's tags record,
-    in the same tangent-plane frame as its slope and aspect, or None.
+    `lit` is the fraction of the solar disk the terrain leaves visible. `sun` is the (azimuth, elevation)
+    in the same tangent-plane frame as slope and aspect, or None.
 
     When `like` is given the fields are matched to its y/x: a shape check and a coordinate
     transplant, never a resample.
     """
-    sun = None
-    if isinstance(slope_az, tuple):
-        # (slope, aspect[, lit[, sun]]) -- what this function returns, so it round-trips
-        slope, aspect, *rest = slope_az
-        lit = rest[0] if rest else None
-        sun = rest[1] if len(rest) > 1 else None
-    elif isinstance(slope_az, xr.Dataset):
-        slope, aspect = slope_az["slope"], slope_az["aspect"]
-        lit = slope_az.get("lit_frac")
-        sun = _sun_tags(slope_az.attrs)
-    else:
-        da = slope_az if isinstance(slope_az, xr.DataArray) else xr.open_dataarray(slope_az, engine="rasterio")
-        names = [str(n) for n in np.atleast_1d(da.attrs.get("long_name", ["slope", "aspect", "lit_frac"]))]
-        pick = lambda n: da.isel(band=names.index(n), drop=True) if n in names else None
-        slope, aspect, lit = pick("slope"), pick("aspect"), pick("lit_frac")
-        if slope is None or aspect is None:
-            raise ValueError(f"slope_az product has bands {names}; need at least slope and aspect")
-        sun_az, sun_elev = pick("sun_az"), pick("sun_elev")
-        sun = (sun_az, sun_elev) if sun_az is not None and sun_elev is not None else _sun_tags(da.attrs)
+    slope, aspect, *rest = slope_az
+    lit = rest[0] if rest else None
+    sun = rest[1] if len(rest) > 1 else None
     if like is not None:
         if slope.shape != like.shape:
             raise ValueError(
@@ -186,7 +160,7 @@ def load_slope_az(slope_az, like=None):
         coords = {d: like[d] for d in like.dims if d in like.coords}
         conv = lambda v: None if v is None else xr.DataArray(np.asarray(v), coords=coords, dims=like.dims)
         slope, aspect, lit = conv(slope), conv(aspect), conv(lit)
-        if isinstance(sun, tuple) and hasattr(sun[0], "shape"):  # per-row arrays, not an (az, elev) tag pair
+        if isinstance(sun, tuple) and hasattr(sun[0], "shape"):
             sun = (conv(sun[0]), conv(sun[1]))
     return slope, aspect, 1.0 if lit is None else lit, sun
 

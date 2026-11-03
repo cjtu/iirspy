@@ -37,3 +37,7 @@
 ::: iirspy.georef.geometry
 
 ::: iirspy.georef.ancillary
+
+::: iirspy.georef.issdc
+
+::: iirspy.georef.arosics
