@@ -19,9 +19,9 @@ from pathlib import Path
 
 import numpy as np
 
-from iirspy import __version__
 from iirspy.georef import ancillary
 from iirspy.georef import chunks as ck
+from iirspy.io import IIRSPY_VERSION
 from iirspy.l1.frames import table_key as frames_key
 from iirspy.workspace import Workspace, ncpu, phase
 
@@ -123,8 +123,8 @@ def _cached_chunk(
         return None
     fit = json.loads(ffit.read_text())
     same = (
-        __version__ != "0+source"
-        and fit.get("version") == __version__
+        IIRSPY_VERSION != "0+source"
+        and fit.get("version") == IIRSPY_VERSION
         and fit.get("band") == c["band"]
         and _dem_key(fit.get("dem_near", "")) == _dem_key(c["dem_near"])
         and _dem_key(fit.get("dem_far", "")) == _dem_key(c["dem_far"])
@@ -198,6 +198,90 @@ def make_loc(
         backplanes.write_loc(floc, loc, sid, row0=scan0, fits=fits, dem_roots=dem_roots)
     ws.log(f"loc: {floc} {lon.shape}, peak RSS {peak0:.0f} -> {_peak_mb():.0f} MB")
     return floc
+
+
+GRADE_OF = {"tight": "pass", "acceptable": "warn", "failed": "fail", None: "warn"}
+
+
+def geometry(
+    *,
+    sid: str,
+    group: str,
+    merged: dict,
+    scan0: int,
+    shape: tuple[int, int],
+    paths,
+    cfg,
+    fgeom,
+    flabel,
+    kernels,
+    fl1=None,
+    stage_dir=None,
+    fgcps=None,
+    topo_dir=None,
+    ws=None,
+):
+    """`Geometry` of one solved group from its merged GCP lattice: LOC from the lattice + LOLA radius, topo
+    (when `topo_dir` is given) and SPICE sun/sensor terms from that LOC, QA from the lattice and the solve summary
+    beside `fgcps`. `shape` is the (ny, nx) of the L1 crop starting at absolute Scan `scan0`; `fl1` the L1 cube
+    for SNR and the PAN-incomplete flag."""
+    from iirspy.georef import backplanes as bp
+    from iirspy.georef.geometry import Geometry, quality
+    from iirspy.georef.georef import scene_topo
+
+    t_start = time.time()
+    ny, nx = shape
+    lon, lat, radius = bp.group_loc_core(merged, group, paths.dem_roots, nrow=ny, ncol=nx)
+    loc = {"lon": lon, "lat": lat, "radius": radius}
+    ftopo = (
+        scene_topo(sid, group, lon, lat, fgeom, flabel, cfg, kernels, topo_dir, paths.dem_roots, scan0=scan0)
+        if topo_dir
+        else None
+    )
+    obs = bp.obs_from_loc(sid, group, loc, scan0, merged, paths, ftopo, fl1, stage_dir)
+
+    fsum = Path(fgcps).with_name(f"{Path(fgcps).stem}_solve_summary.json") if fgcps else None
+    summary = json.loads(fsum.read_text()) if fsum is not None and fsum.exists() else {}
+    qa = bp.build_qa(
+        loc,
+        obs,
+        merged,
+        bp.chunk_overlaps(summary.get("chunks", [])),
+        bp.pan_incomplete(fl1) if fl1 else None,
+    )
+    if ftopo is None:
+        qa |= bp.qa_mask("no_topo")
+
+    grade = summary.get("solve_grade")
+    agree = [v["p95_m"] for v in summary.get("overlap_agreement", {}).values()]
+    tie = bp._tie_point_residual(summary.get("per_chunk_fit", []))
+    sidecars = {"gcps": fgcps, "summary": fsum if summary else None, "topo": ftopo}
+    return Geometry.from_arrays(
+        sid,
+        group,
+        scan0,
+        "arosics",
+        loc,
+        obs["bands"],
+        qa,
+        quality("arosics", GRADE_OF[grade], max(agree) if agree else None),
+        sidecars={k: Path(v) for k, v in sidecars.items() if v},
+        provenance=[
+            {
+                "step": "georef",
+                "method": "arosics",
+                "version": IIRSPY_VERSION,
+                "inputs": {"gcps": str(fgcps), "solve_grade": grade, "n_gcps": len(merged)},
+                "wall_s": round(time.time() - t_start, 1),
+            }
+        ],
+        tags={
+            "SENSOR_SOURCE": obs["sensor_source"],
+            "TIE_POINT_RESIDUAL_P50_M": tie["p50_m"] if tie else "unavailable",
+            "TIE_POINT_RESIDUAL_P95_M": tie["p95_m"] if tie else "unavailable",
+            "PROVENANCE_DEM_ROOTS": ":".join(str(p) for p in paths.dem_roots),
+        },
+    )
 
 
 def warp_merged(ws: Workspace, sid: str, group: str, merged: dict, used_chunks: list[dict], cfg0, ftif: Path):
@@ -503,7 +587,7 @@ def _solve_one(ws, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flab
 
     fit = {
         "chunk": i,
-        "version": __version__,
+        "version": IIRSPY_VERSION,
         "reference": "wac" if wac else "hillshade",
         "band": c["band"],
         "dem_near": c["dem_near"],

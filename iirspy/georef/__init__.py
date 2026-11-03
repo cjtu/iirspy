@@ -1,3 +1,7 @@
+from collections.abc import Callable
+
+from iirspy.georef import arosics, issdc
+from iirspy.georef.geometry import Geometry as Geometry
 from iirspy.georef.georef import LONLAT as LONLAT
 from iirspy.georef.georef import MOON_RADIUS_M as MOON_RADIUS_M
 from iirspy.georef.georef import NODATA as NODATA
@@ -5,8 +9,6 @@ from iirspy.georef.georef import WAC_MIN_ELEV_DEG as WAC_MIN_ELEV_DEG
 from iirspy.georef.georef import GeorefConfig as GeorefConfig
 from iirspy.georef.georef import apply_glt as apply_glt
 from iirspy.georef.georef import camera_gradients as camera_gradients
-from iirspy.georef.georef import camera_topo as camera_topo
-from iirspy.georef.georef import camera_xy as camera_xy
 from iirspy.georef.georef import coarse_shift as coarse_shift
 from iirspy.georef.georef import crop_glt as crop_glt
 from iirspy.georef.georef import displacement_field as displacement_field
@@ -43,3 +45,9 @@ from iirspy.georef.georef import use_wac as use_wac
 from iirspy.georef.georef import window_of as window_of
 from iirspy.georef.georef import xy_to_lonlat as xy_to_lonlat
 from iirspy.georef.georef import xyz_to_lonlat as xyz_to_lonlat
+
+GEOREF: dict[str, Callable[..., Geometry]] = {"issdc": issdc.geometry, "arosics": arosics.geometry}
+
+
+def run_georef(method: str, *, ws=None, **inputs) -> Geometry:
+    return GEOREF[method](ws=ws, **inputs)

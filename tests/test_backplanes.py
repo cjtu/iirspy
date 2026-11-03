@@ -45,16 +45,6 @@ def _paths(tmp_path, **kw):
     })
 
 
-def test_group_info_row_range_uses_gcps_extent_not_the_full_chunk_plan(tmp_path):
-    paths = _paths(tmp_path)
-    sid = "20210101T0000000000"
-    _write_group(paths, sid, "south", scan0=500, rows=range(0, 11, 5), cols=range(0, 3))
-    gi = bp.group_info(sid, "south", paths)
-    assert gi.scan0 == 500
-    assert gi.row_range == (500, 510)
-    assert gi.chunk_rows == [(0, 500, 510)]
-
-
 # ------------------------------------------------------------------------------------------
 # LOC
 # ------------------------------------------------------------------------------------------
@@ -277,11 +267,11 @@ def test_build_qa_bit_packing_no_geometry_and_shadow_lit_disagreement():
     lit = np.array([[1.0, 1.0], [0.1, 0.1], [0.9, 0.9]])  # row1 in geometric shadow, row2 lit
     snr = np.array([[0.0, 0.0], [5.0, 5.0], [0.1, 0.1]])  # row1 also reads as lit -> bit4&5 disagree
     obs = {"bands": {"lit_frac": lit, "snr": snr}, "groups": {}}
-    qa = bp.build_qa("dummy_sid", loc, obs, None, saturation=None)
+    qa = bp.build_qa(loc, obs)
 
-    no_geom = 1 << bp.QA_BITS["no_geometry"]
-    shadow = 1 << bp.QA_BITS["in_geometric_shadow"]
-    is_lit = 1 << bp.QA_BITS["is_lit"]
+    no_geom = bp.qa_mask("no_geometry")
+    shadow = bp.qa_mask("in_geometric_shadow")
+    is_lit = bp.qa_mask("is_lit")
     assert (qa[0] & no_geom).all()
     assert not (qa[1] & no_geom).any()
     assert (qa[1] & shadow).all() and (qa[1] & is_lit).all()  # the disagreement case
@@ -329,7 +319,7 @@ def test_write_qa_tags_name_every_bit(tmp_path):
     with rasterio.open(f) as src:
         tags = src.tags()
         assert tags["IIRS_PRODUCT"] == "QA"
-        for bit in range(8):
+        for bit in range(len(bp.QA_BITS)):
             assert f"QA_BIT_{bit}" in tags
         assert tags["GEOM_SHADOW_LIT"] == str(bp.GEOM_SHADOW_LIT)
 

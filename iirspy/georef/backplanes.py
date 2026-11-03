@@ -1,7 +1,7 @@
 """Camera-space backplanes (M3-style LOC/OBS/QA) for one solve group, absolute-scan-row keyed."""
 
 import json
-from dataclasses import dataclass
+from collections.abc import Sequence
 from itertools import pairwise
 from pathlib import Path
 
@@ -12,8 +12,8 @@ from scipy.interpolate import RectBivariateSpline
 from scipy.ndimage import map_coordinates
 from scipy.spatial import Delaunay, cKDTree
 
-from iirspy import instrument, io
-from iirspy.georef import ancillary, arosics
+from iirspy import io
+from iirspy.georef import ancillary
 from iirspy.georef import chunks as ck
 from iirspy.georef.georef import (
     MOON_RADIUS_M,
@@ -27,7 +27,6 @@ from iirspy.georef.georef import (
     xy_to_lonlat,
 )
 from iirspy.instrument import PAN_BANDS
-from iirspy.l1 import radiometry
 from iirspy.l1.empirical import (
     MIN_ROWS,
     SHADOW_SNR,
@@ -43,46 +42,10 @@ AU_M = 1.495978707e11
 GEOM_SHADOW_LIT = 0.5  # lit fraction below this: sun centre below the local LOLA horizon
 
 
-@dataclass
-class GroupInfo:
-    group: str
-    scan0: int
-    row_range: tuple[int, int]  # absolute scan rows, inclusive, from the group's own .gcps extent
-    chunk_rows: list[tuple[int, int, int]]  # (chunk i, absolute row0, absolute row1)
-
-
-def group_info(sid: str, group: str, paths: io.Paths) -> GroupInfo:
-    """Absolute-scan row range and per-chunk row ranges for one solved group.
-
-    The solve summary is authoritative: `<sid>_<group>_chunks.json` holds the same pre-solve `chunks` plan, but only
-    the summary carries `scan0` and is written once the merge actually succeeds. The gcps file's
-    own row extent (not the chunk plan) sets `row_range`, since a partial merge can fall short of
-    the last planned chunk; `chunk_rows` is the plan's chunks clipped to that same extent.
-    """
-    f = ck.recal_dir(sid, paths) / f"{sid}_{group}_solve_summary.json"
-    if not f.exists():
-        raise FileNotFoundError(f"{f} missing: {sid}/{group} was not merged (partial --chunks run?)")
-    data = json.loads(f.read_text())
-    scan0 = int(data["scan0"])
-    gcps = arosics.load_gcps(ck.merged_gcps_path(sid, group, paths))
-    rows = [int(r) for r, _c in gcps]
-    row_range = (scan0 + min(rows), scan0 + max(rows))
-    chunk_rows = [
-        (int(c["i"]), scan0 + int(c["row0"]), scan0 + int(c["row1"])) for c in data["chunks"] if c["row0"] <= max(rows)
-    ]
-    return GroupInfo(group, scan0, row_range, chunk_rows)
-
-
-def chunk_overlaps(gi: GroupInfo) -> list[tuple[int, int, int, int]]:
-    """(row0, row1, chunk_i, chunk_i) absolute-row overlaps between consecutive chunks of one group."""
-
-    out = []
-    rows = sorted(gi.chunk_rows, key=lambda c: c[1])
-    for (ia, a0, a1), (ib, b0, b1) in pairwise(rows):
-        lo, hi = max(a0, b0), min(a1, b1)
-        if lo < hi:
-            out.append((lo, hi, ia, ib))
-    return out
+def chunk_overlaps(chunks: list[dict]) -> list[tuple[int, int]]:
+    """Crop-relative (row0, row1) overlaps between consecutive chunks of a solve summary's `chunks` plan."""
+    rows = sorted((int(c["row0"]), int(c["row1"])) for c in chunks)
+    return [(max(a0, b0), min(a1, b1)) for (a0, a1), (b0, b1) in pairwise(rows) if max(a0, b0) < min(a1, b1)]
 
 
 # ------------------------------------------------------------------------------------------
@@ -232,6 +195,7 @@ def write_loc(
     row0: int = 0,
     fits: list[dict] | None = None,
     dem_roots: tuple[Path, ...] = (),
+    tags: dict | None = None,
 ) -> Path:
     """Write `<sid>_loc.tif`/`.img`: 3 bands lon [deg, 0-360 E], lat [deg, planetocentric], radius
     [m from Moon centre], matching the M3 LOC band order/units. Full strip rows x 250, camera
@@ -262,7 +226,7 @@ def write_loc(
         "TIE_POINT_RESIDUAL_P95_M": tp["p95_m"] if tp else "unavailable",
         "PROVENANCE_IIRSPY_VERSION": io.IIRSPY_VERSION,
         "PROVENANCE_DEM_ROOTS": ":".join(str(p) for p in dem_roots),
-    }
+    } | (tags or {})
     da = _backplane_da(
         [np.asarray(lon, dtype=dtype), np.asarray(lat, dtype=dtype), np.asarray(radius, dtype=dtype)],
         ["longitude", "latitude", "radius"],
@@ -408,32 +372,12 @@ def _facet_cos_i(sun_zen, sun_az, facet_slope, facet_aspect):
     return np.clip(np.cos(z) * np.cos(s) + np.sin(z) * np.sin(s) * np.cos(daz), -1.0, 1.0)
 
 
-def _read_group_topo(sid: str, group: str, paths: io.Paths) -> dict | None:
-    """`<sid>_<group>_topo.tif` (slope, aspect, lit_frac), or `None` if not on disk for this group.
-
-    `aspect` there is map-grid-referenced (the DEM gradient's own projected rows/cols), not the
-    local-true-north the M3 OBS convention needs — `build_obs` corrects it with the same
-    grid/true-north offset `georef.sun_geometry` derives for the hillshade renderer.
-    """
-    return _read_topo(ck.recal_dir(sid, paths) / f"{sid}_{group}_topo.tif")
-
-
 def _read_topo(f: Path) -> dict | None:
     """A `georef.save_topo` product's bands by name, or `None` if `f` is not on disk."""
     if not Path(f).exists():
         return None
     with rasterio.open(f) as src:
         return {src.descriptions[i]: src.read(i + 1) for i in range(src.count)}
-
-
-def _l1_rad_path(sid: str, group: str, paths: io.Paths) -> Path:
-    return ck.recal_dir(sid, paths, "data/recalibrated") / f"{sid}_{group}_l1_rad.tif"
-
-
-def _group_snr(sid: str, group: str, paths: io.Paths) -> np.ndarray | None:
-    """Broadband SNR over `PAN_BANDS`, from the group's own recalibrated L1 cube, or
-    `None` if that cube is not on disk (a group processed only through geometry)."""
-    return _l1_snr(_l1_rad_path(sid, group, paths))
 
 
 def _l1_snr(f: Path) -> np.ndarray | None:
@@ -451,45 +395,9 @@ def _l1_snr(f: Path) -> np.ndarray | None:
     return np.asarray(broadband_snr(P, d0, d1).values, dtype="float32")
 
 
-def _pan_incomplete(sid: str, group: str, paths: io.Paths) -> np.ndarray | None:
-    """Any-PAN-band-NaN mask from the group's L1 cube, or `None` if it is not on disk."""
-    f = _l1_rad_path(sid, group, paths)
-    if not f.exists():
-        return None
-    bands = [read_band(f, b) for b in PAN_BANDS]
-    return np.isnan(np.stack(bands)).any(0)
-
-
-def _pan_saturation_mask(sid: str, group: str, stage_dir: Path, paths: io.Paths) -> np.ndarray | None:
-    """True where any `PAN_BANDS` band's raw DN, run through the per-scene per-element
-    gain/offset LUT, reaches its saturation radiance — the comparison `IIRSData.calibrate_to_rad`
-    makes just before it NaNs the pixel out (that pre-NaN radiance is never itself exposed, and the
-    empirical correction's own dark/flat/smile terms are near-unity broadband scaling, so the
-    per-element LUT path used here is the same threshold, not a materially different one).
-
-    Needs the nri raw cube, extracted here restricted to `PAN_BANDS` (a cube already staged with a
-    superset, e.g. a solve's, is reused). `None` if the nri bundle is not archived for `sid`.
-    """
-    fzip = ck.nri_zip(sid, paths)
-    fgeom = ck.ancillary(sid, paths)["geometry/calibrated"]
-    if fzip is None or fgeom is None:
-        return None
-    from iirspy import L0
-
-    day = sid[:8]
-    stage_dir = Path(stage_dir)
-    if not (stage_dir / f"data/raw/{day}/{fzip.stem}.qub").exists():
-        io.extract(fzip, stage_dir, bands=PAN_BANDS)
-    lat_range = ck.l1_lat_range(group)
-    scan0 = arosics.scene_scan0(fgeom, lat_range)
-    gi = group_info(sid, group, paths)
-    l0 = L0(sid, str(stage_dir), chunk={"band": -1, "y": 1024, "x": -1})
-    # `y` is the native absolute Scan number, same crop `build_l1` makes off the geometry csv.
-    l0.img = l0.img.sel(y=slice(scan0, gi.row_range[1] - gi.row_range[0] + scan0), band=PAN_BANDS)
-    gain, offset = radiometry.get_gain_offset(l0.qub, calib_dir=instrument.DCALIB)
-    sat = instrument.get_saturation_radiance(l0.qub, calib_dir=instrument.DCALIB)
-    rad = 10 * (l0.img * gain.sel(band=PAN_BANDS) + offset.sel(band=PAN_BANDS))
-    return np.asarray((rad >= sat.sel(band=PAN_BANDS)).any("band").compute().values)
+def pan_incomplete(f: Path) -> np.ndarray:
+    """Any-PAN-band-NaN mask of the L1 cube `f`."""
+    return np.isnan(np.stack([read_band(f, b) for b in PAN_BANDS])).any(0)
 
 
 def _kernels_or_none(day: str, paths: io.Paths) -> list[Path]:
@@ -554,63 +462,14 @@ def _group_obs(sid, group, lon, lat, radius, scan0, topo, snr, paths, stage_dir)
     return bands, sc_source, sc_xyz_km
 
 
-def build_obs(sid: str, loc: dict, paths: io.Paths, stage_dir: Path | None = None) -> dict:
-    """Every OBS band, assembled group by group over `loc` (`lon`/`lat`/`radius`/`groups`).
-    Overlap rows between two groups take the earlier group's own value (first-owner-wins).
-    """
-    groups = list(loc["groups"])
-    ny, nx = loc["lon"].shape
-    out = {n: np.full((ny, nx), np.nan, "float32") for n in OBS_NAMES}
-    owner = np.full(ny, "", dtype=object)
-    sources = set()
-    sc_xyz_km_full = np.full((3, ny), np.nan)
-
-    for g in groups:
-        gi = group_info(sid, g, paths)
-        r0, r1 = gi.row_range[0], gi.row_range[1] + 1
-        write = ~(owner[r0:r1] != "")
-        owner[r0:r1] = np.where(write, g, owner[r0:r1])
-        if not write.any():
-            continue
-        bands, sc_source, sc_xyz_km = _group_obs(
-            sid,
-            g,
-            loc["lon"][r0:r1],
-            loc["lat"][r0:r1],
-            loc["radius"][r0:r1],
-            r0,
-            _read_group_topo(sid, g, paths),
-            _group_snr(sid, g, paths),
-            paths,
-            stage_dir,
-        )
-        sources.add(sc_source)
-        sc_xyz_km_full[:, r0:r1] = np.where(write[None, :], sc_xyz_km, sc_xyz_km_full[:, r0:r1])
-        for name, full in bands.items():
-            out[name][r0:r1] = np.where(write[:, None], full, out[name][r0:r1])
-
-    out["tie_dist"] = _tie_dist(sid, groups, ny, nx, paths)
-    return {
-        "bands": out,
-        "groups": loc["groups"],
-        "sensor_source": ",".join(sorted(sources)) or "none",
-        "sc_xyz_m": sc_xyz_km_full * 1000.0,
-    }
-
-
-def scene_obs(sid, group, gcps, shape, scan0, paths, ftopo=None, fl1=None, stage_dir=None) -> dict:
-    """`build_obs` for one solved group straight from refl's own inputs, with no LOC product: pixel
-    positions from the GCP lattice (`georef.camera_xy`, the same positions the topo samples) plus the
-    LOLA radius, topo from `ftopo`, SNR from the L1 cube `fl1`. `gcps` rows are relative to `scan0`."""
-    from iirspy.georef.georef import camera_xy
-
-    ny, nx = shape
-    x, y = camera_xy(gcps, shape)
-    lon, lat = xy_to_lonlat(x, y, pole=group)
-    radius = np.empty((ny, nx))
-    for r0 in range(0, ny, 500):
-        sl = slice(r0, r0 + 500)
-        radius[sl] = _sample_radius(x[sl], y[sl], lat[sl], group, paths.dem_roots)
+def obs_from_loc(
+    sid: str, group: str, loc: dict, scan0: int, gcps: dict, paths: io.Paths, ftopo=None, fl1=None, stage_dir=None
+) -> dict:
+    """All OBS bands over a group's `loc` (`lon`/`lat`/`radius`, crop-relative rows starting at absolute Scan
+    `scan0`): sun/sensor terms from SPICE, facet terms from the topo product `ftopo`, SNR from the L1 cube `fl1`,
+    tie distance from the merged `gcps` lattice."""
+    lon, lat, radius = loc["lon"], loc["lat"], loc["radius"]
+    ny, nx = lon.shape
     bands, sc_source, sc_xyz_km = _group_obs(
         sid,
         group,
@@ -624,38 +483,16 @@ def scene_obs(sid, group, gcps, shape, scan0, paths, ftopo=None, fl1=None, stage
         stage_dir,
     )
     bands = {n: np.asarray(a, "float32") for n, a in bands.items()}
-    tree = cKDTree(np.array([(g.row, g.col) for g in gcps], dtype="float64"))
+    tree = cKDTree(np.array(list(gcps), dtype="float64"))
     rr, cc = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
     d, _ = tree.query(np.stack([rr.ravel(), cc.ravel()], axis=1))
     bands["tie_dist"] = (d * IIRS_GSD_M).reshape(ny, nx).astype("float32")
     return {
         "bands": bands,
-        "lat": lat.astype("float32"),
         "groups": {group: (scan0, scan0 + ny - 1)},
         "sensor_source": sc_source,
         "sc_xyz_m": sc_xyz_km * 1000.0,
     }
-
-
-def _tie_dist(sid: str, groups: list[str], ny: int, nx: int, paths: io.Paths) -> np.ndarray:
-    """Camera-space Euclidean distance [m] from every pixel to the nearest GCP lattice node of its
-    owning group, `IIRS_GSD_M` per row/col unit. The solve does not persist its raw AROSICS tie-point
-    detections separately from the lattice it fits through them, so this is distance to the nearest
-    *solved lattice node*, not the original tie-point pixel — stated in the OBS `DEFINITION` tag.
-    """
-    out = np.full((ny, nx), np.nan, "float32")
-    for g in groups:
-        gi = group_info(sid, g, paths)
-        gcps = arosics.load_gcps(ck.merged_gcps_path(sid, g, paths))
-        pts = np.array([(gi.scan0 + r, c) for r, c in gcps], dtype="float64")
-        if len(pts) == 0:
-            continue
-        tree = cKDTree(pts)
-        r0, r1 = gi.row_range[0], gi.row_range[1] + 1
-        rr, cc = np.meshgrid(np.arange(r0, r1), np.arange(nx), indexing="ij")
-        d, _ = tree.query(np.stack([rr.ravel(), cc.ravel()], axis=1))
-        out[r0:r1] = np.where(np.isnan(out[r0:r1]), (d * IIRS_GSD_M).reshape(rr.shape).astype("float32"), out[r0:r1])
-    return out
 
 
 ISSDC_OBS_FIXES = (
@@ -669,7 +506,9 @@ ISSDC_OBS_FIXES = (
 )
 
 
-def write_obs(fout: Path, obs: dict, sid: str, compress: str = "ZSTD", predictor: int = 3, row0: int = 0) -> Path:
+def write_obs(
+    fout: Path, obs: dict, sid: str, compress: str = "ZSTD", predictor: int = 3, row0: int = 0, tags: dict | None = None
+) -> Path:
     """Write `<sid>_obs.tif`/`.img`: 14-band f32, camera space (no CRS). Bands 1-9 are ISSDC's ndi `_d_obs_`
     layout, with the values it promises (see `ISSDC_OBS_FIXES`); bands 10-14 are extras. Lossless, tiled,
     `INTERLEAVE=BAND`."""
@@ -720,7 +559,7 @@ def write_obs(fout: Path, obs: dict, sid: str, compress: str = "ZSTD", predictor
         "TIE_DIST_DEFINITION": "distance to the nearest solved GCP lattice node, not the raw tie-point detection",
         "PROVENANCE_IIRSPY_VERSION": io.IIRSPY_VERSION,
         "GROUPS": {g: list(r) for g, r in obs["groups"].items()},
-    }
+    } | (tags or {})
     names = [n for n, _u in names_units]
     units = [u for _n, u in names_units]
     da = _backplane_da([bands[n] for n in names], names, units, row0, tags)
@@ -731,80 +570,64 @@ def write_obs(fout: Path, obs: dict, sid: str, compress: str = "ZSTD", predictor
 # QA: uint16 bit flags
 # ------------------------------------------------------------------------------------------
 QA_BITS = {
-    "no_geometry": 0,
-    "gcp_extrapolated": 1,
-    "in_gcp_chunk_overlap": 2,
-    "in_gcp_region_overlap": 3,
-    "in_geometric_shadow": 4,
-    "is_lit": 5,
-    "is_saturated": 6,
-    "pan_incomplete": 7,
+    "no_geometry": (0, "LOC undefined (row outside every solved group)"),
+    "gcp_extrapolated": (1, "outside the control lattice hull, LOC extrapolating"),
+    "in_gcp_chunk_overlap": (2, "overlap of two chunks of one group, geometry cross-faded"),
+    "in_gcp_region_overlap": (3, "overlap of two solve groups, geometry seam-blended"),
+    "in_geometric_shadow": (4, f"lit_frac < {GEOM_SHADOW_LIT} (sun centre below local LOLA horizon)"),
+    "is_lit": (5, f"broadband PAN snr >= {SHADOW_SNR}"),
+    "is_saturated": (6, "any PAN band at/above saturation radiance"),
+    "pan_incomplete": (7, "any PAN band NaN at this pixel"),
+    "no_topo": (8, "no DEM facet terms: facet_cos_i is the sphere cosine, slope/aspect/lit_frac NaN"),
 }
 
 
-def _extrapolated_mask(sid: str, groups: dict[str, tuple[int, int]], ny: int, nx: int, paths: io.Paths) -> np.ndarray:
-    """True where a pixel lies outside the convex hull of its owning group's own GCP lattice
-    (row, col), i.e. the LOC is extrapolating rather than interpolating."""
-    out = np.zeros((ny, nx), dtype=bool)
-    for g in groups:
-        gi = group_info(sid, g, paths)
-        gcps = arosics.load_gcps(ck.merged_gcps_path(sid, g, paths))
-        pts = np.array([(r, c) for r, c in gcps], dtype="float64")
-        if len(pts) < 4:
-            continue
-        tri = Delaunay(pts)
-        r0, r1 = gi.row_range[0], gi.row_range[1] + 1
-        rr, cc = np.meshgrid(np.arange(r0, r1), np.arange(nx), indexing="ij")
-        inside = tri.find_simplex(np.stack([rr.ravel(), cc.ravel()], axis=1)) >= 0
-        out[r0:r1] |= ~inside.reshape(rr.shape)
-    return out
+def qa_mask(name: str) -> int:
+    return 1 << QA_BITS[name][0]
+
+
+def _extrapolated_mask(gcps: dict, ny: int, nx: int) -> np.ndarray:
+    """True where a pixel centre lies outside the convex hull of the GCP lattice (row, col), i.e. LOC extrapolates."""
+    pts = np.array(list(gcps), dtype="float64")
+    rr, cc = np.meshgrid(np.arange(ny) + 0.5, np.arange(nx) + 0.5, indexing="ij")
+    inside = Delaunay(pts).find_simplex(np.stack([rr.ravel(), cc.ravel()], axis=1)) >= 0
+    return np.asarray(~inside.reshape(ny, nx))
 
 
 def build_qa(
-    sid: str, loc: dict, obs: dict, paths: io.Paths, saturation: dict[str, np.ndarray | None] | None = None
+    loc: dict,
+    obs: dict,
+    gcps: dict | None = None,
+    overlaps: Sequence[tuple[int, int]] = (),
+    pan_bad: np.ndarray | None = None,
+    saturated: np.ndarray | None = None,
 ) -> np.ndarray:
-    """The uint16 QA bit field, from `loc`, `obs`, and per-group PAN saturation
-    masks (`saturation`, keyed by group; `None`/missing group -> bit 6 left 0 for that group's rows,
-    since `SATURATION_CHECK` records whether it was actually evaluated)."""
+    """The uint16 QA bit field for one group, from `loc`, `obs`, the merged `gcps` lattice (extrapolation hull),
+    crop-relative chunk `overlaps`, and the optional per-pixel PAN-incomplete / saturated masks (bit left 0 when
+    the mask is `None`, since `SATURATION_CHECK` records whether it was evaluated)."""
     ny, nx = loc["lon"].shape
     qa = np.zeros((ny, nx), dtype="uint16")
-    groups = loc["groups"]
-
-    qa[np.isnan(loc["lon"])] |= 1 << QA_BITS["no_geometry"]
-    qa[_extrapolated_mask(sid, groups, ny, nx, paths)] |= 1 << QA_BITS["gcp_extrapolated"]
-
-    for g in groups:
-        gi = group_info(sid, g, paths)
-        for lo, hi, _ia, _ib in chunk_overlaps(gi):
-            qa[lo:hi] |= 1 << QA_BITS["in_gcp_chunk_overlap"]
-    for seam in loc.get("seams", ()):
-        lo, hi = seam["row_range"]
-        qa[lo:hi] |= 1 << QA_BITS["in_gcp_region_overlap"]
-
-    lit_frac = obs["bands"]["lit_frac"]
-    qa[np.nan_to_num(lit_frac, nan=1.0) < GEOM_SHADOW_LIT] |= 1 << QA_BITS["in_geometric_shadow"]
-    snr = obs["bands"]["snr"]
-    qa[np.nan_to_num(snr, nan=-np.inf) >= SHADOW_SNR] |= 1 << QA_BITS["is_lit"]
-
-    for g in groups:
-        gi = group_info(sid, g, paths)
-        r0, r1 = gi.row_range[0], gi.row_range[1] + 1
-        pan_bad = _pan_incomplete(sid, g, paths)
-        if pan_bad is not None:
-            n = min(r1 - r0, pan_bad.shape[0])
-            bit = 1 << QA_BITS["pan_incomplete"]
-            qa[r0 : r0 + n] = np.where(pan_bad[:n], qa[r0 : r0 + n] | bit, qa[r0 : r0 + n])
-        sat = saturation.get(g) if saturation else None
-        if sat is not None:
-            n = min(r1 - r0, sat.shape[0])
-            bit = 1 << QA_BITS["is_saturated"]
-            qa[r0 : r0 + n] = np.where(sat[:n], qa[r0 : r0 + n] | bit, qa[r0 : r0 + n])
-
+    qa[np.isnan(loc["lon"])] |= qa_mask("no_geometry")
+    if gcps:
+        qa[_extrapolated_mask(gcps, ny, nx)] |= qa_mask("gcp_extrapolated")
+    for lo, hi in overlaps:
+        qa[lo:hi] |= qa_mask("in_gcp_chunk_overlap")
+    qa[np.nan_to_num(obs["bands"]["lit_frac"], nan=1.0) < GEOM_SHADOW_LIT] |= qa_mask("in_geometric_shadow")
+    qa[np.nan_to_num(obs["bands"]["snr"], nan=-np.inf) >= SHADOW_SNR] |= qa_mask("is_lit")
+    for mask, name in ((pan_bad, "pan_incomplete"), (saturated, "is_saturated")):
+        if mask is not None:
+            qa[mask[:ny]] |= qa_mask(name)
     return qa
 
 
 def write_qa(
-    fout: Path, qa: np.ndarray, sid: str, groups: dict[str, tuple[int, int]], saturation_status: dict, row0: int = 0
+    fout: Path,
+    qa: np.ndarray,
+    sid: str,
+    groups: dict[str, tuple[int, int]],
+    saturation_status: dict,
+    row0: int = 0,
+    tags: dict | None = None,
 ) -> Path:
     """Write `<sid>_qa.tif`/`.img`: uint16 bit flags, lossless."""
     fout = Path(fout)
@@ -813,21 +636,14 @@ def write_qa(
         "IIRS_PRODUCT": "QA",
         "IIRS_FORMAT_VERSION": "1",
         "IIRS_SID": sid,
-        "QA_BIT_0": "no_geometry: LOC undefined (row outside every solved group)",
-        "QA_BIT_1": "gcp_extrapolated: outside the GCP lattice hull, LOC extrapolating",
-        "QA_BIT_2": "in_gcp_chunk_overlap: overlap of two chunks of one group, geometry cross-faded",
-        "QA_BIT_3": "in_gcp_region_overlap: overlap of two solve groups, geometry seam-blended",
-        "QA_BIT_4": f"in_geometric_shadow: lit_frac < {GEOM_SHADOW_LIT} (sun centre below local LOLA horizon)",
-        "QA_BIT_5": f"is_lit: broadband PAN snr >= {SHADOW_SNR}",
-        "QA_BIT_6": "is_saturated: any PAN band at/above saturation radiance",
-        "QA_BIT_7": "pan_incomplete: any PAN band NaN at this pixel",
-        "QA_RESERVED_BITS": "8-15",
+        **{f"QA_BIT_{b}": f"{n}: {d}" for n, (b, d) in QA_BITS.items()},
+        "QA_RESERVED_BITS": f"{len(QA_BITS)}-15",
         "PAN_BANDS": ",".join(str(b) for b in PAN_BANDS),
         "GEOM_SHADOW_LIT": str(GEOM_SHADOW_LIT),
         "SHADOW_SNR": str(SHADOW_SNR),
         "SATURATION_CHECK": saturation_status,
         "GROUPS": {g: list(r) for g, r in groups.items()},
         "PROVENANCE_IIRSPY_VERSION": io.IIRSPY_VERSION,
-    }
+    } | (tags or {})
     da = _backplane_da([qa], ["qa_bits"], [""], row0, tags)
     return Path(io.write_camera_product(da, fout, compress="ZSTD", predictor=2))

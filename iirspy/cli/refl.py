@@ -47,6 +47,7 @@ from iirspy.cli._run import (
     Job,
     build_l1,
     build_l1_nci,
+    ensure_frame_offsets,
     frame_offsets_path,
     log_provenance,
     open_run,
@@ -157,6 +158,13 @@ def _parser():
         help="delete the work dir after --keep; drops the camera-space L1/L2 intermediates",
     )
     ap.add_argument(
+        "--georef",
+        default=None,
+        choices=["arosics", "issdc"],
+        help="georef method: arosics (the solved GCPs) or issdc (ISSDC bundle files only, no SPICE/DEM/solve); "
+        "default issdc for the issdc and issdc-nci L2 presets, else arosics",
+    )
+    ap.add_argument(
         "--gcps",
         default=None,
         help="merged GCPs from iirs-solve-scene --keep (default geometry/recalibrated/<day>/"
@@ -238,7 +246,7 @@ def _file_info(f, sha=False) -> dict:
     return {"path": str(f), "mtime": mtime, **({"sha256": hashlib.sha256(f.read_bytes()).hexdigest()} if sha else {})}
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> None:  # noqa: C901
 
     args = _parser().parse_args(argv)
     args.l1_config = l1_config(args)
@@ -249,22 +257,34 @@ def main(argv: list[str] | None = None) -> None:
     if args.clean and not (args.keep or args.keep_l1):
         sys.exit("--clean without --keep/--keep-l1 would discard the whole run")
 
+    args.georef = args.georef or ("issdc" if args.l2 in ("issdc", "issdc-nci") else "arosics")
+    if args.georef == "issdc" and args.topo_only:
+        sys.exit("--topo-only needs --georef arosics: the issdc method has no DEM topo")
+
     paths = paths_from_env()
-    fgcps = Path(args.gcps) if args.gcps else ck.merged_gcps_path(sid, group, paths)
-    if not fgcps.is_file() or fgcps.stat().st_size == 0:
-        sys.exit(f"{fgcps} missing or empty -- {sid} {group} is not solved yet (run iirs-solve-scene first)")
+    fgcps = frames = None
+    if args.georef == "arosics":
+        fgcps = Path(args.gcps) if args.gcps else ck.merged_gcps_path(sid, group, paths)
+        if not fgcps.is_file() or fgcps.stat().st_size == 0:
+            sys.exit(f"{fgcps} missing or empty -- {sid} {group} is not solved yet (run iirs-solve-scene first)")
+        frames = frame_offsets_path(sid, paths, fgcps.parent)
+        if predates_frames(fgcps, frames):
+            sys.exit(f"{fgcps} was solved before {frames.name} existed -- re-run iirs-solve-scene first")
 
     import dask
 
     dask.config.set(scheduler="threads", num_workers=ncpu())
 
-    frames = frame_offsets_path(sid, paths, fgcps.parent)
-    if predates_frames(fgcps, frames):
-        sys.exit(f"{fgcps} was solved before {frames.name} existed -- re-run iirs-solve-scene first")
-    job = replace(open_run(sid, group, args.out, "refl", paths), frames=frames)
+    job = open_run(sid, group, args.out, "refl", paths)
+    if frames:
+        job = replace(job, frames=frames)
+    elif args.l2 != "issdc-nci" or args.fix_frames or args.fill_frames:
+        job = replace(job, frames=ensure_frame_offsets(job, job.ws.dir))
     t_start = time.time()
     log_provenance(job.ws)
-    job.ws.log(f"{sid} group={group} zip={job.zip.name} ncpu={ncpu()} stage={job.stage} gcps={fgcps}")
+    job.ws.log(
+        f"{sid} group={group} zip={job.zip.name} ncpu={ncpu()} stage={job.stage} georef={args.georef} gcps={fgcps}"
+    )
 
     try:
         _run(job, args, fgcps, t_start)
@@ -275,18 +295,22 @@ def main(argv: list[str] | None = None) -> None:
         raise
 
 
-def _run(job: Job, args, fgcps: Path, t_start: float) -> None:  # noqa: C901
-    from iirspy.georef import georef
+def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C901
+    from iirspy.georef import arosics, backplanes, georef, run_georef
     from iirspy.iirs import L1, L2
 
     ws, sid, group, paths = job.ws, job.sid, job.group, job.paths
-    try:
-        gcps, aoi = georef.gcps_and_aoi(fgcps)
-    except ValueError as e:
-        sys.exit(str(e))
     lat_range = ck.l1_lat_range(group)
-    cfg = replace(ck.chunk_cfg(group, paths.dem_roots), aoi=aoi, lat_band=lat_range)
-    ws.log(f"aoi from {len(gcps)} merged gcps: {[round(v / 1000, 1) for v in aoi]} km")
+    gcps = cfg = None
+    merged: dict = {}
+    if fgcps is not None:
+        try:
+            gcps, aoi = georef.gcps_and_aoi(fgcps)
+        except ValueError as e:
+            sys.exit(str(e))
+        merged = arosics.load_gcps(fgcps)
+        cfg = replace(ck.chunk_cfg(group, paths.dem_roots), aoi=aoi, lat_band=lat_range)
+        ws.log(f"aoi from {len(gcps)} merged gcps: {[round(v / 1000, 1) for v in aoi]} km")
 
     bands = PAN_BANDS if args.topo_only else _full_bands()  # topo-only needs the scan crop, not the spectrum
     nci = args.l2 == "issdc-nci"
@@ -299,8 +323,8 @@ def _run(job: Job, args, fgcps: Path, t_start: float) -> None:  # noqa: C901
         )
     ws.log(f"L1 built ({'ISSDC nci' if nci else 'iirspy'}): {ftif} ({len(bands)} bands), scan0={scan0}")
     # GCP rows are cube rows of the solve's crop: a different crop start would shift every GCP row.
-    fsum = fgcps.parent / f"{fgcps.stem}_solve_summary.json"
-    solve_scan0 = json.loads(fsum.read_text()).get("scan0") if fsum.exists() else None
+    fsum = fgcps.parent / f"{fgcps.stem}_solve_summary.json" if fgcps else None
+    solve_scan0 = json.loads(fsum.read_text()).get("scan0") if fsum and fsum.exists() else None
     if not nci and solve_scan0 is not None and solve_scan0 != scan0:
         sys.exit(
             f"{sid} {group}: L1 crop starts at scan {scan0} but the solve's started at {solve_scan0} -- re-solve with this iirspy"
@@ -321,15 +345,21 @@ def _run(job: Job, args, fgcps: Path, t_start: float) -> None:  # noqa: C901
     fgeom, flabel = anc["geometry/calibrated"], ck.label(sid, paths, job.stage)
     if fgeom is None or flabel is None:
         sys.exit(f"missing ancillary for {sid}: geometry={fgeom} label={flabel}")
-    kernels = ck.kernels(sid[:8], paths)
-    az, elev, r_sun = georef.sun_geometry(fgeom, flabel, cfg, kernels)
-    ws.log(f"sun (grid frame): az={az:.1f} elev={elev:.2f} r_sun={r_sun:.4f} deg")
+    l2cfg = args.l2_config
+    kernels: list[Path] = []
+    az = elev = r_sun = None
 
-    if args.topo_only:
+    if args.georef == "arosics":
+        kernels = ck.kernels(sid[:8], paths)
+        az, elev, r_sun = georef.sun_geometry(fgeom, flabel, cfg, kernels)
+        ws.log(f"sun (grid frame): az={az:.1f} elev={elev:.2f} r_sun={r_sun:.4f} deg")
+
+    if fgcps is not None and args.topo_only:
         with rasterio.open(ftif) as src:
             shape = (src.height, src.width)
+        lon, lat, _ = backplanes.group_loc_core(merged, group, paths.dem_roots, nrow=shape[0], ncol=shape[1])
         topo = georef.scene_topo(
-            sid, group, gcps, shape, fgeom, flabel, cfg, kernels, ws.dir, paths.dem_roots, scan0=scan0
+            sid, group, lon, lat, fgeom, flabel, cfg, kernels, ws.dir, paths.dem_roots, scan0=scan0
         )
         _keep(ws, str(fgcps.parent), topo)
         ws.log(f"--topo-only: {topo} -> {fgcps.parent}, done in {time.time() - t_start:.0f} s")
@@ -342,23 +372,54 @@ def _run(job: Job, args, fgcps: Path, t_start: float) -> None:  # noqa: C901
         l1.img.attrs["calibration_source"] = "issdc"
     ws.log(_chunk_report(l1.img))
 
-    l2cfg = args.l2_config
-    ftopo = (
-        georef.scene_topo(
-            sid, group, gcps, l1.img.shape[-2:], fgeom, flabel, cfg, kernels, ws.dir, paths.dem_roots, scan0=scan0
+    shape = l1.img.shape[-2:]
+    if args.georef == "issdc":
+        geo = run_georef(
+            "issdc",
+            sid=sid,
+            group=group,
+            fgeom=fgeom,
+            flabel=flabel,
+            fspm=ck.spm(sid, paths, job.stage),
+            shape=shape,
+            row0=scan0,
         )
-        if l2cfg.use_slope_az
+    else:
+        geo = run_georef(
+            "arosics",
+            sid=sid,
+            group=group,
+            merged=merged,
+            scan0=scan0,
+            shape=shape,
+            paths=paths,
+            cfg=cfg,
+            fgeom=fgeom,
+            flabel=flabel,
+            kernels=kernels,
+            fl1=ftif,
+            stage_dir=job.stage,
+            fgcps=fgcps,
+            topo_dir=ws.dir if l2cfg.use_slope_az else None,
+        )
+    ftopo = geo.sidecars.get("topo")
+    ws.log(f"geometry: {geo.method} {geo.quality}; topo: {ftopo or 'none'}")
+
+    # incidence and the facet terms are read from the geometry only: with DEM topo the photometric model takes
+    # the facet slope/aspect/lit and the sun in the local frame; without it, the per-pixel sun zenith.
+    obs = geo.obs
+    inc = None if ftopo else xr.DataArray(obs.sun_zenith.values, dims=("y", "x"))
+    slope_az = (
+        (
+            obs.facet_slope.values,
+            obs.facet_aspect.values,
+            obs.lit_frac.values,
+            (obs.sun_azimuth.values, 90 - obs.sun_zenith.values),
+        )
+        if ftopo
         else None
     )
-    ws.log(f"topo: {ftopo or 'skipped (--l2-use-slope-az false)'}")
-
-    # No topo product to carry the per-pixel sun: give L2 the exact per-pixel incidence instead of the spm's one
-    # value per line, which misses the up-to-2% cross-track cos(i) change ISSDC's own L2 divides by.
-    inc = None
-    if not ftopo:
-        _, el = georef.sun_geometry_rows(gcps, l1.img.shape[-2:], flabel, cfg, scan0, kernels)
-        inc = xr.DataArray(90 - np.abs(el), dims=("y", "x"))
-    l2 = l1.calibrate(l2cfg, inc=inc, slope_az=str(ftopo) if ftopo else None)
+    l2 = l1.calibrate(l2cfg, inc=inc, slope_az=slope_az)
     ws.log(f"L2 computed ({args.l2}: {json.dumps(l2cfg.to_attrs())})")
 
     # Camera space keeps one unblended spectrum per pixel; the GLT projects on demand and the
@@ -366,16 +427,15 @@ def _run(job: Job, args, fgcps: Path, t_start: float) -> None:  # noqa: C901
     fl2 = ws.path(f"{sid}_{group}_l2_refl.tif")
     l2.save(str(fl2))
     ws.log(f"L2 saved: {fl2}")
-    for f in (Path(ftif), fl2):
-        ws.log(f"gcp vrt -> {georef.save_gcp_vrt(f, gcps, georef.stereo_crs(group))}")
+    if gcps:
+        for f in (Path(ftif), fl2):
+            ws.log(f"gcp vrt -> {georef.save_gcp_vrt(f, gcps, georef.stereo_crs(group))}")
 
-    # OBS from the same GCPs/topo/L1 already in hand; no LOC product (see backplanes.scene_obs)
-    from iirspy.georef import backplanes
-
-    fobs = ws.path(f"{sid}_{group}_obs.tif")
-    obs = backplanes.scene_obs(sid, group, gcps, l1.img.shape[-2:], scan0, paths, ftopo, ftif, job.stage)
-    backplanes.write_obs(fobs, obs, sid, row0=scan0)
-    ws.log(f"OBS saved: {fobs} (sensor geometry from {obs['sensor_source']})")
+    gfiles = geo.save(ws.dir)
+    fobs = gfiles["obs"]
+    ws.log(
+        f"geometry saved: {', '.join(f.name for f in gfiles.values())} (sensor geometry from {geo.tags['SENSOR_SOURCE']})"
+    )
 
     from iirspy.l2 import stats as l2_stats
 
@@ -385,20 +445,18 @@ def _run(job: Job, args, fgcps: Path, t_start: float) -> None:  # noqa: C901
             fl2,
             ftif,
             np.asarray(l2.img.solar_inc),
-            obs["lat"],
-            emi=obs["bands"]["sensor_zenith"],
-            phase=obs["bands"]["phase"],
+            geo.loc.lat.values,
+            emi=obs.sensor_zenith.values,
+            phase=obs.phase.values,
             sdist=float(l2.img.attrs["solar_distance_au"]),
         )
     except Exception as e:  # sanity stats must never fail a refl run
         stats = {"error": f"{type(e).__name__}: {e}"}
     ws.log(f"l2_stats: {time.time() - t_stats:.1f}s {stats.get('error', 'ok')}")
 
-    fglt = fgcps.parent / f"{sid}_{group}_glt.tif"
-    if not fglt.is_file():
-        ws.log(f"glt: {fglt} not found -- iirs-solve-scene should have built it alongside {fgcps}")
-    else:
-        ws.log(f"glt: {fglt}")
+    fglt = fgcps.parent / f"{sid}_{group}_glt.tif" if fgcps else None
+    if fglt is not None:
+        ws.log(f"glt: {fglt}" if fglt.is_file() else f"glt: {fglt} not found -- iirs-solve-scene should have built it")
 
     resources = f"{_chunk_report(l1.img)}; {_peak_rss_report()}; ncpu={ncpu()}"
     ws.log(resources)
@@ -407,22 +465,25 @@ def _run(job: Job, args, fgcps: Path, t_start: float) -> None:  # noqa: C901
         "sid": sid,
         "group": group,
         "resources": resources,
-        "gcps": str(fgcps),
-        "n_gcps": len(gcps),
-        "solve_quality": _solve_quality(fgcps, group),
+        "georef": geo.method,
+        "geometry_quality": geo.quality,
+        "gcps": str(fgcps) if fgcps else None,
+        "n_gcps": len(gcps) if gcps else None,
+        "solve_quality": _solve_quality(fgcps, group) if fgcps else None,
         "lat_range": list(lat_range),
         "bands": bands,
         "l2_preset": args.l2,
         "l1_source": "issdc-nci" if nci else "iirspy",
         "l2_config": l2cfg.to_attrs(),
         "topo": _topo_info(ftopo),
-        "aoi_m": list(cfg.aoi),
+        "aoi_m": list(cfg.aoi) if cfg else None,
         "scan0": scan0,
         "l1": ftif.name,
         "l2": fl2.name,
         "obs": fobs.name,
-        "obs_sensor_source": obs["sensor_source"],
-        "glt": str(fglt),
+        "obs_sensor_source": geo.tags["SENSOR_SOURCE"],
+        "geometry": {k: f.name for k, f in gfiles.items()},
+        "glt": str(fglt) if fglt else None,
         "sun_az_grid_deg": az,
         "sun_elev_deg": elev,
         "sun_angular_radius_deg": r_sun,
@@ -439,10 +500,11 @@ def _run(job: Job, args, fgcps: Path, t_start: float) -> None:  # noqa: C901
 
     inputs = {
         "nri_zip": _file_info(job.zip),
-        "gcps": _file_info(fgcps, sha=True),
-        "frames": {**_file_info(job.frames), "key": frames_key(job.frames)},
+        "gcps": _file_info(fgcps, sha=True) if fgcps else None,
+        "frames": {**_file_info(job.frames), "key": frames_key(job.frames)} if job.frames else None,
         "label": _file_info(flabel),
-        "geometry": _file_info(fgeom),
+        "geometry_csv": _file_info(fgeom),
+        "geometry": geo.provenance,
         "spice_kernels": [str(k) for k in kernels],
         "topo": _file_info(ftopo) if ftopo else None,
     }
@@ -465,9 +527,10 @@ def _run(job: Job, args, fgcps: Path, t_start: float) -> None:  # noqa: C901
     sidecars = [
         f for f in (ftif.with_name(ftif.stem + "_empirical.npz"), ftif.with_name(ftif.stem + "_snr.tif")) if f.exists()
     ]
-    _keep(ws, args.keep_l1, ftif, ftif.with_suffix(".vrt"), *sidecars, fprov)
-    _keep(ws, args.keep, fl2, fl2.with_suffix(".vrt"), fobs, fsummary, fprov, job.logfile)
-    if ftopo:  # geometry, so it lands beside the GCPs rather than with L2
+    vrt = lambda f: [f.with_suffix(".vrt")] if f.with_suffix(".vrt").exists() else []
+    _keep(ws, args.keep_l1, ftif, *vrt(ftif), *sidecars, fprov)
+    _keep(ws, args.keep, fl2, *vrt(fl2), *gfiles.values(), fsummary, fprov, job.logfile)
+    if ftopo and fgcps:  # geometry, so it lands beside the GCPs rather than with L2
         _keep(ws, str(fgcps.parent) if args.keep else None, ftopo)
 
     if args.clean:

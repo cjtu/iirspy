@@ -37,7 +37,7 @@ import xarray as xr
 from pyproj import CRS, Transformer
 from rasterio.control import GroundControlPoint
 from rasterio.warp import Resampling, reproject
-from scipy.interpolate import RBFInterpolator, RectBivariateSpline
+from scipy.interpolate import RBFInterpolator
 from scipy.ndimage import (
     binary_erosion,
     distance_transform_edt,
@@ -486,28 +486,22 @@ def scan_order_reversed(fgeom, flabel, fspm=None, kernels=None, use_spk: bool = 
     return bool(rev < fwd / 2 and rev < 20.0), src
 
 
-def sun_geometry_rows(gcps, shape, flabel, cfg, scan0, kernels=None):
-    """(az_grid, elev) at every camera *pixel*. Exact sun angle on the solved geometry.
+def sun_geometry_rows(lon, lat, flabel, pole, scan0, kernels=None):
+    """(az_grid, elev) at every camera *pixel* of the (y, x) `lon`/`lat` arrays. Exact sun angle on the located geometry.
 
-    Ground position comes from `camera_xy` (the solved GCP lattice).
-
-    `scan0` is the crop's first absolute Scan (`arosics.build_l1`'s own return): `flabel` (the nri label) times
-    absolute Scans, not this crop's own 0-based row numbering.
+    `scan0` is the crop's first absolute Scan: `flabel` (the nri label) times absolute Scans, not this
+    crop's own 0-based row numbering.
     """
     import spiceypy as sp
 
     for k in kernels or []:
         sp.furnsh(str(k))
 
-    ny, nx = shape
-    x, y = camera_xy(gcps, shape)
-    lon, lat = to_lonlat(cfg.pole).transform(x, y)
-    lon = np.where(lon > 180, lon - 360, lon)
-
+    ny, nx = lon.shape
     utc = ancillary.scan_utc(flabel, scan0 + np.arange(ny))
 
-    lon0 = stereo_crs(cfg.pole).to_dict().get("lon_0", 0.0)
-    grid_sign = 0.0 if cfg.pole == "equatorial" else (-1.0 if cfg.pole == "north" else 1.0)
+    lon0 = stereo_crs(pole).to_dict().get("lon_0", 0.0)
+    grid_sign = 0.0 if pole == "equatorial" else (-1.0 if pole == "north" else 1.0)
 
     az = np.empty((ny, nx))
     el = np.empty((ny, nx))
@@ -700,38 +694,17 @@ def render_topo(fgeom, flabel, cfg, kernels=None):
     return gx, gy, _to_gsd(lit, ps_n, cfg), tr_n, {"az_grid": az, "elev": el, "r_sun": r_sun}
 
 
-def camera_xy(gcps, shape):
-    """Map (x, y) at every camera pixel of `shape`, interpolated from a registration's GCP lattice.
-
-    The lattice is regular in camera space (`row_step` rows by `ncol` columns), so a bicubic
-    spline through it reproduces the warp between nodes: exact at the nodes, well under a 40 m
-    output pixel between them.
-    """
-    rows = np.array(sorted({g.row for g in gcps}))
-    cols = np.array(sorted({g.col for g in gcps}))
-    ri = {v: i for i, v in enumerate(rows)}
-    ci = {v: i for i, v in enumerate(cols)}
-    xy = np.full((2, len(rows), len(cols)), np.nan)
-    for g in gcps:
-        xy[:, ri[g.row], ci[g.col]] = (g.x, g.y)
-    if not np.isfinite(xy).all():
-        raise ValueError("GCPs do not form a full lattice; camera_xy needs the lattice register() builds")
-    ys, xs = np.arange(shape[0]), np.arange(shape[1])
-    kx, ky = min(3, len(rows) - 1), min(3, len(cols) - 1)
-    return tuple(RectBivariateSpline(rows, cols, a, kx=kx, ky=ky)(ys, xs) for a in xy)
-
-
-def camera_gradients(gcps, shape, fgeom, flabel, cfg, kernels=None):
+def camera_gradients(x, y, fgeom, flabel, cfg, kernels=None):
     """(sx, sy, lit, info) sampled into (y, x) camera space east/north gradients, not yet slope/aspect.
 
-    Each camera pixel is sampled bilinearly at its map position - consistency with hillshade.
+    `x`, `y` are the map position of every camera pixel. Each is sampled bilinearly at its map position -
+    consistency with hillshade.
 
-    NaN outside `cfg.aoi`: the hillshade covers only that box, so only there are the GCPs measured
+    NaN outside `cfg.aoi`: the hillshade covers only that box, so only there is the geometry measured
     rather than extrapolated. On a strip several times longer than the AOI that is most of the
     scene.
     """
     gx, gy, lit, tr, info = render_topo(fgeom, flabel, cfg, kernels)
-    x, y = camera_xy(gcps, shape)
     rc = [(y - tr.f) / tr.e, (x - tr.c) / tr.a]
     # Sample the gradients, then convert: aspect is circular, so interpolating the angle would
     # average 359 and 1 degrees into 180.
@@ -739,16 +712,6 @@ def camera_gradients(gcps, shape, fgeom, flabel, cfg, kernels=None):
     out = (x < cfg.aoi[0]) | (x > cfg.aoi[2]) | (y < cfg.aoi[1]) | (y > cfg.aoi[3])
     sx, sy, slit = (np.where(out, np.nan, a) for a in (sx, sy, slit))
     return sx.astype("float32"), sy.astype("float32"), slit.astype("float32"), info
-
-
-def camera_topo(gcps, shape, fgeom, flabel, cfg, kernels=None):
-    """(slope, aspect, lit) as (y, x) camera-space arrays, for the L2 photometric correction.
-
-    See :func:`camera_gradients` for the sampling; this just converts its gradients to slope/aspect.
-    """
-    sx, sy, lit, info = camera_gradients(gcps, shape, fgeom, flabel, cfg, kernels)
-    slope, aspect = slope_aspect(sx, sy)
-    return slope.astype("float32"), aspect.astype("float32"), lit, info
 
 
 def save_topo(fout, slope, aspect, lit, tags=None, sun_az=None, sun_elev=None):
@@ -787,34 +750,24 @@ def save_topo(fout, slope, aspect, lit, tags=None, sun_az=None, sun_elev=None):
     return fout
 
 
-def _row_bands(gcps, ny, cfg):
-    """Per absolute camera row 0..ny-1, the `chunks.BANDS` name to render its topo with.
+def _row_bands(lat, cfg):
+    """Per camera row of the (y, x) `lat` array, the `chunks.BANDS` name to render its topo with.
 
-    A row takes the polar band only if both lattice rows bracketing it are themselves fully inside
+    A row takes the polar band only if it and every row within `cfg.row_step` of it lie fully inside
     the polar `lat_range` -- conservative at the transition, since the midlat DEM's wider
     `dem_range` already covers the whole group. Equatorial has one band; no split.
     """
+    from scipy.ndimage import binary_erosion
+
     from iirspy.georef import chunks as ck
 
+    ny = lat.shape[0]
     if cfg.pole == "equatorial":
         return np.full(ny, "equatorial", dtype=object)
-    polar, midlat = cfg.pole, f"{cfg.pole}_midlat"
-    lo, hi = ck.BANDS[polar]["lat_range"]
-    rows = np.array(sorted({g.row for g in gcps}))
-    is_polar = np.empty(len(rows), dtype=bool)
-    for i, r in enumerate(rows):
-        xs = [g.x for g in gcps if g.row == r]
-        ys = [g.y for g in gcps if g.row == r]
-        _, lat = to_lonlat(cfg.pole).transform(xs, ys)
-        is_polar[i] = bool(np.all((np.asarray(lat) >= lo) & (np.asarray(lat) <= hi)))
-    band = np.full(ny, midlat, dtype=object)
-    idx = np.arange(ny)
-    band[idx < rows[0]] = polar if is_polar[0] else midlat
-    band[idx >= rows[-1]] = polar if is_polar[-1] else midlat
-    for i in range(len(rows) - 1):
-        if is_polar[i] and is_polar[i + 1]:
-            band[(idx >= rows[i]) & (idx < rows[i + 1])] = polar
-    return band
+    lo, hi = ck.BANDS[cfg.pole]["lat_range"]
+    inside = np.all((lat >= lo) & (lat <= hi), axis=1)
+    polar = binary_erosion(inside, structure=np.ones(2 * cfg.row_step + 1, bool), border_value=1)
+    return np.where(polar, cfg.pole, f"{cfg.pole}_midlat").astype(object)
 
 
 def _split_run(r0, r1, max_rows=2000):
@@ -836,12 +789,12 @@ def _split_run(r0, r1, max_rows=2000):
 
 
 def scene_topo(
-    sid, group, gcps, shape, fgeom, flabel, cfg, kernels, topo_dir, dem_roots, scan0=0, overwrite=False
+    sid, group, lon, lat, fgeom, flabel, cfg, kernels, topo_dir, dem_roots, scan0=0, overwrite=False
 ) -> Path:
     """The scene's camera-space topo product (slope/aspect/lit + per-pixel sun), built if not there.
 
     Splits the strip into `_split_run`-sized pieces, each its own band (see `_row_bands`), its own
-    DEM crop (AOI = bbox of its own GCPs + `cfg.margin_m`) and one `camera_gradients` call; pieces
+    DEM crop (AOI = bbox of its own pixels + `cfg.margin_m`) and one `camera_gradients` call; pieces
     resample already-fixed positions rather than reconciling independent solves, so gradients just
     concatenate. `slope_aspect` runs once, over the assembled gradients, since -- unlike them -- it
     is nonlinear (circular, for aspect) across a seam. Sun az/elev are `sun_geometry_rows`'s exact
@@ -859,9 +812,10 @@ def scene_topo(
         return f
     f.parent.mkdir(parents=True, exist_ok=True)
 
-    ny, nx = shape
+    ny, nx = lon.shape
     resolved = ck.bands(dem_roots)
-    band_of_row = _row_bands(gcps, ny, cfg)
+    x, y = (np.asarray(v) for v in to_stereo(cfg.pole).transform(lon, lat))
+    band_of_row = _row_bands(lat, cfg)
     pieces: list[tuple[int, int, str]] = []
     for name in dict.fromkeys(band_of_row.tolist()):
         for a, z in ck.true_runs(band_of_row == name):
@@ -874,22 +828,19 @@ def scene_topo(
     used_bands = []
     for a, z, name in pieces:
         b = resolved[name]
-        own = [g for g in gcps if a <= g.row < z] or gcps
-        xs, ys = [g.x for g in own], [g.y for g in own]
         aoi = (
-            min(xs) - cfg.margin_m,
-            min(ys) - cfg.margin_m,
-            max(xs) + cfg.margin_m,
-            max(ys) + cfg.margin_m,
+            np.nanmin(x[a:z]) - cfg.margin_m,
+            np.nanmin(y[a:z]) - cfg.margin_m,
+            np.nanmax(x[a:z]) + cfg.margin_m,
+            np.nanmax(y[a:z]) + cfg.margin_m,
         )
         pcfg = replace(cfg, aoi=aoi, dem_near=b["dem_near"], dem_far=b["dem_far"])
-        shifted = [GroundControlPoint(row=g.row - a, col=g.col, x=g.x, y=g.y) for g in gcps]
-        psx, psy, plit, _ = camera_gradients(shifted, (z - a, nx), fgeom, flabel, pcfg, kernels)
+        psx, psy, plit, _ = camera_gradients(x[a:z], y[a:z], fgeom, flabel, pcfg, kernels)
         sx[a:z], sy[a:z], lit[a:z] = psx, psy, plit
         used_bands.append(name)
 
     slope, aspect = slope_aspect(sx, sy)
-    sun_az, sun_elev = sun_geometry_rows(gcps, shape, flabel, cfg, scan0, kernels)
+    sun_az, sun_elev = sun_geometry_rows(lon, lat, flabel, cfg.pole, scan0, kernels)
     mid = ny // 2
     tags = {
         "az_grid": float(sun_az[mid, nx // 2]),
