@@ -75,56 +75,6 @@ def geom2grid(fgeom, extent=(None, None, None, None), xs=None, ys=None, xyextent
     return gridlon, gridlat, xyext
 
 
-def geom2latlon_coords(df_geom, xyext, nx, ny):
-    """
-    Convert geometry coordinates to latitude/longitude coordinates using thin plate spline
-    interpolation.
-
-    Parameters
-    ----------
-    df_geom : pandas.DataFrame
-        DataFrame containing geometry from parse_geom(). Has columns:
-        - "Pixel": pixel coordinate values
-        - "Scan": scan coordinate values
-        - "Longitude": longitude values in degrees
-        - "Latitude": latitude values in degrees
-    xyext : array-like
-        Extent specification as [x_min, x_max, y_min, y_max] defining the pixel
-        and scan ranges for which to interpolate coordinates.
-    nx : int
-        Number of pixels in the x (pixel) direction.
-    ny : int
-        Number of pixels in the y (scan) direction.
-
-    Returns
-    -------
-    lon_1d : numpy.ndarray
-        1D array of interpolated longitude values with length nx.
-    lat_1d : numpy.ndarray
-        1D array of interpolated latitude values with length ny.
-    """
-
-    # Create thin plate spline interpolators
-    points = df_geom[["Pixel", "Scan"]].values
-    lons = df_geom["Longitude"].values
-    lats = df_geom["Latitude"].values
-
-    rbf_lon = RBFInterpolator(points, lons, kernel="thin_plate_spline")
-    rbf_lat = RBFInterpolator(points, lats, kernel="thin_plate_spline")
-
-    # Create 1D coordinate arrays
-    pixel_range = np.linspace(xyext[0], xyext[1], nx)
-    scan_range = np.linspace(xyext[2], xyext[3], ny)
-
-    # Evaluate lon along the first scan line (constant y)
-    lon_1d = rbf_lon(np.column_stack([pixel_range, np.full(nx, scan_range[0])]))
-
-    # Evaluate lat along the first pixel line (constant x)
-    lat_1d = rbf_lat(np.column_stack([np.full(ny, pixel_range[0]), scan_range]))
-
-    return lon_1d, lat_1d
-
-
 def read_geom_csv(fgeom) -> pd.DataFrame:
     """IIRS geometry csv, minus the (0, 0) fill rows some bundles pad the tail with.
 

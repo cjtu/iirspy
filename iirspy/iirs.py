@@ -2,7 +2,6 @@ import copy
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import TypeVar
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -49,9 +48,6 @@ def _try_load_next_level_metadata(basename, target_level, directory, xyextent):
         pass
 
     return result
-
-
-XR = TypeVar("XR", xr.DataArray, xr.Dataset)
 
 
 def _flip(da, flip: tuple[bool, bool]):
@@ -459,10 +455,8 @@ class IIRSData(ABC):
         if len(data.y) > 2000:
             data = data.sel(y=slice(None, None, len(data.y) // 1000))
 
-        # Xarray plots with lat increasing up, but when it's raw DN (y coords) origin should be upper left
-        yincrease = "y" in kwargs and kwargs["y"].lower() in ["lat", "latitude"]
-        # Plot
-        p = data.plot(vmin=vmin, cmap=cmap, yincrease=yincrease, **kwargs)
+        # Camera space: scan 0 at the top
+        p = data.plot(vmin=vmin, cmap=cmap, yincrease=False, **kwargs)
         ax = p.axes
         ax.set_title(title)
         ax.set_aspect("equal")
@@ -660,8 +654,6 @@ class L1(IIRSData):
         if latlonextent and instance.geomdf is not None:
             instance.geomdf, xy_extent = ancillary.parse_geom(instance.csv, latlonextent, center=False)
             instance.extent = xy_extent
-            lon, lat = ancillary.geom2latlon_coords(instance.geomdf, xy_extent, instance.nx, instance.ny)
-            instance.img = instance.img.assign_coords({"lon": ("x", lon), "lat": ("y", lat)})
 
         if instance.spm is not None:
             # Solar incidence/azimuth need the scene's per-line clock times, which come from the
@@ -681,18 +673,6 @@ class L1(IIRSData):
                     "solar_az": ("y", iaz),
                 })
 
-        return instance
-
-    @classmethod
-    def from_file(cls, path, basename, directory=".", chunk=True):
-        """Load a cropped L1 raster (native [1000 mW/cm^2/sr/um]) as physical [W/m^2/sr/um] radiance.
-
-        Also attaches lat/lon from the geometry csv in `directory` for the actual absolute crop extent.
-        """
-        instance = super().from_file(path, basename, directory, chunk)
-        if instance.geomdf is not None:
-            lon, lat = ancillary.geom2latlon_coords(instance.geomdf, instance.extent, instance.nx, instance.ny)
-            instance.img = instance.img.assign_coords({"lon": ("x", lon), "lat": ("y", lat)})
         return instance
 
     def __init__(
@@ -755,27 +735,17 @@ class L1(IIRSData):
         self.img.attrs["units"] = "W/m^2/sr/um"
         self.img.attrs["calibration_source"] = "issdc"
 
-        # Assign lat, lon coordinates
-        # `self.extent` (the cube's crop), not `xy_extent` (the whole strip).
-        lon, lat = ancillary.geom2latlon_coords(self.geomdf, self.extent, self.shape[2], self.shape[1])
-
         # Get solar incidence for each line of image
         inc, iaz = ancillary.get_iirs_inc_az(self.qub, self.spm, self.extent[2:])
 
         # Assign new coords
-        self.img = self.img.assign_coords({
-            "lon": ("x", lon),
-            "lat": ("y", lat),
-            "solar_inc": ("y", inc),
-            "solar_az": ("y", iaz),
-        })
+        self.img = self.img.assign_coords({"solar_inc": ("y", inc), "solar_az": ("y", iaz)})
 
     def plot(self, band=12, yrange=(None, None), xrange=(None, None), **kwargs):
         """Plot image at band and x, y indices if supplied."""
         if "cbarlabel" not in kwargs:
             kwargs["cbarlabel"] = "Radiance [$W/m^2/sr/um$]"
-        x, y = ("lon", "lat") if "lon" in self.img.coords and "lat" in self.img.coords else ("x", "y")
-        _, ax = super().plot(band, yrange, xrange, x=x, y=y, **kwargs)
+        _, ax = super().plot(band, yrange, xrange, **kwargs)
         return ax
 
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
@@ -867,8 +837,6 @@ class L2(IIRSData):
         if latlonextent and instance.geomdf is not None:
             instance.geomdf, xy_extent = ancillary.parse_geom(instance.csv, latlonextent, center=False)
             instance.extent = xy_extent
-            lon, lat = ancillary.geom2latlon_coords(instance.geomdf, xy_extent, instance.nx, instance.ny)
-            instance.img = instance.img.assign_coords({"lon": ("x", lon), "lat": ("y", lat)})
 
         return instance
 
@@ -936,10 +904,6 @@ class L2(IIRSData):
         self.shape = self.img.shape
         self.img = self.img.where(self.img != 0)  # ISSDC ndi fill is exact 0, not a declared nodata
 
-        if self.geomdf is not None:
-            lon, lat = ancillary.geom2latlon_coords(self.geomdf, self.extent, self.shape[2], self.shape[1])
-            self.img = self.img.assign_coords({"lon": ("x", lon), "lat": ("y", lat)})
-
         if self.spm is not None:
             inc, iaz = ancillary.get_iirs_inc_az(self.qub, self.spm, self.extent[2:])
             self.img = self.img.assign_coords({"solar_inc": ("y", inc), "solar_az": ("y", iaz)})
@@ -948,8 +912,7 @@ class L2(IIRSData):
         """Plot reflectance image."""
         if "cbarlabel" not in kwargs:
             kwargs["cbarlabel"] = "Reflectance"
-        x, y = ("lon", "lat") if "lon" in self.img.coords and "lat" in self.img.coords else ("x", "y")
-        _, ax = super().plot(band, yrange, xrange, x=x, y=y, **kwargs)
+        _, ax = super().plot(band, yrange, xrange, **kwargs)
         return ax
 
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):

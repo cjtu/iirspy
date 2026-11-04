@@ -24,13 +24,12 @@ dependencies = [
     "pandas>=2.2.3",
     "pdr>=1.3.0",
     "pyproj>=3.7.1",
-    "rasterio>=1.5",  # 1.4 ignores reproject(tolerance=0): GCP_TPS warps stay approximate
+    "rasterio>=1.5",
     "rioxarray>=0.15.0",
     "scikit-image>=0.25.2",
     "scipy>=1.13.1",
     "spiceypy>=8.2.0",
     "xarray>=2024.7.0",
-    "xarray-regrid>=0.4.0",
 ]
 
 [project.scripts]
