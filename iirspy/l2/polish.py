@@ -1,4 +1,10 @@
-import time
+"""Spectral polish and smoothing, the late L2 steps that clean up the reflectance spectrum.
+
+`spectral_polish` is a per-band divisor for residual band-to-band calibration structure: the Verma et al. (2022)
+table, or one fitted to ISSDC's published L2 so `L2Config.preset("issdc")` reproduces it. `moving_average` is the
+3-band smoothing ISSDC applies to its L2. `apply_smoothing` (boxcar, Gaussian, Savitzky-Golay) defines other spectral
+smoothing operations.
+"""
 
 import numpy as np
 import pandas as pd
@@ -6,22 +12,20 @@ import xarray as xr
 from scipy.signal import savgol_filter
 from scipy.stats import norm
 
-from iirspy import io
 from iirspy.instrument import PKG_DATA
 
 FPOLISH = str(PKG_DATA.joinpath("spectral_polish_verma2022.csv"))
-
-
 # Per-band polish inferred from published ISSDC L2 (NDI) products; bands without a fit are 1.0
 FPOLISH_ISSDC_EMPIRICAL = str(PKG_DATA.joinpath("spectral_polish_issdc_empirical.csv"))
-
 POLISH = {"verma2022": FPOLISH, "issdc_empirical": FPOLISH_ISSDC_EMPIRICAL}
 
 
 def spectral_polish(band, fpolish=FPOLISH):
-    """Per-band polish divisor from csv `fpolish` (`band`, `polish` columns), mapped onto `band` by
-    band number; bands the table lacks get 1.0."""
-    df = pd.read_csv(fpolish)
+    """Per-band polish divisor on `band` (by band number; 1.0 where the table has none).
+
+    `fpolish` is a `POLISH` name or a csv with `band` and `polish` columns.
+    """
+    df = pd.read_csv(POLISH.get(fpolish, fpolish))
     band = np.asarray(band)
     coeff = pd.Series(df["polish"].to_numpy(), index=df["band"].to_numpy()).reindex(band).fillna(1.0)
     return xr.DataArray(coeff.to_numpy(), coords={"band": band})
@@ -51,14 +55,11 @@ def moving_average(da, width=3, edges="pair"):
 
 
 def apply_smoothing(da, smoothing, swindow):
-    """Smooth the spectra using boxcar or Gaussian smoothing."""
+    """Smooth the spectra over `swindow` bands: "boxcar", "gaussian" (odd window, NaN-preserving) or "savgol"."""
     if smoothing.lower() == "boxcar":
-        # Moving average over wavelength (test this since .mean on a rolling array may not handle NaNs correctly)
         da = da.rolling({"band": swindow}, center=True, min_periods=swindow / 2).mean(["band"])
     elif smoothing.lower() == "gaussian":
-        # make a gaussian length of swindow, normalize, apply to rolling window as dot product
-        # note: this interpolates NaN to allow spectra to be smooth up to a NaN band
-        #  we then need to reapply the NaNs at the end. More steps and more expensive than moving avg
+        # Interpolate NaN so spectra smooth up to a NaN band, then put the NaNs back.
         if not swindow % 2:
             raise ValueError("Gaussian swindow must be odd.")
         gaussian = norm(loc=0, scale=1).pdf(np.arange(swindow) - swindow // 2)
@@ -71,63 +72,14 @@ def apply_smoothing(da, smoothing, swindow):
             .dot(weights)
             .where(~da.isnull())
         )
-    elif smoothing.lower() == "savgol":
-        da = smooth_savgol(da, swindow)  # Assumes polyorder=2
+    elif smoothing.lower() == "savgol":  # polyorder 2; spectra must have no NaNs
+        da = xr.apply_ufunc(
+            savgol_filter,
+            da,
+            kwargs={"window_length": swindow, "polyorder": 2, "axis": -1},
+            input_core_dims=[["band"]],
+            output_core_dims=[["band"]],
+            dask="parallelized",
+            output_dtypes=[float],
+        )
     return da
-
-
-def smooth_savgol(data: xr.DataArray, savgol_window: int = 9, savgol_polyorder: int = 2) -> xr.DataArray:
-    """
-    Savitzky-Golay filtering for spectral smoothing. Must have no NaNs.
-    """
-
-    def filter_spectrum(spectrum):
-        """Apply Savitzky-Golay to a single spectrum."""
-        # needed for dask
-        spectrum = np.array(spectrum, copy=True)
-        # TODO (optional): Can remove spikes here using method from https://doi.org/10.1029/2024JE008842
-
-        # Savitzky-Golay
-        spectrum = savgol_filter(spectrum, window_length=savgol_window, polyorder=savgol_polyorder)
-        return spectrum
-
-    # Apply combined filter
-    result: xr.DataArray = xr.apply_ufunc(
-        filter_spectrum,
-        data,
-        input_core_dims=[["band"]],
-        output_core_dims=[["band"]],
-        vectorize=True,
-        dask="parallelized",
-        output_dtypes=[float],
-    )
-
-    return result
-
-
-def polish(rad, cfg, **_):
-    """Divide by the per-band polish table named by `cfg.polish`."""
-    if cfg.polish is None:
-        return rad
-    t0 = time.monotonic()
-    out = rad / spectral_polish(rad.band, POLISH.get(cfg.polish, cfg.polish))
-    return io.get_step_log(out, rad, "polish", cfg.polish, t0, cfg, ("polish",))
-
-
-def smooth(rad, cfg, **_):
-    """Spectral moving average of width `cfg.smoothing`."""
-    if cfg.smoothing <= 1:
-        return rad
-    t0 = time.monotonic()
-    out = moving_average(rad, cfg.smoothing, cfg.smoothing_edges)
-    return io.get_step_log(out, rad, "smoothing", "moving_average", t0, cfg, ("smoothing", "smoothing_edges"))
-
-
-def clip_fill(rad, cfg, **_):
-    """Zero negative reflectance, then write `cfg.fill_nan` over every NaN."""
-    if not cfg.clip_negative and cfg.fill_nan is None:
-        return rad
-    t0 = time.monotonic()
-    out = rad.clip(min=0) if cfg.clip_negative else rad
-    out = out if cfg.fill_nan is None else out.fillna(cfg.fill_nan)
-    return io.get_step_log(out, rad, "clip_fill", "clip_fill", t0, cfg, ("clip_negative", "fill_nan"))

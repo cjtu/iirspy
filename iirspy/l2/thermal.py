@@ -1,9 +1,55 @@
-import time
+"""Thermal tail removal, the first L2 step: subtract the Moon's own emission before dividing by the solar flux.
+
+Past ~2.5 um the dayside Moon emits as well as reflects. Each pixel is taken as isothermal: T is its mean brightness
+temperature over `bands` (227-247, 4.5-4.9 um, where emission dominates), and eps * B(T, wl) is subtracted from
+every band, in radiance:
+
+    rad_reflected = rad - eps * B(T, wl)
+
+Where that T is not above `t_min` (shadow, noise), it falls back to the radiative-equilibrium temperature of a flat
+surface at the pixel's incidence (`flat_surface_temperature`): ~391 K at overhead sun, 0 K at the terminator.
+"""
+
 import warnings
 
 import numpy as np
 
-from iirspy import io
+C = 3e8  # speed of light [m/s]
+H = 6.626e-34  # Planck [J s]
+K_B = 1.38e-23  # Boltzmann [J/K]
+SIGMA = 5.670374e-8  # Stefan-Boltzmann [W/m^2/K^4]
+
+
+def subtract(rad, eps=1.0, bands=(227, 247), inc=None, sdist=1.0, t_min=0.0):
+    """`rad` less the isothermal tail eps * B(T), T [K] riding along as coord `T` (see `thermal_radiance`).
+
+    A cube with none of `bands` comes back unchanged, with a warning.
+    """
+    trad, temp = thermal_radiance(rad, eps, bands, inc=inc, sdist=sdist, t_min=t_min)
+    return rad if temp is None else (rad - trad).assign_coords(T=temp)
+
+
+def thermal_radiance(rad, eps=1.0, bands=(227, 247), inc=None, sdist=1.0, t_min=0.0):
+    """(eps * B(T), T) for an isothermal surface, T [K] per pixel.
+
+    T is the mean brightness temperature at emissivity `eps` over IIRS band numbers `bands`
+    (1-indexed, inclusive), selected by band number. `rad` is (band, y, x) [W/m^2/sr/um] with a
+    `wl` [nm] coord. Where T is not above `t_min` (or not finite) and `inc` [deg] is given, T falls
+    back to `flat_surface_temperature(inc, sdist)`. A cube with none of `bands` has no thermal
+    term: (0.0, None).
+    """
+    tb = rad.sel(band=slice(*bands))
+    if not tb.sizes["band"]:
+        warnings.warn(f"no thermal bands {bands} in the cube, thermal removal skipped", UserWarning, stacklevel=2)
+        return 0.0, None
+    wl_t = tb.wl * 1e-9
+    q = np.log(eps * 2 * H * C**2 * 1e-6 / (tb * wl_t**5) + 1)
+    t = (H * C / (wl_t * K_B * q)).mean("band")
+    if inc is not None:
+        t = t.where(t > t_min, flat_surface_temperature(inc, sdist))
+    wl = rad.wl * 1e-9
+    bbr = 1e-6 * (2 * H * C * C / wl**5) * 1 / (np.exp(H * C / (wl * K_B * t)) - 1)
+    return eps * bbr, t
 
 
 def flat_surface_temperature(inc, sdist=1.0, s0=1370.0, eps=0.95, a0=0.08, a=0.045, b=0.14):
@@ -23,41 +69,4 @@ def flat_surface_temperature(inc, sdist=1.0, s0=1370.0, eps=0.95, a0=0.08, a=0.0
     """
     albedo = a0 + a * (inc / 45) ** 3 + b * (inc / 90) ** 8
     cos_i = np.clip(np.cos(np.radians(inc)), 0, None)
-    return (s0 / sdist**2 * (1 - albedo) * cos_i / (eps * 5.670374e-8)) ** 0.25
-
-
-def thermal_radiance(rad, eps=1.0, bands=(227, 247), inc=None, sdist=1.0, t_min=0.0):
-    """(eps * B(T), T) for an isothermal surface, T [K] per pixel.
-
-    T is the mean brightness temperature at emissivity `eps` over IIRS band numbers `bands`
-    (1-indexed, inclusive), selected by band number. `rad` is (band, y, x) [W/m^2/sr/um] with a
-    `wl` [nm] coord. Where T is not above `t_min` (or not finite) and `inc` [deg] is given, T falls
-    back to `flat_surface_temperature(inc, sdist)`. A cube with none of `bands` has no thermal
-    term: (0.0, None).
-    """
-    tb = rad.sel(band=slice(*bands))
-    if not tb.sizes["band"]:
-        warnings.warn(f"no thermal bands {bands} in the cube, thermal removal skipped", UserWarning, stacklevel=2)
-        return 0.0, None
-    c, h, k = 3e8, 6.626e-34, 1.38e-23
-    wl_t = tb.wl * 1e-9
-    q = np.log(eps * 2 * h * c**2 * 1e-6 / (tb * wl_t**5) + 1)
-    t = (h * c / (wl_t * k * q)).mean("band")
-    if inc is not None:
-        t = t.where(t > t_min, flat_surface_temperature(inc, sdist))
-    wl = rad.wl * 1e-9
-    bbr = 1e-6 * (2 * h * c * c / wl**5) * 1 / (np.exp(h * c / (wl * k * t)) - 1)
-    return eps * bbr, t
-
-
-def subtract(rad, cfg, *, sdist, inc, **_):
-    """Remove the isothermal thermal tail eps * B(T) from `rad`; the temperature [K] rides along as coord `T`."""
-    if cfg.thermal == "none":
-        return rad
-    t0 = time.monotonic()
-    trad, temp = thermal_radiance(
-        rad, cfg.thermal_eps, cfg.thermal_bands, inc=inc, sdist=sdist, t_min=cfg.thermal_t_min
-    )
-    out = (rad - trad).assign_coords(T=temp)
-    fields = ("thermal_eps", "thermal_bands", "thermal_t_min")
-    return io.get_step_log(out, rad, "thermal", cfg.thermal, t0, cfg, fields)
+    return (s0 / sdist**2 * (1 - albedo) * cos_i / (eps * SIGMA)) ** 0.25

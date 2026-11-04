@@ -1,4 +1,14 @@
-import time
+"""Solar flux division, the second L2 step: thermal-free radiance -> radiance factor (I/F).
+
+Each band is divided by the solar spectral radiance at the scene's Sun distance d [AU],
+
+    I/F = rad / (F_sun(band) / (pi d^2))
+
+`flux` picks F_sun, all convolved to IIRS bands at 1 AU: the ISSDC file (default), HSRS v2, or NOAA SSI CDR v03
+(2010-2019 mean or the scene's month). `sdist` is "spice" (SPICE at the scene's mid-line epoch), "none" (1 AU)
+or a value in AU. The flux files are in mW/cm^2/um; x10 converts to W/m^2/um.
+"""
+
 import warnings
 from pathlib import Path
 
@@ -21,6 +31,29 @@ FSOLAR_HSRS = str(PKG_DATA.joinpath("ch2_iirs_solar_flux_hsrs.txt"))
 AU_KM = 1.495978707e8
 
 
+def divide_flux(rad, flux="issdc", sdist=1.0, qub=None):
+    """`rad` over the solar flux at `sdist` AU; `flux` is an `L2Config.flux` value, `qub` the label (monthly CDR)."""
+    if isinstance(flux, tuple):
+        n = len(flux)
+        f = flux[0] if n == 1 else xr.DataArray(np.asarray(flux), coords={"band": np.arange(1, n + 1)})
+    elif flux == "noaa_cdr_mean":
+        f = get_noaa_flux(sdist)
+    elif flux == "noaa_cdr_monthly":
+        f = get_noaa_flux(sdist, pd.Timestamp(pdr.open(qub).metaget("start_date_time")).strftime("%Y-%m"))
+    else:
+        f = get_solar_flux(sdist, {"issdc": FSOLAR, "hsrs": FSOLAR_HSRS}.get(flux, flux))
+    out = rad / f
+    out.attrs["solar_distance_au"] = sdist
+    return out
+
+
+def sun_distance(sdist, qub=None):
+    """Sun distance [AU] for an `L2Config.sdist` value; "spice" without a label `qub` is 1 AU."""
+    if sdist == "spice":
+        return get_solar_distance(qub) if qub else 1.0
+    return 1.0 if sdist == "none" else float(sdist)
+
+
 def get_noaa_flux(sdist=1.0, month=None, fflux=FNOAA):
     """NOAA SSI CDR v03 solar flux [W/m^2/sr/um] at `sdist` AU on band 1..256 (see `FNOAA`).
 
@@ -35,16 +68,16 @@ def get_noaa_flux(sdist=1.0, month=None, fflux=FNOAA):
 
 
 def get_solar_flux(sdist=1.0, fflux=FSOLAR):
-    """Return IIRS solar flux as DataArray along band."""
+    """IIRS solar flux [W/m^2/sr/um] at `sdist` AU along band, from a file in ISSDC's format."""
     L = np.loadtxt(fflux, delimiter="\t", usecols=1)
-    flux = L * 10 / (np.pi * sdist**2)  # [W/m^2/sr/um]
+    flux = L * 10 / (np.pi * sdist**2)
     return xr.DataArray(flux, coords={"band": np.arange(1, 257)}, name="Solar flux [W/m^2/sr/um]")
 
 
 def get_solar_distance(fimg, kernels=None):
-    """Return the Sun-Moon distance in AU at the scene's mid-line epoch, from SPICE.
+    """Sun-Moon distance [AU] at the scene's mid-line epoch, from SPICE.
 
-    `kernels=None` resolves the kernel set via `spice_kernels(day)`. Warns and returns 1.0 AU if
+    `kernels=None` resolves the kernel set via `io.spice_kernels(day)`. Warns and returns 1.0 AU if
     the label or kernels can't be found.
     """
     import spiceypy as sp
@@ -62,32 +95,3 @@ def get_solar_distance(fimg, kernels=None):
         warnings.warn(f"get_solar_distance: could not compute from SPICE for {fimg} ({e}); using 1.0 AU", stacklevel=2)
         return 1.0
     return float(np.linalg.norm(v) / AU_KM)
-
-
-def sun_distance(cfg, qub):
-    """Sun distance [AU] for `cfg.sdist`; "spice" without a label is 1 AU."""
-    if cfg.sdist == "none":
-        return 1.0
-    if cfg.sdist == "spice":
-        return get_solar_distance(qub) if qub else 1.0
-    return float(cfg.sdist)
-
-
-def solar_flux(cfg, sdist, qub):
-    """Per-band solar flux [W/m^2/sr/um] at `sdist` for `cfg.flux`."""
-    if isinstance(cfg.flux, tuple):
-        n = len(cfg.flux)
-        return cfg.flux[0] if n == 1 else xr.DataArray(np.asarray(cfg.flux), coords={"band": np.arange(1, n + 1)})
-    if cfg.flux == "noaa_cdr_mean":
-        return get_noaa_flux(sdist)
-    if cfg.flux == "noaa_cdr_monthly":
-        return get_noaa_flux(sdist, pd.Timestamp(pdr.open(qub).metaget("start_date_time")).strftime("%Y-%m"))
-    return get_solar_flux(sdist, {"issdc": FSOLAR, "hsrs": FSOLAR_HSRS}.get(cfg.flux, cfg.flux))
-
-
-def divide_flux(rad, cfg, *, qub, sdist, **_):
-    """Radiance -> radiance factor: divide by the solar flux at `sdist`."""
-    t0 = time.monotonic()
-    out = rad / solar_flux(cfg, sdist, qub)
-    out.attrs["solar_distance_au"] = sdist
-    return io.get_step_log(out, rad, "solar", str(cfg.flux), t0, cfg, ("flux", "sdist"), qub=str(qub))

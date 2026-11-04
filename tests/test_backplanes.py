@@ -158,7 +158,7 @@ def test_glt_from_loc_recovers_known_camera_pixels(monkeypatch):
 
     import xarray as xr
 
-    from iirspy.georef import GeorefConfig, glt_from_loc
+    from iirspy.georef.georef import GeorefConfig, glt_from_loc
 
     # camera and output grids share the same 2000 m spacing, chosen so every camera point sits
     # exactly on an output cell centre: no ties for "nearest" to break either way.
@@ -188,7 +188,7 @@ def test_glt_from_loc_no_holes_when_camera_spacing_coarser_than_output_grid():
 
     import xarray as xr
 
-    from iirspy.georef import GeorefConfig, glt_from_loc
+    from iirspy.georef.georef import GeorefConfig, glt_from_loc
 
     # camera points 2000 m apart; output grid at 500 m, 4x finer than the camera spacing. A cutoff
     # of one output pixel (the old bug) misses most cells inside the footprint.

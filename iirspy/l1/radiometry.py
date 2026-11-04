@@ -1,6 +1,16 @@
+"""Radiometric scale, the L1 step from (dark/flat-corrected) DN to radiance [W/m^2/sr/um].
+
+    rad = 10 * (gain * DN + offset)     gain, offset in mW/cm^2/sr/um per DN; x10 converts to W/m^2/sr/um
+
+`calib` picks gain and offset: the ISSDC per-element LUT ("lut"), its per-band median ("lut_median", no
+cross-track structure), the median on an empirically corrected cube ("empirical", offset dropped when the scene's
+own dark was subtracted), or a G1 table `.npz` of per-epoch gains fitted on orbit.
+
+Only the e1g2 LUT (1 ms) is a real calibration; every scene uses it with the gain scaled by 1 ms / exposure, which
+is what ISSDC's own nci L1 does (see `get_gain_offset`).
+"""
+
 import hashlib
-import json
-import time
 import warnings
 from pathlib import Path
 
@@ -9,9 +19,28 @@ import pandas as pd
 import pdr
 import xarray as xr
 
-from iirspy import instrument, io
+from iirspy import instrument
 from iirspy.instrument import DCALIB, E1_EXPOSURE_MS
 from iirspy.l1.config import CALIB
+
+
+def radiometry(dn, qub, calib="lut", *, calib_dir=DCALIB, has_shadow=False):
+    """`dn` -> radiance [W/m^2/sr/um] by `calib`: "lut", "lut_median", "empirical" or a G1 table path.
+
+    `has_shadow` (empirical only) says the scene's residual dark was subtracted, so the LUT offset is dropped. A G1
+    table's provenance rides along as attrs and its bad-element mask as the `calib_bad` (band, x) coord.
+    """
+    if calib in (*CALIB, "empirical"):
+        gain, offset = get_gain_offset(qub, calib_dir=calib_dir)
+        if calib != "lut":
+            gain, offset = gain.median("x"), offset.median("x")
+        if calib == "empirical" and has_shadow:
+            offset = 0.0
+        return 10 * (dn * gain + offset)
+    gain, offset, bad, attrs = _read_g1_table(calib, pd.Timestamp(pdr.open(qub).metaget("start_date_time")))
+    rad = 10 * (dn * gain * (E1_EXPOSURE_MS / instrument.get_exposure_duration(qub)) + offset)  # e1 units, as the LUT
+    rad.attrs.update(attrs)
+    return rad if bad is None else rad.assign_coords(calib_bad=(("band", "x"), bad.values))
 
 
 def load_reference_flat(fimg, calib_dir=DCALIB):
@@ -38,7 +67,7 @@ def get_gain_offset(fimg, denoise=False, gain_z=None, offset_z=None, calib_dir=D
     Only ch2_iirs_cal_e1g2_lut_coeff.csv is a real calibration. The e2g2/e3g2/e4g2 tables are
     placeholders: gain ~ 1.0 at every (band, x) with no spectral structure at all, ~360x flatter
     across band than the true response. Used as shipped they put radiance ~1000x high, every pixel
-    trips the saturation cut in calibrate_to_rad, and the whole cube is nulled.
+    trips the saturation cut in `mask`, and the whole cube is nulled.
 
     ISSDC's own L1 product does not use them either. Differencing the e2g2 scene
     20201203T1859574285 against its nci L1 gives L1 = 333.6 +/- 3.8 * gain_e1g2 * DN over bands
@@ -50,12 +79,7 @@ def get_gain_offset(fimg, denoise=False, gain_z=None, offset_z=None, calib_dir=D
     Note the e2g2/e3g2/e4g2 saturations_radiance tables sit ~3x above the resulting full-scale
     radiance, so the saturation cut cannot fire for those scenes (safe, but not a real check).
 
-    Parameters
-    ----------
-    flut : str
-        Path to the lookup table file.
-    denoise: bool
-        Replace speckly noise from gain / offset with NaN.
+    `denoise` replaces speckle (robust z above `gain_z` / `offset_z` in a 5-column window) with NaN.
     """
     flut = str(Path(calib_dir) / "ch2_iirs_cal_e1g2_lut_coeff.csv")
     gain_scale = E1_EXPOSURE_MS / instrument.get_exposure_duration(fimg)
@@ -116,40 +140,3 @@ def _read_g1_table(fnpz, t):
         "calib_table_epoch": str(starts[e].date()),
     }
     return gain, offset, mask, attrs
-
-
-def _lut(dn, cfg, qub, calib_dir):
-    gain, offset = get_gain_offset(qub, calib_dir=calib_dir)
-    return 10 * (dn * gain + offset)
-
-
-def _lut_median(dn, cfg, qub, calib_dir):
-    gain, offset = get_gain_offset(qub, calib_dir=calib_dir)
-    return 10 * (dn * gain.median("x") + offset.median("x"))
-
-
-def _g1(dn, cfg, qub, calib_dir):
-    start = pd.Timestamp(pdr.open(qub).metaget("start_date_time"))
-    gain, offset, bad, attrs = _read_g1_table(cfg.calib, start)
-    gain = gain * (E1_EXPOSURE_MS / instrument.get_exposure_duration(qub))  # e1 units, as the LUT
-    rad = 10 * (dn * gain + offset)
-    rad.attrs.update(attrs)
-    return rad if bad is None else rad.assign_coords(calib_bad=(("band", "x"), bad.values))
-
-
-def _empirical(dn, cfg, qub, calib_dir):
-    gain, offset = get_gain_offset(qub, calib_dir=calib_dir)
-    if json.loads(dn.attrs["empirical_notes"])["has_shadow"]:
-        return 10 * gain.median("x") * dn
-    return 10 * (gain.median("x") * dn + offset.median("x"))
-
-
-RADIOMETRY = {"lut": _lut, "lut_median": _lut_median, "g1": _g1, "empirical": _empirical}
-
-
-def radiometry(dn, cfg, *, qub, calib_dir=DCALIB, **_):
-    """DN (dark and flat/smile corrected when `cfg.empirical`) -> radiance [W/m^2/sr/um]."""
-    t0 = time.monotonic()
-    method = "empirical" if cfg.empirical else cfg.calib if cfg.calib in CALIB else "g1"
-    rad = RADIOMETRY[method](dn, cfg, qub, calib_dir)
-    return io.get_step_log(rad, dn, "radiometry", method, t0, cfg, ("calib",), qub=str(qub))

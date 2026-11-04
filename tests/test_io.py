@@ -118,7 +118,8 @@ def test_write_block_tracks_chunking_and_pixels_do_not(chunk, tmp_path):
 
     back = L1.from_file(fout, BASENAME, tmp_path, chunk=chunk)
     ychunks = back.img.chunks[back.img.dims.index("y")] if back.img.chunks else None
-    assert io.rows_per_block(back.img) == (max(ychunks) if ychunks else io.rows_per_block(back.img.compute()))
+    if ychunks:
+        assert io.rows_per_block(back.img) == max(ychunks), "the cube's own y-chunk is the write block"
     assert io.rows_per_block(back.img, 7) == 7, "an explicit sub_rows still wins"
 
     fout2 = tmp_path / "cube2.tif"

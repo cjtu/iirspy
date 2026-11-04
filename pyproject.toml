@@ -33,7 +33,7 @@ dependencies = [
 ]
 
 [project.scripts]
-iirs-solve-scene = "iirspy.cli.solve:main"
+iirs-georef-solve = "iirspy.cli.georef_solve:main"
 iirs-compute-refl = "iirspy.cli.refl:main"
 iirs-make-glt = "iirspy.cli.make_glt:main"
 iirs-fix-frames = "iirspy.cli.fixframes:main"

@@ -101,7 +101,7 @@ def test_displacement_field_falls_back_to_the_bulk_median_on_collinear_tie_point
     """
     import pandas as pd
 
-    from iirspy.georef import GeorefConfig, displacement_field
+    from iirspy.georef.georef import GeorefConfig, displacement_field
 
     cfg = GeorefConfig()
     q = np.array([[-4e5, -8.5e5], [-3e5, -7e5]])  # on and far off the support
@@ -212,7 +212,7 @@ def test_coarse_shift_falls_through_to_a_lower_ranked_base_peak_when_rank0_fails
 
     import skimage.registration._masked_phase_cross_correlation as mpc
 
-    from iirspy.georef import GeorefConfig, coarse_shift
+    from iirspy.georef.georef import GeorefConfig, coarse_shift
 
     def peaks_at(*entries):
         x = np.zeros((9, 9))

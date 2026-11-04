@@ -1,3 +1,8 @@
+"""The "issdc" georef method: rebuild ISSDC's own geometry (csv lon/lat, spm angles per line) as a `Geometry`.
+
+No registration and no DEM: the flat-Moon reference for comparing against "arosics" solves.
+"""
+
 import numpy as np
 
 from iirspy import io

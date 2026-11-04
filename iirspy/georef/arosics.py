@@ -48,6 +48,25 @@ CONSENSUS_MAX_DRIFT_CROSS = 0.012
 CONSENSUS_LOCAL_K = 5
 CONSENSUS_HOLD_CHUNKS = 2.0
 
+# How a fit json written before one of these knobs existed must be read, so an old cache is only
+# reused by a run that also leaves them off.
+TWEAK_DEFAULTS = {
+    "edge_reject_m": 0.0,
+    "edge_reject_axis": "all",
+    "shadow_max": 1.0,
+    "edge_dense_m": 0.0,
+    "edge_fit_k": 0,
+    "p95_plateau_frac": 0.0,
+    "min_iter": 0,
+    "gcp_row_margin": 250,
+}
+
+GRADE_OF = {"tight": "pass", "acceptable": "warn", "failed": "fail", None: "warn"}
+
+# Copied to `keep`, each after the `<sid>_<group>` prefix every work-dir file carries. Everything else (chunk
+# gcps/fits/plan, hillshades, the L1 and its vrt) is the scratch restart cache.
+KEEP_GLOBS = (".gcps", "_glt.tif", "_loc.tif", "_solve_summary.json", "_solve.log", "_L1_b*.tif")
+
 
 def _cross_fade(t: float) -> float:
     """Weight for the earlier of two overlapping chunks: 1 at the overlap's start, 0 at its end.
@@ -71,20 +90,6 @@ def load_gcps(path: Path) -> dict:
         r, c, x, y = (float(v) for v in line.split(","))
         gcps_by_rc[(r, c)] = (x, y)
     return gcps_by_rc
-
-
-# How a fit json written before one of these knobs existed must be read, so an old cache is only
-# reused by a run that also leaves them off.
-TWEAK_DEFAULTS = {
-    "edge_reject_m": 0.0,
-    "edge_reject_axis": "all",
-    "shadow_max": 1.0,
-    "edge_dense_m": 0.0,
-    "edge_fit_k": 0,
-    "p95_plateau_frac": 0.0,
-    "min_iter": 0,
-    "gcp_row_margin": 250,
-}
 
 
 def _cached_chunk(
@@ -148,7 +153,7 @@ def gcp_list(merged: dict) -> list:
 
 def make_glt(sid: str, group: str, merged: dict, cfg0, scan0: int, glt_dir: str, overwrite: bool = False) -> Path:
     """Build the scene's GLT from the merged GCPs."""
-    from iirspy import georef
+    from iirspy.georef import georef
 
     gcps = gcp_list(merged)
     xs, ys = [g.x for g in gcps], [g.y for g in gcps]
@@ -185,9 +190,6 @@ def make_loc(
     backplanes.write_loc(floc, loc, sid, row0=scan0, fits=fits, dem_roots=dem_roots)
     log.info(f"loc: {floc} {lon.shape}, peak RSS {peak0:.0f} -> {_peak_mb():.0f} MB")
     return floc
-
-
-GRADE_OF = {"tight": "pass", "acceptable": "warn", "failed": "fail", None: "warn"}
 
 
 def geometry(
@@ -277,11 +279,6 @@ def _quality(summary: dict) -> dict:
     return quality("arosics", GRADE_OF[summary.get("solve_grade")], max(agree) if agree else None)
 
 
-# Copied to `keep`, each after the `<sid>_<group>` prefix every work-dir file carries. Everything else (chunk
-# gcps/fits/plan, hillshades, the L1 and its vrt) is the scratch restart cache.
-KEEP_GLOBS = (".gcps", "_glt.tif", "_loc.tif", "_solve_summary.json", "_solve.log", "_L1_b*.tif")
-
-
 def keep_products(sid: str, group: str, out: Path, dest: Path) -> list[Path]:
     """Copy the durable products in `out` (see `KEEP_GLOBS`) to `dest`, skipping any already there unchanged.
     Returns what was copied."""
@@ -363,7 +360,7 @@ def solve(
     """Solve every chunk, merge with a cross-fade, warp, and write the merged GCPs, GLT, LOC and solve summary to
     `work` (and `keep`, the GCPs and GLT before the LOC). Returns the group's `Geometry` with those as sidecars;
     its LOC is read on demand."""
-    from iirspy import georef
+    from iirspy.georef import georef
     from iirspy.georef.geometry import Geometry
 
     t_start = time.time()
@@ -600,7 +597,7 @@ def _is_anchor(r, cfg0) -> bool:
     a chunk kilometres off keeps 0.003-0.017 of its tie-point candidates.
 
     >>> from dataclasses import replace
-    >>> from iirspy.georef import GeorefConfig
+    >>> from iirspy.georef.georef import GeorefConfig
     >>> cfg = replace(GeorefConfig(), min_match_frac=0.10)
     >>> _is_anchor({"fit": {"quality": {"match_frac": 0.167}}}, cfg)  # refused its peak, matched
     True

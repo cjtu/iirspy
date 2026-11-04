@@ -1,8 +1,13 @@
+"""File I/O and data locations: find ISSDC bundle members and reprocessed products, read labels, write ENVI/GeoTIFF.
+
+`Paths` resolves the data trees from `IIRS_*` env vars on first use. `get_iirs_paths` finds each scene's files by
+extension, in ISSDC's `<subdir>/<YYYYMMDD>/` layout first, then flat, then by a recursive walk. Cube writers
+stream row blocks, so peak memory is one block whatever the scene size.
+"""
+
 import hashlib
-import json
 import os
 import re
-import time
 from importlib import metadata
 from pathlib import Path
 from typing import Any
@@ -15,8 +20,22 @@ import rasterio
 CHUNKSIZE = 128 * 2**20  # [B] dask y-chunk target (dask's array.chunk-size default; profiled fastest + lowest RAM)
 
 
-# Convert data level to "Mission-Type-Camera" identifier
-LVL2MTC = {0: "nri", 1: "nci", 2: "ndi"}
+LVL2MTC = {0: "nri", 1: "nci", 2: "ndi"}  # data level -> ISSDC "Mission-Type-Camera" identifier
+LVL2DIR = {0: "raw", 1: "calibrated", 2: "derived"}  # data level -> ISSDC bundle subdir
+# ext -> subdir of an ISSDC bundle ({lvl} = LVL2DIR[level]); "xml-csv" is the csv's xml label
+ISSDC_SUBDIR = {
+    **dict.fromkeys(("png", "xml-png"), "browse/{lvl}"),
+    **dict.fromkeys(("hdr", "qub", "xml"), "data/{lvl}"),
+    **dict.fromkeys(("csv", "xml-csv"), "geometry/calibrated"),
+    **dict.fromkeys(("lbr", "oat", "oath", "spm"), "miscellaneous/{lvl}"),
+}
+# ext -> (subdir, suffix) of iirspy's reprocessed products, one per solve group; "tif" depends on the level
+REPROCESSED = {
+    "gcps": ("geometry/recalibrated", ".gcps"),
+    "loc": ("geometry/recalibrated", "_loc.tif"),
+    "obs": ("data/rederived", "_obs.tif"),
+}
+ENVI_DTYPE_CODES = {"uint8": 1, "int16": 2, "int32": 3, "float32": 4, "float64": 5, "uint16": 12}
 
 
 try:
@@ -159,7 +178,7 @@ def _find_recursive(ddir, subdir, ext, wanted):
     return {b: f for f in Path(ddir).glob(f"**/{subdir}/**/*.{ext}") if (b := _iirs_basename(f)) in wanted}
 
 
-def _find_reprocessed(ddir, subdir, bnames, suffix, group=None):
+def _find_reprocessed(ddir, subdir, suffix, bnames, group=None):
     """Reprocessed products at `<ddir>/<subdir>/<sid[:8]>/<sid>_<group><suffix>`, the flat day-dir
     layout of ISSDC's own trees. `group=None` matches any group but raises if a sid has several."""
     found: dict[str, Path] = {}
@@ -170,45 +189,6 @@ def _find_reprocessed(ddir, subdir, bnames, suffix, group=None):
         if hits:
             found[sid] = hits[0]
     return found
-
-
-def _find_by_basename(ddir, subdir, ext, bnames):
-    """Look up each sid in `bnames`, cheapest strategy first (see `_find_direct`/`_find_flat`/
-    `_find_recursive`), only escalating for sids the previous tier didn't find."""
-    found = _find_direct(ddir, subdir, ext, bnames)
-    missing = [sid for sid in bnames if sid not in found]
-    if missing:
-        found.update(_find_flat(ddir, ext, missing))
-        missing = [sid for sid in bnames if sid not in found]
-    if missing:
-        found.update(_find_recursive(ddir, subdir, ext, missing))
-    return found
-
-
-def _resolve_ext(ddir, ext, level, bnames, group=None):
-    """Every path `get_iirs_paths` knows how to locate for one `ext` at one `level`."""
-    LVL2DIR = {0: "raw", 1: "calibrated", 2: "derived"}
-    if ext == "gcps":
-        return _find_reprocessed(ddir, "geometry/recalibrated", bnames, ".gcps", group)
-    if ext == "loc":
-        return _find_reprocessed(ddir, "geometry/recalibrated", bnames, "_loc.tif", group)
-    if ext == "obs":
-        return _find_reprocessed(ddir, "data/rederived", bnames, "_obs.tif", group)
-    if ext == "tif":
-        if level == 1:
-            return _find_reprocessed(ddir, "data/recalibrated", bnames, "_l1_rad.tif", group)
-        return _find_reprocessed(ddir, "data/rederived", bnames, "_l2_refl.tif", group)
-    if ext in ("png", "xml-png"):
-        subdir = "browse/" + LVL2DIR[level]
-    elif ext in ("hdr", "qub", "xml"):
-        subdir = "data/" + LVL2DIR[level]
-    elif ext in ("csv", "xml-csv"):
-        subdir = "geometry/calibrated"
-    elif ext in ("lbr", "oat", "oath", "spm"):
-        subdir = "miscellaneous/" + LVL2DIR[level]
-    else:
-        raise ValueError(f"Unknown IIRS file extension: {ext}")
-    return _find_by_basename(ddir, subdir, ext.split("-")[0], bnames)
 
 
 def get_iirs_paths(
@@ -225,7 +205,21 @@ def get_iirs_paths(
     out: dict[str, Any] = {}
     bnames = [basenames] if isinstance(basenames, str) else list(basenames)
     for ext in exts:
-        found = _resolve_ext(ddir, ext, level, bnames, group)
+        if ext == "tif":
+            subdir, suffix = ("data/recalibrated", "_l1_rad.tif") if level == 1 else ("data/rederived", "_l2_refl.tif")
+            found = _find_reprocessed(ddir, subdir, suffix, bnames, group)
+        elif ext in REPROCESSED:
+            found = _find_reprocessed(ddir, *REPROCESSED[ext], bnames, group)
+        elif ext in ISSDC_SUBDIR:
+            # cheapest lookup first, escalating only for the sids the previous tier missed
+            subdir, e = ISSDC_SUBDIR[ext].format(lvl=LVL2DIR[level]), ext.split("-")[0]
+            found = _find_direct(ddir, subdir, e, bnames)
+            if missing := [sid for sid in bnames if sid not in found]:
+                found.update(_find_flat(ddir, e, missing))
+            if missing := [sid for sid in bnames if sid not in found]:
+                found.update(_find_recursive(ddir, subdir, e, missing))
+        else:
+            raise ValueError(f"Unknown IIRS file extension: {ext}")
         if found:
             out[ext] = found
     # Add list of basenames to dict
@@ -239,24 +233,6 @@ def get_iirs_shape_meta(fimg):
     axs = pdr.open(fimg).metaget("Array_3D_Spectrum").getall("Axis_Array")
     bands, lines, samples = (int(axs[i]["elements"]) for i in range(3))
     return bands, lines, samples
-
-
-def get_step_log(out, prev, step: str, method: str, t0: float, cfg=None, fields=(), **inputs):
-    """`out` carrying `prev`'s attrs and its provenance list plus one entry for this step.
-
-    `t0` is the step's `time.monotonic()` start; `fields` names the `cfg` fields the step read.
-    """
-    entry = {
-        "step": step,
-        "method": method,
-        "cfg": {f: getattr(cfg, f) for f in fields},
-        "version": IIRSPY_VERSION,
-        "inputs": inputs,
-        "wall_s": round(time.monotonic() - t0, 3),
-    }
-    prov = [*json.loads(prev.attrs.get("provenance", "[]")), entry]
-    out.attrs = {**prev.attrs, **out.attrs, "provenance": json.dumps(prov, default=str)}
-    return out
 
 
 def provenance(**extra) -> dict:
@@ -303,9 +279,6 @@ def spice_kernels(day, spice_dir=None) -> list[Path]:
     if not any(f.suffix == ".bsp" for f in ks):
         raise FileNotFoundError(f"no SPK in {spice_dir / 'spk'} covers {day}")
     return ks
-
-
-ENVI_DTYPE_CODES = {"uint8": 1, "int16": 2, "int32": 3, "float32": 4, "float64": 5, "uint16": 12}
 
 
 def write_envi_hdr(
@@ -358,14 +331,6 @@ def write_envi_hdr(
     )
 
 
-def _write_bil_rows(f, da, i0, i1, sub_rows, dtype="float32"):
-    """Stream rows [i0:i1) of a (band, y, x) DataArray to open file f as ENVI BIL."""
-    for a in range(i0, i1, sub_rows):
-        b = min(a + sub_rows, i1)
-        blk = np.asarray(da.isel(y=slice(a, b)).values, dtype=dtype)  # (band, rows, x)
-        blk.transpose(1, 0, 2).tofile(f)  # C-order of (row, band, x) == ENVI BIL
-
-
 def write_envi_bil(da, fout, sub_rows, description="IIRS"):
     """Sequentially stream a (band, y, x) DataArray to an ENVI BIL file (bounded memory).
 
@@ -376,7 +341,9 @@ def write_envi_bil(da, fout, sub_rows, description="IIRS"):
     nband, ny, nx = da.shape
     dtype = str(da.dtype) if np.issubdtype(da.dtype, np.integer) else "float32"
     with open(fout, "wb") as f:
-        _write_bil_rows(f, da, 0, ny, sub_rows, dtype)
+        for a in range(0, ny, sub_rows):
+            blk = np.asarray(da.isel(y=slice(a, a + sub_rows)).values, dtype=dtype)  # (band, rows, x)
+            blk.transpose(1, 0, 2).tofile(f)  # C-order of (row, band, x) == ENVI BIL
     has_wl = "wl" in da.coords
     wls = da.wl.values if has_wl else None
     band_names = None if has_wl else da.coords.get("band_name")

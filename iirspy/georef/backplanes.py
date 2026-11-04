@@ -41,6 +41,45 @@ DEM_MARGIN_M = 2_000.0  # bbox pad for a DEM window read around one row block's 
 AU_M = 1.495978707e11
 GEOM_SHADOW_LIT = 0.5  # lit fraction below this: sun centre below the local LOLA horizon
 
+OBS_NAMES = [
+    "sun_azimuth",
+    "sun_zenith",
+    "sensor_azimuth",
+    "sensor_zenith",
+    "phase",
+    "sun_distance",
+    "sensor_distance",
+    "facet_slope",
+    "facet_aspect",
+    "facet_cos_i",
+    "lit_frac",
+    "sky_view",
+    "snr",
+    "tie_dist",
+]
+
+ISSDC_OBS_FIXES = (
+    "vs ISSDC ndi _d_obs_: band 5 is the phase angle (ISSDC writes 180 - phase); band 6 is the absolute "
+    "Sun-pixel distance in AU (ISSDC: km, but labelled au minus a constant); band 7 "
+    "is the true pixel-IIRS range in m (ISSDC: near-constant ~1735.6 km); bands 8-9 are real facet "
+    "slope/aspect in deg (ISSDC: ~89.9 deg slope): slope is the tilt of the LOLA facet normal from the local "
+    "vertical, i.e. of the facet from the local horizontal (tangent) plane; aspect is the facet's downhill "
+    "direction projected onto that tangent plane, clockwise from local true north, 0-360; both from the DEM "
+    "gradient smoothed to the IIRS ground sample"
+)
+
+QA_BITS = {
+    "no_geometry": (0, "LOC undefined (row outside every solved group)"),
+    "gcp_extrapolated": (1, "outside the control lattice hull, LOC extrapolating"),
+    "in_gcp_chunk_overlap": (2, "overlap of two chunks of one group, geometry cross-faded"),
+    "in_gcp_region_overlap": (3, "overlap of two solve groups, geometry seam-blended"),
+    "in_geometric_shadow": (4, f"lit_frac < {GEOM_SHADOW_LIT} (sun centre below local LOLA horizon)"),
+    "is_lit": (5, f"broadband PAN snr >= {SHADOW_SNR}"),
+    "is_saturated": (6, "any PAN band at/above saturation radiance"),
+    "pan_incomplete": (7, "any PAN band NaN at this pixel"),
+    "no_topo": (8, "no DEM facet terms: facet_cos_i is the sphere cosine, slope/aspect/lit_frac NaN"),
+}
+
 
 def chunk_overlaps(chunks: list[dict]) -> list[tuple[int, int]]:
     """Crop-relative (row0, row1) overlaps between consecutive chunks of a solve summary's `chunks` plan."""
@@ -290,13 +329,6 @@ def _local_az_zenith(
     """(azimuth, zenith) [deg] of a unit look vector `u`, in the local topocentric frame
     (`east`/`north`/`up`, each same-shape as `u`): azimuth clockwise from local north 0-360,
     zenith from the local vertical (M3 OBS convention, DPSIS Sec 2.5.3.3).
-
-    >>> [round(float(v), 3) for v in _local_az_zenith(*[np.array(v) for v in
-    ...     ((0.5, 0.0, 0.8660254), (0, 1, 0), (0, 0, 1), (1, 0, 0))])]
-    [0.0, 60.0]
-    >>> [round(float(v), 3) for v in _local_az_zenith(*[np.array(v) for v in
-    ...     ((1.0, 0.0, 0.0), (0, 1, 0), (0, 0, 1), (1, 0, 0))])]
-    [0.0, 0.0]
     """
     az = np.degrees(np.arctan2((u * east).sum(0), (u * north).sum(0))) % 360
     zen = 90.0 - np.degrees(np.arcsin((u * up).sum(0)))
@@ -408,24 +440,6 @@ def _kernels_or_none(day: str, paths: io.Paths) -> list[Path]:
         return []
 
 
-OBS_NAMES = [
-    "sun_azimuth",
-    "sun_zenith",
-    "sensor_azimuth",
-    "sensor_zenith",
-    "phase",
-    "sun_distance",
-    "sensor_distance",
-    "facet_slope",
-    "facet_aspect",
-    "facet_cos_i",
-    "lit_frac",
-    "sky_view",
-    "snr",
-    "tie_dist",
-]
-
-
 def _group_obs(sid, group, lon, lat, radius, scan0, topo, snr, paths, stage_dir) -> tuple[dict, str, np.ndarray]:
     """One group's OBS bands (all but `tie_dist`) over its own rows, which start at absolute Scan `scan0`:
     ({name: (ny, nx)}, spacecraft source, (3, ny) spacecraft km). `topo`/`snr` may be `None` (-> NaN)."""
@@ -495,17 +509,6 @@ def obs_from_loc(
     }
 
 
-ISSDC_OBS_FIXES = (
-    "vs ISSDC ndi _d_obs_: band 5 is the phase angle (ISSDC writes 180 - phase); band 6 is the absolute "
-    "Sun-pixel distance in AU (ISSDC: km, but labelled au minus a constant); band 7 "
-    "is the true pixel-IIRS range in m (ISSDC: near-constant ~1735.6 km); bands 8-9 are real facet "
-    "slope/aspect in deg (ISSDC: ~89.9 deg slope): slope is the tilt of the LOLA facet normal from the local "
-    "vertical, i.e. of the facet from the local horizontal (tangent) plane; aspect is the facet's downhill "
-    "direction projected onto that tangent plane, clockwise from local true north, 0-360; both from the DEM "
-    "gradient smoothed to the IIRS ground sample"
-)
-
-
 def write_obs(
     fout: Path, obs: dict, sid: str, compress: str = "ZSTD", predictor: int = 3, row0: int = 0, tags: dict | None = None
 ) -> Path:
@@ -569,17 +572,6 @@ def write_obs(
 # ------------------------------------------------------------------------------------------
 # QA: uint16 bit flags
 # ------------------------------------------------------------------------------------------
-QA_BITS = {
-    "no_geometry": (0, "LOC undefined (row outside every solved group)"),
-    "gcp_extrapolated": (1, "outside the control lattice hull, LOC extrapolating"),
-    "in_gcp_chunk_overlap": (2, "overlap of two chunks of one group, geometry cross-faded"),
-    "in_gcp_region_overlap": (3, "overlap of two solve groups, geometry seam-blended"),
-    "in_geometric_shadow": (4, f"lit_frac < {GEOM_SHADOW_LIT} (sun centre below local LOLA horizon)"),
-    "is_lit": (5, f"broadband PAN snr >= {SHADOW_SNR}"),
-    "is_saturated": (6, "any PAN band at/above saturation radiance"),
-    "pan_incomplete": (7, "any PAN band NaN at this pixel"),
-    "no_topo": (8, "no DEM facet terms: facet_cos_i is the sphere cosine, slope/aspect/lit_frac NaN"),
-}
 
 
 def qa_mask(name: str) -> int:

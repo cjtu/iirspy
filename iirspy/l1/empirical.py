@@ -1,35 +1,24 @@
 """
-On-orbit empirical residual-dark / flat / smile correction for IIRS L0->L1 calibration.
+Empirical residual dark, flat and smile, the first L1 steps: per-scene detector corrections from the scene itself.
 
-The IIRS gain/offset LUT is applied per detector element (band, x), but its cross-track
-structure is poorly correlated with the true on-orbit detector response, injecting striping
-and speckle. This module derives three corrections from the scene itself and lets the L0->L1
-step use the LUT only for the per-band absolute scale (see `iirspy.l1.radiometry`):
+The ISSDC gain/offset LUT's cross-track structure correlates poorly with the on-orbit detector response and injects
+striping and speckle, so the LUT supplies only the per-band scale (`iirspy.l1.radiometry`) and three (band, x)
+frames come from the raw DN:
 
-  dark_resid(band, x) : median DN over the scene's shadow rows. L0 counts are already
-                        dark-subtracted onboard (pre-imaging night-side dark), so this is a
-                        *residual* dark - drift + hot/warm-pixel residuals + stray light. Its
-                        real job is per-element hot-pixel refinement. 0 when no shadow is found.
-  flat(band, x)       : sensor high-frequency response, R / lowpass_x(R), median-composited over
-                        the flattest rows of each brightness quantile bin. A hardware property,
-                        so it is transferable; falls back to a packaged reference flat when the
-                        scene has no qualifying flat region.
-  smile(band, x)      : band-relative smooth cross-track field. Only spectrally-varying smooth
-                        structure is divided out; the broadband scene gradient is preserved.
-
-Shadow and lit rows are both cut on the broadband SNR field (SHADOW_SNR, LIT_SNR), whose noise
-unit is the per-pixel scatter measured in the scene's own shadow.
-
-Correction model (shadow anchors the zero point; see `iirspy.l1.radiometry`):
+  dark_resid : median DN over the scene's shadow rows, the residual of the onboard dark subtraction (drift,
+               hot/warm pixels, stray light). 0 when the scene has no shadow.
+  flat       : sensor high-frequency response R / lowpass_x(R), composited over the flattest lit rows of each
+               brightness bin. A hardware property: the packaged reference flat stands in when a scene has none.
+  smile      : band-relative smooth cross-track field; the broadband scene gradient is kept.
 
   shadow scene   : rad = 10 * gain_med * (DN - dark_resid) / (flat * smile)   # LUT offset dropped
-  no-shadow scene: rad = 10 * (gain_med * DN / (flat * smile) + offset_med)   # LUT offset kept
+  no-shadow scene: rad = 10 * (gain_med * DN / (flat * smile) + offset_med)
 
-Everything here operates on the raw DN DataArray (band, y, x).
+Shadow and lit rows are cut on the broadband SNR (SHADOW_SNR, LIT_SNR), in units of the per-pixel scatter measured
+in the scene's own shadow.
 """
 
 import json
-import time
 import warnings
 from functools import cache
 
@@ -37,7 +26,7 @@ import numpy as np
 import xarray as xr
 from scipy.stats import norm
 
-from iirspy import instrument, io
+from iirspy import instrument
 from iirspy.instrument import PAN_BANDS
 from iirspy.l1.radiometry import load_reference_flat
 
@@ -76,6 +65,29 @@ SMILE_STRIDE = 8  # along-track subsample stride for the smile estimate
 
 # Constant: MAD -> standard deviation for a normal distribution, 1 / inverse_cdf(3/4)
 MAD_TO_SIGMA = 1.4826
+
+
+def residual_dark(dn, qub, *, subtract=True, attach_snr=True, calib_dir=instrument.DCALIB, **kws):
+    """(`dn` less the scene's residual dark, derivation notes): the first L1 step.
+
+    The empirical frames (`empirical_frames(dn, ref_flat, **kws)`) ride along as `empirical_*` (band, x) coords and
+    the notes as `attrs["empirical_notes"]`. The dark is subtracted, and the broadband SNR attached as `snr` with
+    `attach_snr`, only with `subtract` and a shadow in the scene; otherwise `dn` is unchanged.
+    """
+    dark, flat, smile, snr, notes = empirical_frames(dn, load_reference_flat(qub, calib_dir=calib_dir), **kws)
+    out = dn - dark if subtract and snr is not None else dn.copy()
+    extra = {"empirical_flat_unmasked": flat.attrs.get("unmasked")}
+    extra |= {f"empirical_flat_bin{i}": f for i, f in enumerate(flat.attrs.get("bins", []))}
+    out = out.assign_coords(
+        empirical_dark=(("band", "x"), dark.broadcast_like(flat).values),  # (x,)-only zeros when no shadow was found
+        empirical_flat=(("band", "x"), flat.values),
+        empirical_smile=(("band", "x"), smile.values),
+        **{k: (("band", "x"), v.values) for k, v in extra.items() if v is not None},
+    )
+    if subtract and snr is not None and attach_snr:
+        out = out.assign_coords(snr=(("y", "x"), snr.values))
+    out.attrs["empirical_notes"] = json.dumps(notes)
+    return out, notes
 
 
 def lowpass_x(da, w=CROSS_WIN):
@@ -360,7 +372,7 @@ def build_flat(img, dark, rs, lit, row_bright, ref_flat=None):
     if flats:
         unmasked = xr.concat(flats, dim="region").median("region").astype("float32")
         flat = unmasked.where(~bad)
-        # unmasked composite + per-bin flats ride along as attrs; L1.calibrate_to_rad attaches them as frames
+        # unmasked composite + per-bin flats ride along as attrs; `residual_dark` attaches them as frames
         flat.attrs.update(unmasked=unmasked, bins=[f.astype("float32") for f in flats])
         if ref_flat is not None:
             emp_notes["flat_ref_rms"] = _flat_rms(flat, ref_flat)
@@ -414,7 +426,7 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
               when apply_smile is False, in which case estimate_smile is skipped entirely).
       snr   : (y, x) float32 broadband SNR field above the dark level, or None when no shadow rows.
               snr is not None <=> a residual dark was derived <=> the scene anchors its own zero
-              point (calibrate_to_rad then drops the LUT offset).
+              point (`radiometry` then drops the LUT offset).
       emp_notes : JSON-serializable provenance dict (dark rows/source/threshold, flat runs,
               fallbacks fired, per-scene-vs-reference flat RMS) stored in the product's attrs.
 
@@ -576,39 +588,3 @@ def detect_stripes_2D(data, threshold):
     num_anom = np.sum(((data < data_l) & (data < data_r)) | ((data > data_l) & (data > data_r)), axis=0)
     is_stripe_x = num_anom > threshold  # 1D bool array along samples (x)
     return is_stripe_x
-
-
-def residual_dark(dn, cfg, *, qub, calib_dir=instrument.DCALIB, empirical_kws=None, **_):
-    """Derive the empirical frames from `dn` and, with `cfg.empirical`, subtract the scene's residual dark.
-
-    The frames ride along as `empirical_*` coords, the broadband SNR as `snr` (shadow scenes with `cfg.attach_snr`),
-    the derivation notes as `attrs["empirical_notes"]`.
-    """
-    if not (cfg.empirical or cfg.attach_empirical_frames):
-        return dn
-    t0 = time.monotonic()
-    ref_flat = load_reference_flat(qub, calib_dir=calib_dir)
-    dark, flat, smile, snr, notes = empirical_frames(dn, ref_flat, **(empirical_kws or {}))
-    out = dn - dark if cfg.empirical and snr is not None else dn.copy()
-    extra = {"empirical_flat_unmasked": flat.attrs.get("unmasked")}
-    extra |= {f"empirical_flat_bin{i}": f for i, f in enumerate(flat.attrs.get("bins", []))}
-    out = out.assign_coords(
-        empirical_dark=(("band", "x"), dark.broadcast_like(flat).values),  # (x,)-only zeros when no shadow was found
-        empirical_flat=(("band", "x"), flat.values),
-        empirical_smile=(("band", "x"), smile.values),
-        **{k: (("band", "x"), v.values) for k, v in extra.items() if v is not None},
-    )
-    if cfg.empirical and snr is not None and cfg.attach_snr:
-        out = out.assign_coords(snr=(("y", "x"), snr.values))
-    out.attrs["empirical_notes"] = json.dumps(notes)
-    method = "scene" if notes["has_shadow"] else "none"
-    return io.get_step_log(out, dn, "residual_dark", method, t0, cfg, ("empirical", "attach_snr"), qub=str(qub))
-
-
-def flat_smile(dn, cfg, **_):
-    """Divide out the empirical sensor flat and band-relative smile."""
-    if not cfg.empirical:
-        return dn
-    t0 = time.monotonic()
-    out = dn / (dn.empirical_flat * dn.empirical_smile).clip(min=FLAT_SMILE_MIN)  # avoid divide by 0
-    return io.get_step_log(out, dn, "flat_smile", "empirical", t0, cfg, ("empirical",))

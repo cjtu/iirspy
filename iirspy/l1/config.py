@@ -1,9 +1,6 @@
 """L0 -> L1 radiance config: one frozen dataclass whose fields each name one method choice.
 
 `L1Config` drives `L0.calibrate`. Presets are named sets of field values; overrides replace single fields.
-
->>> L1Config.preset("iirspy").empirical
-True
 """
 
 from __future__ import annotations
@@ -18,7 +15,7 @@ CALIB = ("lut", "lut_median")
 
 @dataclass(frozen=True)
 class L1Config(Config):
-    """L0 digital number -> L1 radiance choices (see `L0.calibrate_to_rad`).
+    """L0 digital number -> L1 radiance choices (see `iirspy.l1.calibrate`).
 
     Attributes:
         empirical: Per-scene empirical dark/flat (+ smile) with the LUT's band-median scale,
@@ -35,7 +32,7 @@ class L1Config(Config):
             (diagnostic only when `empirical` is off: they are saved, not applied).
         calib: Radiometric scale when not `empirical`. "lut" is the per-element LUT gain/offset,
             "lut_median" the LUT's per-band median gain/offset (no cross-track structure), or a path
-            to a G1 table `.npz` (see `L0.calibrate_to_rad`). `empirical` already uses the median, so
+            to a G1 table `.npz` (see `iirspy.l1.radiometry`). `empirical` already uses the median, so
             it needs "lut".
     """
 

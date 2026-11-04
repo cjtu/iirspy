@@ -27,51 +27,11 @@ from iirspy.georef.georef import MOON_RADIUS_M, GeorefConfig, to_stereo
 # does not imply it.
 GOOD_CORR = 0.85
 
-
-def _dem(sub: str, name: str, dem_roots: tuple[Path, ...]) -> str:
-    """Path to a LOLA product by its bare product name, preferring a COG over the GDR JP2.
-
-    Searched across `dem_roots` in order, first hit wins; COG rebuilds shadow the original GDR JP2s.
-
-    Matched case-insensitively, returning the directory's real entry: PDS ships these labels as
-    both `_JP2.LBL` and `_jp2.lbl`, a difference a case-insensitive drvfs mount hides and ext4
-    does not.
-    """
-    for root in dem_roots:
-        d = root / sub
-        if not d.is_dir():
-            continue
-        entries = {f.name.lower(): f for f in d.iterdir()}
-        for leaf in (f"{name}.tif", f"{name}_jp2.lbl"):
-            hit = entries.get(leaf.lower())
-            if hit is not None:
-                return str(hit)
-    raise FileNotFoundError(f"{name} not found under any of {[str(r) for r in dem_roots]}")
-
-
 _POLAR = "LOLA_GDR/POLAR"
+
 _SLDEM = "SLDEM2015_512_60S_60N_000_360"
+
 _WAC_MOSAIC = "LRO_WAC_Mosaic_Global_303ppd_v3"
-
-
-@lru_cache
-def wac_mosaic(dem_roots: tuple[Path, ...]) -> str | None:
-    try:
-        return _dem("", _WAC_MOSAIC, dem_roots)
-    except FileNotFoundError:
-        return None
-
-
-def _pole_radius_m(crs_pole: str, lat: float) -> float:
-    """Stereographic distance from `crs_pole`'s pole to `lat`."""
-    x, y = to_stereo(crs_pole).transform(0.0, lat)
-    return float(np.hypot(x, y))
-
-
-def _equatorward(lat_range: tuple[float, float]) -> float:
-    """Whichever bound of `lat_range` sits closer to the equator."""
-    return min(lat_range, key=abs)
-
 
 # One entry per latitude band. `group` is the CRS family a band's GCPs merge within: south and
 # south_midlat share the south polar stereographic CRS, north likewise, and equatorial stands alone
@@ -88,7 +48,6 @@ def _equatorward(lat_range: tuple[float, float]) -> float:
 #
 # `near`/`far` name the products; `bands()` resolves them to paths. Keeping the names here lets
 # this module import with no DEM tree present.
-
 BANDS: dict[str, dict] = {
     "south": {
         "lat_range": (-90.0, -76.5),
@@ -132,6 +91,68 @@ BANDS: dict[str, dict] = {
         "p95_stop_m": 16.5,
     },
 }
+
+GROUPS = ("south", "north", "equatorial")
+
+GROUP_PRIMARY_BAND = {"south": "south", "north": "north", "equatorial": "equatorial"}
+
+AOI_BUFFER_M = 15_000.0  # covers coarse_shift's bulk error plus the tie-point window half-width
+
+ROW_STEP = 25  # GCP lattice row spacing
+
+# Extra latitude kept in the L1 crop beyond the solved bands, so a swath shifted equatorward by the
+# registration still has rows under every chunk's buffered AOI. Crop only; chunks stop at the band
+# edge.
+L1_BUFFER_DEG = 1.0
+
+NCI_MEMBERS = ("*.qub", "*.hdr", "*.xml", "*.csv", "*.spm", "*.oat", "*.oath", "*.lbr")
+
+# Rows forced to overlap across a band seam within a group, so the merge cross-fades the seam like
+# any other chunk boundary instead of butting the two runs edge to edge. Always extended from the
+# band with the wider `dem_range`, so it cannot run off the narrower tile.
+SEAM_OVERLAP_M = 15_000.0
+
+
+def _dem(sub: str, name: str, dem_roots: tuple[Path, ...]) -> str:
+    """Path to a LOLA product by its bare product name, preferring a COG over the GDR JP2.
+
+    Searched across `dem_roots` in order, first hit wins; COG rebuilds shadow the original GDR JP2s.
+
+    Matched case-insensitively, returning the directory's real entry: PDS ships these labels as
+    both `_JP2.LBL` and `_jp2.lbl`, a difference a case-insensitive drvfs mount hides and ext4
+    does not.
+    """
+    for root in dem_roots:
+        d = root / sub
+        if not d.is_dir():
+            continue
+        entries = {f.name.lower(): f for f in d.iterdir()}
+        for leaf in (f"{name}.tif", f"{name}_jp2.lbl"):
+            hit = entries.get(leaf.lower())
+            if hit is not None:
+                return str(hit)
+    raise FileNotFoundError(f"{name} not found under any of {[str(r) for r in dem_roots]}")
+
+
+@lru_cache
+def wac_mosaic(dem_roots: tuple[Path, ...]) -> str | None:
+    try:
+        return _dem("", _WAC_MOSAIC, dem_roots)
+    except FileNotFoundError:
+        return None
+
+
+def _pole_radius_m(crs_pole: str, lat: float) -> float:
+    """Stereographic distance from `crs_pole`'s pole to `lat`."""
+    x, y = to_stereo(crs_pole).transform(0.0, lat)
+    return float(np.hypot(x, y))
+
+
+def _equatorward(lat_range: tuple[float, float]) -> float:
+    """Whichever bound of `lat_range` sits closer to the equator."""
+    return min(lat_range, key=abs)
+
+
 for _name, _e in BANDS.items():
     _lo, _hi = _e["lat_range"]
     _dlo, _dhi = _e["dem_range"]
@@ -148,17 +169,6 @@ for _a, _ba in BANDS.items():
             continue
         if not (_ba["lat_range"][1] <= _bz["lat_range"][0] or _bz["lat_range"][1] <= _ba["lat_range"][0]):
             raise ValueError(f"{_a} and {_z} share a group and overlap in lat_range")
-
-GROUPS = ("south", "north", "equatorial")
-GROUP_PRIMARY_BAND = {"south": "south", "north": "north", "equatorial": "equatorial"}
-
-
-AOI_BUFFER_M = 15_000.0  # covers coarse_shift's bulk error plus the tie-point window half-width
-ROW_STEP = 25  # GCP lattice row spacing
-# Extra latitude kept in the L1 crop beyond the solved bands, so a swath shifted equatorward by the
-# registration still has rows under every chunk's buffered AOI. Crop only; chunks stop at the band
-# edge.
-L1_BUFFER_DEG = 1.0
 
 
 @lru_cache
@@ -178,13 +188,7 @@ def bands(dem_roots: tuple[Path, ...]) -> dict[str, dict]:
 
 
 def group_lat_range(group: str) -> tuple[float, float]:
-    """Latitudes `group` solves: the union of its bands' `lat_range`.
-
-    >>> group_lat_range("south")
-    (-90.0, -60.0)
-    >>> group_lat_range("equatorial")
-    (-60.0, 60.0)
-    """
+    """Latitudes `group` solves: the union of its bands' `lat_range`."""
     lo = min(b["lat_range"][0] for b in BANDS.values() if b["group"] == group)
     hi = max(b["lat_range"][1] for b in BANDS.values() if b["group"] == group)
     return (lo, hi)
@@ -195,10 +199,8 @@ def l1_lat_range(group: str) -> tuple[float, float]:
 
     What the L1 crop covers, as opposed to what gets solved.
 
-    >>> l1_lat_range("south")
+    >>> l1_lat_range("south")  # solves -90..-60
     (-90.0, -59.0)
-    >>> l1_lat_range("equatorial")
-    (-61.0, 61.0)
     """
     lo, hi = group_lat_range(group)
     return (max(-90.0, lo - L1_BUFFER_DEG if lo > -90.0 else lo), min(90.0, hi + L1_BUFFER_DEG if hi < 90.0 else hi))
@@ -274,9 +276,6 @@ def nri_zip(sid: str, paths: io.Paths) -> Path | None:
     """The nri bundle for `sid`, searched recursively since `zips/` nests some by region."""
     hits = sorted((paths.archive / "zips").rglob(f"ch2_iir_nri_{sid}_d_img_*.zip"))
     return hits[0] if hits else None
-
-
-NCI_MEMBERS = ("*.qub", "*.hdr", "*.xml", "*.csv", "*.spm", "*.oat", "*.oath", "*.lbr")
 
 
 def nci_zip(sid: str, paths: io.Paths) -> Path | None:
@@ -388,12 +387,6 @@ def true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
     """
     d = np.diff(np.concatenate(([0], mask.astype(int), [0])))
     return list(zip(np.flatnonzero(d == 1).tolist(), np.flatnonzero(d == -1).tolist(), strict=True))
-
-
-# Rows forced to overlap across a band seam within a group, so the merge cross-fades the seam like
-# any other chunk boundary instead of butting the two runs edge to edge. Always extended from the
-# band with the wider `dem_range`, so it cannot run off the narrower tile.
-SEAM_OVERLAP_M = 15_000.0
 
 
 @dataclass

@@ -53,7 +53,6 @@ from iirspy.georef import ancillary
 
 AROSICS_ENV = os.environ.get("IIRSPY_AROSICS_ENV", "arosics")  # conda env iirspy.georef.coreg runs in
 MAX_RAM_BYTES = float(os.environ.get("IIRSPY_MAX_RAM_BYTES", 4e9))  # past this, project() spills to disk
-
 MOON_RADIUS_M = 1737400.0
 SOLAR_RADIUS_DEG = 0.266  # nominal; the true value per epoch comes from SPICE
 LONLAT = CRS.from_authority("IAU", "30100")
@@ -63,6 +62,10 @@ TO_LONLAT = Transformer.from_crs(STEREO, LONLAT, always_xy=True)
 GEOCENTRIC = CRS.from_proj4(f"+proj=geocent +a={MOON_RADIUS_M} +b={MOON_RADIUS_M} +units=m +no_defs")
 TO_XYZ = Transformer.from_crs(LONLAT, GEOCENTRIC, always_xy=True)
 FROM_XYZ = Transformer.from_crs(GEOCENTRIC, LONLAT, always_xy=True)
+WAC_MIN_ELEV_DEG = 55.0
+SMOOTH_GRID = np.geomspace(1e-2, 1e9, 25)
+NODATA = -1
+TAG_KEYS = ("sid", "group", "scan0", "lat_range", "camera_shape", "row_frame", "n_gcps", "ps", "aoi")
 
 
 def lonlat_to_xyz(lon, lat, radius=MOON_RADIUS_M):
@@ -622,9 +625,6 @@ def render_reference(fgeom, flabel, cfg, kernels=None):
     return f[ri, ci].astype("float32"), {"az_grid": az, "elev": el, "r_sun": r_sun, "lit_frac": float(lit.mean())}
 
 
-WAC_MIN_ELEV_DEG = 55.0
-
-
 def use_wac(elev_deg, cfg) -> bool:
     return bool(cfg.wac_mosaic) and elev_deg >= WAC_MIN_ELEV_DEG
 
@@ -1154,7 +1154,6 @@ def _reject_mad(tp, k, ps):
 # ------------------------------------------------------------------------------------------
 # 5. Displacement field
 # ------------------------------------------------------------------------------------------
-SMOOTH_GRID = np.geomspace(1e-2, 1e9, 25)
 
 
 def choose_smoothing(pts, disp, k=5, seed=0):
@@ -1720,10 +1719,6 @@ def register(ftif, fgeom, flabel, cfg, kernels=None, reference=None, verbose=Fal
 #     projected = apply_glt(l2.img.values, glt, cube_scan0, window=(r0, r1, c0, c1))
 #
 #     iirs-make-glt <sid> --group south [--gcps PATH] [--out DIR]
-
-NODATA = -1
-
-TAG_KEYS = ("sid", "group", "scan0", "lat_range", "camera_shape", "row_frame", "n_gcps", "ps", "aoi")
 
 
 def make_glt(gcps, cfg, camera_shape, scan0=0, window=None) -> np.ndarray:

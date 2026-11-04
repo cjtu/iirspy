@@ -1,6 +1,6 @@
 """Chunked AROSICS registration of one CRS group of one scene (`L1.georef("arosics")`).
 
-    iirs-solve-scene <sid> --group south|north|equatorial [--out WORKDIR] [--keep DIR] [--clean]
+    iirs-georef-solve <sid> --group south|north|equatorial [--out WORKDIR] [--keep DIR] [--clean]
 
 `--out` holds everything the run produces and doubles as its restart cache: a re-run reuses any
 chunk already solved at the same shape, so a rerun only re-solves what it did not finish.

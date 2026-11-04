@@ -45,7 +45,7 @@ So always pass all three:
 
 ```python
 import xarray as xr
-from iirspy import georef
+from iirspy.georef import georef
 
 table, tags = georef.read_glt(
     "geometry/recalibrated/20201202/20201202T2319552644_south/20201202T2319552644_south_glt.tif"
@@ -66,7 +66,7 @@ To write a projected GeoTIFF for an area of interest:
 
 ```python
 import rasterio
-from iirspy import georef
+from iirspy.georef import georef
 
 (ny, nx), transform = georef.window_of(cfg, window)          # cfg from the solve, or the GLT tags
 with rasterio.open(

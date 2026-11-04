@@ -1,69 +1,149 @@
 """
-Photometric models and terrain normalization for the IIRS L1 -> L2 step.
+Photometric normalization, the L2 step after the solar flux: I/F -> reflectance at the standard geometry.
 
-A model is a disk function ``f(cos_inc, cos_view, g)``: how the surface's reflectance varies with
-the cosines of incidence and emission and with phase ``g`` [deg]. L2 divides the measured
-radiance factor by it,
+I/F depends on the illumination and view as well as on the surface. A photometric model r(i, e, g) describes that
+dependence, and this step moves every pixel onto i = 30, e = 0, g = 30 (`STANDARD_GEOMETRY`, the RELAB/M3 convention):
 
-    I/F = (rad - trad) / (F_solar * f(cos_inc, cos_view, g))
+    reflectance = I/F * r(30, 0, 30) / r(i, e, g),    I/F = (rad - thermal) / (F_sun / π)
 
-so the output is normalized to the model's own reference geometry (f = 1: overhead sun, nadir
-view, zero phase). Without terrain, cos_inc is the scene's solar cosine and the view is nadir;
-given a camera-space slope/aspect (`slope_az`), both become local cosines about the tilted facet.
+A model takes any of `cos_inc`, `cos_view`, `g` [deg] and `wl` [nm], passed by parameter name:
 
-Swap models by name (:data:`MODELS`) or pass any ``f(cos_inc, cos_view, g)`` callable as ``photom``.
+    none()                                        1: reflectance = I/F
+    lambert(cos_inc)                              cos_inc
+    lommel_seeliger(cos_inc, cos_view)            2 cos_inc / (cos_inc + cos_view)
+    lunar_lambert(cos_inc, cos_view, g)           McEwen's L(g) blend of the two
+    besse_m3_highland(cos_inc, cos_view, g, wl)   lunar_lambert x Besse et al. (2013) M3 highland f(g, wl)
+
+A model that also takes `iof` returns the reflectance itself. That covers models nonlinear in albedo, such as Hapke
+(invert w per pixel and band, then evaluate at the standard geometry), and `issdc`, which reproduces ISSDC's
+I/F / cos_inc.
+
+Without terrain the surface is the flat local horizontal: cos_inc = cos(solar_inc), nadir view, g = incidence.
+With a `Geometry` that has topo, both cosines are taken about each DEM facet and r is scaled by the lit fraction.
 
 Angle conventions match the IIRS spm:
 
     slope   degrees from the local horizontal (tangent plane), 0 = flat
     aspect  degrees clockwise from grid north, direction the facet faces (downhill)
     azimuth degrees clockwise from grid north; elevation degrees above the horizon
+
+`photom` is a :data:`MODELS` name or any such callable, recorded by function name.
 """
 
-import functools
-import time
+import inspect
 
 import numpy as np
 import xarray as xr
 
-from iirspy import io
 from iirspy.instrument import PKG_DATA
 
 M3_DATA = PKG_DATA.joinpath("m3")
+STANDARD_GEOMETRY = (30.0, 0.0, 30.0)  # (i, e, g) [deg]
 
 
-def lambert(cos_inc, cos_view, g):
-    """Lambert disk function: cos_inc."""
+def photometric(iof, inc, geom=None, *, photom="lambert", cos_min=0.0, min_lit=0.9):
+    """`iof` at `STANDARD_GEOMETRY` by the model `photom` (see the module docstring).
+
+    `inc` is the solar incidence [deg] on `iof`'s (y, x). `geom` is a `Geometry` with topo whose facet slope, aspect,
+    lit fraction and sun replace the flat local horizontal, or None. `cos_min` floors cos_inc and cos_view (clamped,
+    not nulled; the floored fractions go to attrs). Pixels lit less than `min_lit` or where r is not positive are NaN.
+    """
+    like = iof.isel(band=0, drop=True)
+    lit = 1.0
+    if geom is None:
+        cos_inc = np.cos(np.radians(inc))
+        cos_view, g = xr.ones_like(cos_inc), phase_angle(iof.solar_az if "solar_az" in iof.coords else 0.0, 90 - inc)
+    else:
+        o = geom.obs
+        sun = (o.sun_azimuth.values, 90 - o.sun_zenith.values)
+        slope, aspect, lit, sun = load_slope_az((o.facet_slope, o.facet_aspect, o.lit_frac, sun), like=like)
+        # slope/aspect are referenced to the DEM's tangent plane, so the sun must be in that same frame
+        cos_inc, cos_view, g = local_angles(slope, aspect, *sun)
+    floors = {"cos_inc_floor_frac": 0.0, "cos_view_floor_frac": 0.0}
+    if cos_min > 0.0:
+        floors = {
+            "cos_inc_floor_frac": float((cos_inc < cos_min).mean()),
+            "cos_view_floor_frac": float((cos_view < cos_min).mean()),
+        }
+        cos_inc, cos_view = cos_inc.clip(min=cos_min), cos_view.clip(min=cos_min)
+
+    model = get_model(photom)
+    params = inspect.signature(model).parameters
+    call = lambda **kw: model(**{k: v for k, v in kw.items() if k in params})
+    if "iof" in params:
+        out = call(iof=iof / lit, cos_inc=cos_inc, cos_view=cos_view, g=g, wl=iof.wl)
+    else:
+        i, e, g_std = STANDARD_GEOMETRY
+        r_std = call(cos_inc=np.cos(np.radians(i)), cos_view=np.cos(np.radians(e)), g=g_std, wl=iof.wl)
+        r = xr.ones_like(like) * call(cos_inc=cos_inc, cos_view=cos_view, g=g, wl=iof.wl) * lit
+        # r is numpy-backed (topo); unchunked, dividing by it makes an eager (y, x, band) float64 cube
+        if iof.chunks is not None:
+            r = r.chunk({"y": iof.chunksizes["y"]})
+        out = iof * r_std / r.where(r > 0)  # facets the sun does not reach have no direct beam to normalize by
+    if min_lit > 0.0:
+        out = out.where(lit >= min_lit)
+    out.attrs |= {
+        **floors,
+        "slope_az_used": geom is not None,
+        "inc_min_deg": float(inc.min()),
+        "inc_max_deg": float(inc.max()),
+        "inc_mean_deg": float(inc.mean()),
+    }
+    return out
+
+
+def no_correction():
+    """No photometric correction: reflectance = I/F."""
+    return 1.0
+
+
+def lambert(cos_inc):
+    """Lambert: cos_inc."""
     return cos_inc
 
 
-def lommel_seeliger(cos_inc, cos_view, g):
-    """Lommel-Seeliger (single-scattering) disk function, normalized to 1 at cos_inc = cos_view = 1."""
+def lommel_seeliger(cos_inc, cos_view):
+    """Lommel-Seeliger (single scattering), normalized to 1 at cos_inc = cos_view = 1."""
     return 2 * cos_inc / (cos_inc + cos_view)
 
 
 def lunar_lambert(cos_inc, cos_view, g, coeffs=(1.0, -0.019, 2.42e-4, -1.46e-6)):
-    """Lunar-Lambert disk function with McEwen's phase-dependent L(g) (McEwen 1991).
+    """Lunar-Lambert with McEwen's phase-dependent L(g) (McEwen 1991).
 
     L(g) blends Lommel-Seeliger (L=1, limb-darkened) into Lambert (L=0). The default cubic is the
     one ISIS ships; pass `coeffs` for a band- or site-fitted L(g).
     """
     # Horner by hand: np.polyval drops xarray dims, and g may be per-line (y,) against (y, x) cosines.
     L = np.clip(sum(c * g**i for i, c in enumerate(coeffs)), 0.0, 1.0)
-    return L * lommel_seeliger(cos_inc, cos_view, g) + (1 - L) * cos_inc
+    return L * lommel_seeliger(cos_inc, cos_view) + (1 - L) * cos_inc
 
 
-MODELS = {"lambert": lambert, "lommel_seeliger": lommel_seeliger, "lunar_lambert": lunar_lambert}
+def besse_m3_highland(cos_inc, cos_view, g, wl):
+    """`lunar_lambert` times the Besse et al. (2013) M3 highland phase function f(g, wl) (`besse_phase`).
+
+    Fit to M3 highland spectra: a reference for comparing with M3 products, not an IIRS photometric model.
+    """
+    f = xr.DataArray(besse_phase(np.asarray(g), np.asarray(wl)), dims=("band", *getattr(g, "dims", ())))
+    return lunar_lambert(cos_inc, cos_view, g) * f
+
+
+def issdc(iof, cos_inc):
+    """ISSDC's L2 normalization, I/F / cos_inc (Lambert to overhead sun, not the standard geometry)."""
+    return iof / cos_inc.where(cos_inc > 0)
+
+
+MODELS = {
+    "none": no_correction,
+    "lambert": lambert,
+    "lommel_seeliger": lommel_seeliger,
+    "lunar_lambert": lunar_lambert,
+    "besse_m3_highland": besse_m3_highland,
+    "issdc": issdc,
+}
 
 
 def get_model(photom):
-    """Resolve `photom` (a MODELS key or any f(cos_inc, cos_view, g) callable) to the model function.
-
-    >>> get_model("lambert") is lambert
-    True
-    >>> get_model(lambda cos_inc, cos_view, g: cos_inc**0.7)(1.0, 1.0, 0.0)
-    1.0
-    """
+    """The model function for `photom`, a `MODELS` name or any callable (see the module docstring)."""
     if callable(photom):
         return photom
     try:
@@ -72,45 +152,24 @@ def get_model(photom):
         raise ValueError(f"unknown photometric model {photom!r}; have {sorted(MODELS)}") from None
 
 
-@functools.lru_cache(maxsize=1)
-def _m3_phase_table():
-    """(alpha_deg, wl_nm, f) from the vendored Besse et al. (2013) M3 highland F_ALPHA table."""
+def besse_phase(g, wl_nm):
+    """Besse et al. (2013) M3 highland phase function f(g) at wl_nm [nm]: (n_wl, *g.shape), g clamped to 0-85 deg."""
     tab = np.loadtxt(M3_DATA.joinpath("M3G20111109_RFL_F_ALPHA_HIL.TAB").open(), skiprows=1)
     alpha, f = tab[:86, 0], tab[:86, 1:]
     wl = np.loadtxt(M3_DATA.joinpath("M3G20110224_RFL_SOLAR_SPEC.TAB").open())[:, 0]
     if f.shape[1] != wl.size:
         raise ValueError(f"M3 phase table has {f.shape[1]} channels but solar spectrum has {wl.size}")
-    return alpha, wl, f
-
-
-def besse_phase(g, wl_nm):
-    """Besse et al. (2013) M3 highland phase-function ratio f(30)/f(g), interpolated to wl_nm [nm].
-
-    >>> round(float(besse_phase(75.0, 950.06)), 4)
-    1.5474
-    >>> round(float(besse_phase(30.0, 950.06)), 4)
-    1.0
-    >>> bool(besse_phase(200.0, 950.06) == besse_phase(85.0, 950.06))  # clamped to the domain edge
-    True
-    """
-    alpha, wl, f = _m3_phase_table()
     wl_arr = np.atleast_1d(np.asarray(wl_nm, dtype=float))
     f_wl = np.vstack([np.interp(np.clip(wl_arr, wl.min(), wl.max()), wl, row) for row in f])  # (86, n_wl)
     g_arr = np.clip(np.asarray(g, dtype=float), 0.0, 85.0)
-    ratio = np.stack([f_wl[30, j] / np.interp(g_arr, alpha, f_wl[:, j]) for j in range(wl_arr.size)], axis=0)
-    return ratio if np.ndim(wl_nm) else ratio[0]
+    vals = np.stack([np.interp(g_arr, alpha, f_wl[:, j]) for j in range(wl_arr.size)], axis=0)
+    return vals if np.ndim(wl_nm) else vals[0]
 
 
 def cos_angle(slope, aspect, az, elev):
     """Cosine of the angle between the facet normal and a direction (az, elev), all degrees.
 
-    Flat ground gives sin(elev) - i.e. cos of the angle from vertical - and a facet tilted into
-    the direction gives more:
-
-    >>> float(np.round(cos_angle(0, 0, 30, 45), 4))
-    0.7071
-    >>> float(np.round(cos_angle(20, 30, 30, 45), 4))
-    0.9063
+    Flat ground gives sin(elev), the cosine of the angle from vertical; a facet tilted toward the direction gives more.
     """
     s, a = np.radians(slope), np.radians(aspect)
     e, z = np.radians(elev), np.radians(az)
@@ -181,90 +240,3 @@ def slope_az_from_dem(dem):
     slope = np.degrees(np.arctan(np.hypot(dz_dx, dz_dy)))
     aspect = np.degrees(np.arctan2(-dz_dx, -dz_dy)) % 360
     return xr.DataArray(slope, coords=dem.coords, dims=dem.dims), xr.DataArray(aspect, coords=dem.coords, dims=dem.dims)
-
-
-def photometric_factor(solar_inc, sun_az, slope_az=None, like=None, photom="lambert", cos_min=0.0, min_lit=0.9):
-    """(factor, g, floor fractions): the disk function times the lit fraction, NaN where unlit.
-
-    Without `slope_az` the surface is the flat local horizontal at incidence `solar_inc` [deg], nadir
-    view, phase = incidence. With it, cosines are local to each facet, using the product's own sun when
-    it records one, else (`sun_az`, 90 - `solar_inc`). `cos_min` floors cos_inc and cos_view
-    before the model (clamped, not nulled); the fraction of pixels below it is returned as
-    {"cos_inc_floor_frac", "cos_view_floor_frac"}. Pixels lit less than `min_lit` (from the
-    product's lit fraction) are nulled.
-    """
-    lit = 1.0
-    if slope_az is not None:
-        slope, aspect, lit, sun = load_slope_az(slope_az, like=like)
-        # slope/aspect are referenced to the DEM's tangent plane, the spm's angles to each pixel's
-        # local horizontal, so the product's own sun is used whenever it carries one.
-        az, elev = sun if sun is not None else (sun_az, 90 - solar_inc)
-        cos_inc, cos_view, g = local_angles(slope, aspect, az, elev)
-    else:
-        cos_inc = np.cos(np.radians(solar_inc))
-        cos_view, g = xr.ones_like(cos_inc), phase_angle(sun_az, 90 - solar_inc)
-    floors = {"cos_inc_floor_frac": 0.0, "cos_view_floor_frac": 0.0}
-    if cos_min > 0.0:
-        floors["cos_inc_floor_frac"] = float(np.asarray(cos_inc < cos_min).mean())
-        cos_inc = cos_inc.clip(min=cos_min) if hasattr(cos_inc, "clip") else np.clip(cos_inc, cos_min, None)
-        floors["cos_view_floor_frac"] = float(np.asarray(cos_view < cos_min).mean())
-        cos_view = cos_view.clip(min=cos_min) if hasattr(cos_view, "clip") else np.clip(cos_view, cos_min, None)
-    # Facets the sun does not reach have no direct beam to normalize by, so they are nulled.
-    factor = get_model(photom)(cos_inc, cos_view, g) * lit
-    if min_lit > 0.0:
-        factor = factor.where(np.asarray(lit) >= min_lit) if hasattr(factor, "where") else factor
-    factor = factor.where(factor > 0) if hasattr(factor, "where") else factor
-    return factor, g, floors
-
-
-def besse_rescale(refl, photom, g, wl):
-    """Rescale `refl` from `photom`'s own f=1 normalization onto Besse's RADF(30, 0, 30) convention."""
-    xl_ref = get_model(photom)(np.cos(np.radians(30.0)), 1.0, 30.0)
-    g_dims = getattr(g, "dims", ("y",))
-    f_ratio = xr.DataArray(besse_phase(np.asarray(g), wl.values), dims=("band", *g_dims))
-    return refl * xl_ref * f_ratio
-
-
-def slope_az_from_geom(geom):
-    """Facet (slope, aspect, lit, sun) from `geom.obs`, as `load_slope_az` takes."""
-    o = geom.obs
-    sun = (o.sun_azimuth.values, 90 - o.sun_zenith.values)
-    return o.facet_slope.values, o.facet_aspect.values, o.lit_frac.values, sun
-
-
-def photometric(rad, cfg, *, inc, geom=None, **_):
-    """Divide by the disk function times the lit fraction; facet terms come from `geom` when it has topo."""
-    t0 = time.monotonic()
-    slope_az = slope_az_from_geom(geom) if cfg.use_slope_az and geom is not None and geom.has_topo else None
-    photfn, g, floors = photometric_factor(
-        inc,
-        rad.solar_az if "solar_az" in rad.coords else 0.0,
-        slope_az,
-        like=rad.isel(band=0, drop=True),
-        photom=cfg.photom,
-        cos_min=cfg.cos_min,
-        min_lit=cfg.min_lit,
-    )
-    # photfn is numpy (topo); unchunked, dividing by it makes an eager (y, x, band) float64 cube
-    if rad.chunks is not None and hasattr(photfn, "chunk"):
-        photfn = photfn.chunk({"y": rad.chunksizes["y"]})
-    out = rad / photfn
-    out = out.assign_coords(phase_g=g) if cfg.phase else out
-    out.attrs |= {
-        **floors,
-        "slope_az_used": slope_az is not None,
-        "inc_min_deg": float(inc.min()),
-        "inc_max_deg": float(inc.max()),
-        "inc_mean_deg": float(inc.mean()),
-    }
-    fields = ("photom", "use_slope_az", "cos_min", "min_lit")
-    return io.get_step_log(out, rad, "photometric", str(cfg.photom), t0, cfg, fields, geom=geom and geom.method)
-
-
-def phase(rad, cfg, **_):
-    """Rescale onto Besse's 30 deg phase reference."""
-    if not cfg.phase:
-        return rad
-    t0 = time.monotonic()
-    out = besse_rescale(rad.drop_vars("phase_g"), cfg.photom, rad.phase_g, rad.wl)
-    return io.get_step_log(out, rad, "phase", "besse", t0, cfg, ("photom",))

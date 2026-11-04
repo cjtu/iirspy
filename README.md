@@ -67,7 +67,7 @@ Check out the fully worked examples notebooks [here](https://github.com/cjtu/iir
 
 ### Command-line tools
 
-`iirs-solve-scene`, `iirs-compute-refl`, `iirs-make-glt` and `iirs-fix-frames` need these set:
+`iirs-georef-solve`, `iirs-compute-refl`, `iirs-make-glt` and `iirs-fix-frames` need these set:
 
 - `IIRS_ARCHIVE`: ISSDC-layout tree holding `zips/`, `data/`, `geometry/`.
 - `IIRS_DEM_ROOTS`: `:`-separated dirs holding the LOLA / WAC DEMs.

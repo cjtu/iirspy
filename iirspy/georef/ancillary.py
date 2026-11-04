@@ -1,3 +1,9 @@
+"""Readers for a scene's ISSDC ancillary files: geometry csv, spm (sun/spacecraft angles per time), label line times.
+
+The csv holds lon/lat on a sparse (Pixel, Scan) grid; `geom2grid` interpolates it to every pixel. The spm is a
+time series; `get_line_times` gives each scan's UTC so spm columns can be sampled per line.
+"""
+
 import numpy as np
 import pandas as pd
 import pdr

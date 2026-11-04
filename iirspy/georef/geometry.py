@@ -1,3 +1,10 @@
+"""`Geometry`: a scene's per-pixel location (LOC), viewing/illumination angles (OBS) and QA flags, in camera space.
+
+The one output of every georef method. Arrays are (y, x) Datasets on the cube's own rows (`row0` = first Scan);
+`has_topo` says whether OBS carries DEM facet slope/aspect/lit fraction for the photometric step. `save`/`open`
+round-trip it as `<sid>_<group>_{loc,obs,qa}.tif` sidecars.
+"""
+
 import json
 from dataclasses import dataclass, field
 from pathlib import Path

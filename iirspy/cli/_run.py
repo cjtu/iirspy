@@ -1,3 +1,9 @@
+"""Shared plumbing of the `iirs-georef-solve` and `iirs-compute-refl` CLIs: work dir, staging, L1 build, outputs.
+
+A run's inputs come from the `IIRS_*` env vars (`io.Paths`); `stage_inputs` pulls only the bands it needs from the
+nri zip, so a local run and a cluster array task behave identically.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -26,6 +32,8 @@ from iirspy.l1.frames import table_key as frames_key
 from iirspy.l2.config import L2Config
 
 log = logging.getLogger(__name__)
+
+CALIBRATE_KWS = {"empirical": True, "interp_bands": "linear", "interp_spatial": True, "bad_pixel_mask": True}
 
 
 @dataclass(frozen=True)
@@ -104,9 +112,6 @@ def stage_inputs(job: Job, day: str, bands: list[int]) -> Path:
         if not dst.exists():
             shutil.copyfile(fgeom, dst)
     return raw_qub
-
-
-CALIBRATE_KWS = {"empirical": True, "interp_bands": "linear", "interp_spatial": True, "bad_pixel_mask": True}
 
 
 def build_l1(
@@ -469,8 +474,6 @@ def write_refl_outputs(
             ftif,
             np.asarray(l2.img.solar_inc),
             geo.loc.lat.values,
-            emi=geo.obs.sensor_zenith.values,
-            phase=geo.obs.phase.values,
             sdist=float(l2.img.attrs["solar_distance_au"]),
         )
     except Exception as e:  # sanity stats must never fail a refl run
@@ -479,7 +482,7 @@ def write_refl_outputs(
     fglt = fgcps.parent / f"{sid}_{group}_glt.tif" if fgcps else None
     if fglt is not None:
         log.info(
-            f"glt: {fglt}" if fglt.is_file() else f"glt: {fglt} not found -- iirs-solve-scene should have built it"
+            f"glt: {fglt}" if fglt.is_file() else f"glt: {fglt} not found -- iirs-georef-solve should have built it"
         )
     resources = f"{resource_report(l1.img)}; ncpu={ncpu()}"
     log.info(resources)

@@ -1,3 +1,13 @@
+"""`L0`, `L1` and `L2`: one IIRS scene at one processing level, wrapping its (band, y, x) cube and ancillary files.
+
+    L0(sid, dir).calibrate() -> L1   # raw DN -> radiance (`iirspy.l1.calibrate`)
+    L1.georef(method, ...)   -> Geometry
+    L1.calibrate(geom=...)   -> L2   # radiance -> reflectance (`iirspy.l2.calibrate`)
+
+Each class reads the ISSDC product (or a saved iirspy crop) lazily with dask; `crop` -> `save` -> `from_file` keeps
+absolute y/x and band numbers, so a crop stays tied to its parent scene.
+"""
+
 import copy
 import warnings
 from abc import ABC, abstractmethod
@@ -10,8 +20,8 @@ import rasterio
 import xarray as xr
 from rioxarray.exceptions import NoDataInBounds
 
-from iirspy import georef, instrument, io, l1, l2
-from iirspy.georef import ancillary
+from iirspy import instrument, io, l1, l2
+from iirspy.georef import GEOREF, ancillary, georef
 from iirspy.l1 import empirical, frames
 from iirspy.l1.config import L1Config
 from iirspy.l2 import polish
@@ -285,12 +295,12 @@ class IIRSData(ABC):
         threaded scheduler computes each block across all cores; peak memory stays ~one block
         regardless of image or machine size. GeoTIFF (.tif): float32 BigTIFF, windowed blocks.
 
-        When the cube carries an empirical `snr` coordinate (from calibrate_to_rad with attach_snr),
+        When the cube carries an empirical `snr` coordinate (from `L0.calibrate` with attach_snr),
         a float32 sidecar `<basename>_snr<ext>` is written alongside it in the same format (ENVI
         coords don't survive the BIL write), unless snr_sidecar is False.
 
         When the cube carries `empirical_dark`/`empirical_flat`/`empirical_smile` coordinates (from
-        calibrate_to_rad with attach_empirical_frames), they're written to a single
+        `L0.calibrate` with attach_empirical_frames), they're written to a single
         `<basename>_empirical.npz` (keys dark/flat/smile/band/x) beside fout, unless
         empirical_sidecar is False -- these are (band, x) diagnostic frames, not a raster, so they
         skip the cube writer entirely.
@@ -372,8 +382,6 @@ class IIRSData(ABC):
         """`img` pulled through GLT `table` as a lazy (band, y, x) DataArray, `row_block` map rows
         per dask chunk, so a write streams it instead of holding the whole map grid."""
         import dask.array as dsa
-
-        from iirspy import georef
 
         cube, scan0 = img.values, self._cube_scan0()
         rows = row_block or max(1, int(io.CHUNKSIZE / (cube.shape[0] * table.shape[2] * 4)))
@@ -752,9 +760,9 @@ class L1(IIRSData):
         return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
     def georef(self, method, *, work=None, **inputs):
-        """The scene's `Geometry` by `method` (a `georef.GEOREF` key); `inputs` are that method's own (see `iirspy.georef`)."""
-        return georef.run_georef(
-            method, work=work, sid=self.basename, shape=self.img.shape[-2:], row0=self._cube_scan0(), **inputs
+        """The scene's `Geometry` by `method` (a `GEOREF` key); `inputs` are that method's own (see `iirspy.georef`)."""
+        return GEOREF[method](
+            work=work, sid=self.basename, shape=self.img.shape[-2:], row0=self._cube_scan0(), **inputs
         )
 
     def calibrate(self, config="iirspy", *, geom=None, **overrides):

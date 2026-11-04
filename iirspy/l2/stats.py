@@ -2,9 +2,6 @@
 
 Reads a strided sample of ~10 bands from the L2 tif (and the thermal bands of the L1 tif), never the whole cube, so it
 costs seconds. Everything is a plain float/list for the refl summary json.
-
->>> round(float(_hapke_ssa(np.array([0.3]), np.array([60.0]), np.array([0.0]), np.array([60.0]))[0]), 2) > 0.4
-True
 """
 
 from __future__ import annotations
@@ -16,6 +13,7 @@ import numpy as np
 import rasterio
 
 from iirspy.l2 import thermal
+from iirspy.l2.photometry import STANDARD_GEOMETRY
 
 TARGET_NM = (750, 1000, 1250, 1500, 1800, 2000, 2400, 2700, 3500, 4200, 4800)
 REF_NM, SSA_NM = 1500, 1000  # level / drift / correlation band, SSA band
@@ -51,30 +49,27 @@ def _hapke_h(x, w):
 
 
 def _hapke_model(w, mu0, mu, g, b=HAPKE["b"], B0=HAPKE["B0"], h=HAPKE["h"]):
-    """Reflectance as `iirspy` defines it (I / (F/pi * cos i)) = REFF / mu0, for single scattering albedo `w`."""
+    """Hapke I/F (= REFF) for single scattering albedo `w`."""
     gr = np.radians(g)
     P = (1 - b * b) / (1 - 2 * b * np.cos(gr) + b * b) ** 1.5
     B = B0 / (1 + np.tan(gr / 2) / h)
-    return w / 4 / (mu0 + mu) * ((1 + B) * P + _hapke_h(mu0, w) * _hapke_h(mu, w) - 1)
+    return w / 4 * mu0 / (mu0 + mu) * ((1 + B) * P + _hapke_h(mu0, w) * _hapke_h(mu, w) - 1)
 
 
-def _hapke_ssa(refl, inc, emi, phase):
-    """Single scattering albedo per sample by inverting `_hapke_model` over a w grid (monotonic); NaN outside the grid."""
-    mu0, mu = np.cos(np.radians(inc))[:, None], np.cos(np.radians(emi))[:, None]
-    wg = np.linspace(0.02, 0.999, 120)[None]
-    m = _hapke_model(wg, mu0, mu, phase[:, None])
-    k = np.clip((m < refl[:, None]).sum(1), 1, m.shape[1] - 1)
-    r = np.arange(len(refl))
-    f = (refl - m[r, k - 1]) / (m[r, k] - m[r, k - 1])
-    w = wg[0, k - 1] + f * (wg[0, k] - wg[0, k - 1])
-    return np.where((f >= 0) & (f <= 1), w, np.nan)
+def _hapke_ssa(refl):
+    """Single scattering albedo per sample of reflectance at `STANDARD_GEOMETRY`, by inverting `_hapke_model` over a w
+    grid (monotonic); NaN outside the grid."""
+    i, e, g = STANDARD_GEOMETRY
+    wg = np.linspace(0.02, 0.999, 120)
+    m = _hapke_model(wg, np.cos(np.radians(i)), np.cos(np.radians(e)), g)
+    return np.interp(refl, m, wg, left=np.nan, right=np.nan)
 
 
-def l2_stats(fl2, fl1, inc, lat, emi=None, phase=None, sdist=1.0, step=8, t_bins=2.0) -> dict:
+def l2_stats(fl2, fl1, inc, lat, sdist=1.0, step=8, t_bins=2.0) -> dict:
     """Statistics of `fl2` (reflectance tif) with `fl1` (radiance tif, for the isothermal T).
 
-    `inc` [deg] and `lat` [deg] are per row (ny,) or per pixel (ny, nx); `emi`/`phase` per pixel or None
-    (nadir, phase = incidence). `step` strides rows and columns.
+    `inc` [deg] and `lat` [deg] are per row (ny,) or per pixel (ny, nx). `step` strides rows and columns. The SSA
+    assumes the reflectance is at the standard geometry, as every `L2Config.photom` model but `issdc` leaves it.
     """
     t0 = time.time()
     out: dict = {}
@@ -195,9 +190,7 @@ def l2_stats(fl2, fl1, inc, lat, emi=None, phase=None, sdist=1.0, step=8, t_bins
         rssa = _read(src, [sel[SSA_NM]], step)[0]
     m = lit & (inc_s < SSA_INC_MAX) & np.isfinite(rssa) & (rssa > 0)
     if m.sum() > 100:
-        e = np.nan_to_num(sub(emi)[m]) if emi is not None else np.zeros(m.sum(), "float32")
-        g = np.where(np.isfinite(sub(phase)[m]), sub(phase)[m], inc_s[m]) if phase is not None else inc_s[m]
-        w = _hapke_ssa(rssa[m].astype("float64"), inc_s[m].astype("float64"), e.astype("float64"), g.astype("float64"))
+        w = _hapke_ssa(rssa[m].astype("float64"))
         out["ssa"] = {
             "nm": SSA_NM,
             "mean": float(np.nanmean(w)),

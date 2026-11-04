@@ -29,17 +29,32 @@ def test_slope_toward_sun_gains_light_and_away_loses_it():
     assert away < 0  # a 10 deg back-slope under a 5 deg sun is unlit, not dim
 
 
-@pytest.mark.parametrize("name", sorted(ph.MODELS))
-def test_models_are_unity_at_reference_geometry(name):
-    """Every disk function is normalized to 1 at overhead sun, nadir view, zero phase."""
-    assert ph.get_model(name)(1.0, 1.0, 0.0) == pytest.approx(1.0)
+@pytest.mark.parametrize("name", sorted(set(ph.MODELS) - {"issdc"}))
+def test_every_model_leaves_a_scene_at_the_standard_geometry_unchanged(name):
+    """At i = 30, nadir view (g = 30) the ratio r(30, 0, 30) / r(i, e, g) is 1, so reflectance = I/F."""
+    rad = _synthetic_l1()
+    rad["solar_inc"] = ("y", np.full(rad.sizes["y"], 30.0))
+    np.testing.assert_allclose(_refl(rad, photom=name, min_lit=0.0).values, _refl(rad, photom="none").values, rtol=1e-6)
+
+
+def test_lambert_moves_a_60_deg_scene_to_30_deg_incidence():
+    rad = _synthetic_l1()
+    rad["solar_inc"] = ("y", np.full(rad.sizes["y"], 60.0))
+    ratio = _refl(rad, photom="lambert").values / _refl(rad, photom="none").values
+    np.testing.assert_allclose(ratio, np.cos(np.radians(30.0)) / np.cos(np.radians(60.0)), rtol=1e-6)
+
+
+def test_an_iof_model_returns_its_own_reflectance():
+    rad = _synthetic_l1()
+    halve = lambda iof, cos_inc: iof / 2
+    np.testing.assert_allclose(_refl(rad, photom=halve).values, _refl(rad, photom="none").values / 2, rtol=1e-6)
 
 
 def test_lunar_lambert_between_its_two_limits():
     cos_inc, cos_view, g = 0.2, 0.9, 60.0
     f = ph.lunar_lambert(cos_inc, cos_view, g)
-    assert min(ph.lambert(cos_inc, cos_view, g), ph.lommel_seeliger(cos_inc, cos_view, g)) <= f
-    assert f <= max(ph.lambert(cos_inc, cos_view, g), ph.lommel_seeliger(cos_inc, cos_view, g))
+    assert min(ph.lambert(cos_inc), ph.lommel_seeliger(cos_inc, cos_view)) <= f
+    assert f <= max(ph.lambert(cos_inc), ph.lommel_seeliger(cos_inc, cos_view))
 
 
 def test_load_slope_az_checks_the_crop():
@@ -144,7 +159,7 @@ def test_cos_min_floors_grazing_incidence_without_changing_default():
     )
 
 
-def _cos_view_dependent_photom(cos_inc, cos_view, g):
+def _cos_view_dependent_photom(cos_inc, cos_view):
     """cos_inc*cos_view -- unlike lambert/lommel_seeliger/lunar_lambert this actually diverges as cos_view -> 0,
     so it exercises what an emission floor is for even though none of the built-in models do."""
     return cos_inc * cos_view
@@ -186,30 +201,13 @@ def test_grazing_incidence_and_emission_together_stay_bounded():
     assert clamped.attrs["cos_view_floor_frac"] == 1.0
 
 
-def test_besse_phase_table_parses_known_value():
-    """Spot-check against Besse's table: ch19/950.06 nm, f(75)/f(30) ~ 0.6462 ."""
-    _, wl, f = ph._m3_phase_table()
-    i = int(np.argmin(np.abs(wl - 950.06)))
-    assert f[30, i] == pytest.approx(0.255755, abs=1e-6)
-    assert (f[75, i] / f[30, i]) == pytest.approx(0.6462, abs=1e-4)
-
-
-def test_besse_phase_broadcasts_over_wavelength_and_geometry():
-    g = np.array([10.0, 30.0, 75.0])
-    out = ph.besse_phase(g, np.array([950.06, 1508.99]))
-    assert out.shape == (2, 3)
-    np.testing.assert_allclose(out[:, 1], 1.0)  # alpha=30 is the identity for every band
-
-
-def test_phase_wiring_reproduces_a_scene_at_the_reference_geometry():
-    """At phase=30 with lommel_seeliger, besse_phase is 1 everywhere, so `phase` only rescales by
-    the fixed XL(30,0,30) reference constant -- the ratio to the no-phase run is that constant."""
-    rad = _synthetic_l1()
-    rad["solar_inc"] = ("y", np.full(rad.sizes["y"], 30.0))  # nadir view: phase == incidence
-    baseline = _refl(rad, photom="lommel_seeliger", min_lit=0.0)
-    with_phase = _refl(rad, photom="lommel_seeliger", phase=True, min_lit=0.0)
-    xl_ref = ph.lommel_seeliger(np.cos(np.radians(30.0)), 1.0, 30.0)
-    np.testing.assert_allclose(with_phase.values, baseline.values * xl_ref, rtol=1e-6)
+def test_besse_phase_matches_the_table_and_clamps_past_85_deg():
+    """Spot-check against Besse's table: ch19/950.06 nm, f(30) = 0.255755, f(75)/f(30) ~ 0.6462."""
+    f = ph.besse_phase(np.array([30.0, 75.0, 85.0, 200.0]), np.array([950.06, 1508.99]))
+    assert f.shape == (2, 4)
+    assert f[0, 0] == pytest.approx(0.255755, abs=1e-6)
+    assert f[0, 1] / f[0, 0] == pytest.approx(0.6462, abs=1e-4)
+    np.testing.assert_array_equal(f[:, 3], f[:, 2])
 
 
 def test_penumbra_is_dropped_by_the_min_lit_default():

@@ -1,3 +1,10 @@
+"""IIRS instrument constants and packaged tables: band wavelengths, bad bands and elements, exposure/gain, LUTs.
+
+Everything here is a fixed property of the sensor or of one scene's label, read by every level. Calibration files are
+named by exposure + gain, e.g. `ch2_iirs_cal_e1g2_lut_coeff.csv`, under `DCALIB`; read packaged files through
+`PKG_DATA` (importlib.resources), never by path.
+"""
+
 from importlib.resources import files
 from pathlib import Path
 

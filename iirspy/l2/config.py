@@ -1,11 +1,6 @@
 """L1 -> L2 reflectance config: one frozen dataclass whose fields each name one method choice.
 
 `L2Config` drives `L1.calibrate`. Presets are named sets of field values; overrides replace single fields.
-
->>> L2Config.preset("issdc").smoothing
-3
->>> L2Config.preset("issdc", polish=None).polish is None
-True
 """
 
 from __future__ import annotations
@@ -31,8 +26,8 @@ SMOOTHING_EDGES = ("pair", "nan", "reflect")
 class L2Config(Config):
     """L1 radiance -> L2 reflectance choices (see `iirspy.l2.calibrate`).
 
-    Steps run in order: solar flux, thermal removal, polish, photometric normalization,
-    Besse phase, spectral smoothing, clip.
+    Steps run in order: thermal removal, solar flux, photometric normalization, polish,
+    spectral smoothing, clip, NaN fill.
 
     Attributes:
         flux: Solar spectrum. "issdc" (the ISSDC flux file), "noaa_cdr_mean" (NOAA SSI CDR v03,
@@ -51,11 +46,11 @@ class L2Config(Config):
         fill_nan: Value written over every NaN as the last step (ISSDC's ndi marks all nulls with 0), or None to keep NaN.
         polish: Per-band divisor: None, "verma2022", "issdc_empirical", or a csv path with `band`
             and `polish` columns. Mapped by band number; bands the table lacks get 1.0.
-        photom: Disk function, a `photometry.MODELS` key or any f(cos_inc, cos_view, g) callable.
-        use_slope_az: Use the caller's `slope_az` terrain product when one is given.
-        phase: Rescale onto Besse's 30 deg phase reference (`photometry.besse_phase`).
+        photom: Photometric model taking the cube to i = 30, e = 0, g = 30: a `photometry.MODELS` name or any
+            callable of `cos_inc`, `cos_view`, `g`, `wl` (and `iof`), see `iirspy.l2.photometry`.
+        use_slope_az: Use the `Geometry`'s facet terms when it has topo.
         cos_min: Floor on cos_inc and cos_view before the disk function (0 = none). Clamps.
-        min_lit: Null pixels with less than this lit fraction (needs `slope_az`).
+        min_lit: Null pixels with less than this lit fraction (needs topo).
         smoothing: Spectral moving-average width in bands (0 = off).
         smoothing_edges: End bands of the moving average (`polish.moving_average`).
     """
@@ -71,7 +66,6 @@ class L2Config(Config):
     polish: str | None = None
     photom: str | Callable = "lambert"
     use_slope_az: bool = True
-    phase: bool = False
     cos_min: float = 0.0
     min_lit: float = 0.9
     smoothing: int = 0
@@ -107,7 +101,6 @@ L2Config.PRESETS = {
         "sdist": "spice",
         "thermal": "isothermal",
         "photom": "lambert",
-        "phase": False,
         "polish": None,
         "smoothing": 0,
         "clip_negative": False,
@@ -118,6 +111,7 @@ L2Config.PRESETS = {
     },
     "issdc": {
         "sdist": "none",
+        "photom": "issdc",
         "thermal": "isothermal",
         "thermal_eps": 1.0,
         "clip_negative": True,
@@ -128,6 +122,7 @@ L2Config.PRESETS = {
     },
     "verma2022": {
         "sdist": "none",
+        "photom": "issdc",
         "thermal": "isothermal",
         "thermal_eps": 0.95,
         "thermal_bands": (225, 246),

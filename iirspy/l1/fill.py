@@ -1,14 +1,36 @@
-import time
+"""Gap filling, the last L1 step: rebuild lost frames, then interpolate short band and spatial gaps.
+
+Lost frames (`frames.retime`) are rebuilt from each pixel's own spectrum (`frames.fill`). Remaining NaN runs are
+bridged linearly when short: up to `BAND_GAP` bands, one column across x, `ROW_GAP` rows along y. Longer gaps stay
+NaN.
+"""
 
 import dask.array as da
 import numpy as np
 import xarray as xr
 
-from iirspy import io
 from iirspy.l1 import frames
 
 BAND_GAP = 9  # widest spectral hole `interpolate_na` bridges: two dropped groups (8 bands) in a row
 ROW_GAP = 5  # likewise along y: up to 4 lost frames in a row
+
+
+def fill(rad, *, fill_frames=False, interp_bands=None, interp_spatial=False):
+    """`rad` with lost frames rebuilt (`fill_frames`), then band gaps (`interp_bands` method) and x/y gaps filled.
+
+    The `lost_frames` coord is consumed.
+    """
+    lost = rad.lost_frames.values if "lost_frames" in rad.coords else None
+    out = rad.drop_vars("lost_frames", errors="ignore")
+    if fill_frames and lost is not None:
+        out = frames.fill(out, lost)
+    if interp_bands is not None:
+        out = out.interpolate_na("band", max_gap=BAND_GAP, keep_attrs=True, method=interp_bands)
+    if interp_spatial:
+        # max_gap=2 in 0.5-based x coords spans exactly one missing column
+        out = out.interpolate_na("x", max_gap=2, keep_attrs=True, method="linear")
+        out = _interp_rows(out)
+    return out
 
 
 def _interp_rows(rad, max_gap=ROW_GAP):
@@ -33,21 +55,3 @@ def _interp_rows(rad, max_gap=ROW_GAP):
         )
 
     return rad.copy(data=data.map_overlap(block, depth={ax: max_gap}, boundary="none", dtype=data.dtype))
-
-
-def fill(rad, cfg, **_):
-    """Rebuild the lost frames from each pixel's own spectrum, then interpolate the remaining band and spatial gaps."""
-    lost = rad.lost_frames.values if "lost_frames" in rad.coords else None
-    out = rad.drop_vars("lost_frames", errors="ignore")
-    if not (cfg.fill_frames or cfg.interp_bands or cfg.interp_spatial):
-        return out
-    t0 = time.monotonic()
-    if cfg.fill_frames and lost is not None:
-        out = frames.fill(out, lost)
-    if cfg.interp_bands is not None:
-        out = out.interpolate_na("band", max_gap=BAND_GAP, keep_attrs=True, method=cfg.interp_bands)
-    if cfg.interp_spatial:
-        # max_gap=2 in 0.5-based x coords spans exactly one missing column
-        out = out.interpolate_na("x", max_gap=2, keep_attrs=True, method="linear")
-        out = _interp_rows(out)
-    return io.get_step_log(out, rad, "fill", "interpolate", t0, cfg, ("fill_frames", "interp_bands", "interp_spatial"))

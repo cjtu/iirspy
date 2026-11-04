@@ -5,7 +5,8 @@ import pytest
 import rasterio
 import xarray as xr
 
-from iirspy import georef, io
+from iirspy import io
+from iirspy.georef import georef
 from iirspy.georef.geometry import Geometry, quality
 from iirspy.iirs import IIRSData
 

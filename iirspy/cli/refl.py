@@ -5,7 +5,7 @@
         [--l2 PRESET] [--l2-<field> VALUE ...]
 
 Writes full-band L1 radiance, L2 reflectance and the LOC/OBS/QA `Geometry` in camera space. `--georef arosics`
-(default) builds the geometry from the GCPs `iirs-solve-scene` produced and refuses to run on an unsolved scene;
+(default) builds the geometry from the GCPs `iirs-georef-solve` produced and refuses to run on an unsolved scene;
 `--georef issdc` (default for the `issdc`/`issdc-nci` L2 presets) needs only the ISSDC bundle files.
 
 `--l1`/`--l2` pick an `L1Config`/`L2Config` preset (`p0` is the frozen L1 derivation basis); each
@@ -14,7 +14,7 @@ Writes full-band L1 radiance, L2 reflectance and the LOC/OBS/QA `Geometry` in ca
 cache key. `--l2 issdc-nci` runs the `issdc` L2 on ISSDC's own nci cube (unzipped into the archive tree on first use).
 
 `--gcps` defaults to geometry/recalibrated/<day>/<sid>_<group>.gcps under `IIRS_RECAL_ROOT`. Paths come from
-`IIRS_ARCHIVE`, `IIRS_DEM_ROOTS`, `IIRS_SPICE`, `IIRS_STAGE` and `IIRS_RECAL_ROOT`, as for `iirs-solve-scene`.
+`IIRS_ARCHIVE`, `IIRS_DEM_ROOTS`, `IIRS_SPICE`, `IIRS_STAGE` and `IIRS_RECAL_ROOT`, as for `iirs-georef-solve`.
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ def _parser():
     ap.add_argument(
         "--gcps",
         default=None,
-        help="merged GCPs from iirs-solve-scene --keep (default geometry/recalibrated/<day>/"
+        help="merged GCPs from iirs-georef-solve --keep (default geometry/recalibrated/<day>/"
         "<sid>_<group>.gcps under IIRS_RECAL_ROOT)",
     )
     add_config_args(ap)
@@ -113,10 +113,10 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901
     if args.georef == "arosics":
         fgcps = Path(args.gcps) if args.gcps else ck.merged_gcps_path(sid, group, paths)
         if not fgcps.is_file() or fgcps.stat().st_size == 0:
-            sys.exit(f"{fgcps} missing or empty -- {sid} {group} is not solved yet (run iirs-solve-scene first)")
+            sys.exit(f"{fgcps} missing or empty -- {sid} {group} is not solved yet (run iirs-georef-solve first)")
         frames = frame_offsets_path(sid, paths, fgcps.parent)
         if predates_frames(fgcps, frames):
-            sys.exit(f"{fgcps} was solved before {frames.name} existed -- re-run iirs-solve-scene first")
+            sys.exit(f"{fgcps} was solved before {frames.name} existed -- re-run iirs-georef-solve first")
 
     import dask
 
@@ -229,7 +229,7 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
     ftopo = geo.sidecars.get("topo")
     log.info(f"geometry: {geo.method} {geo.quality}; topo: {ftopo or 'none'}")
 
-    l2 = l1.calibrate(l2cfg, geom=geo, work=work)
+    l2 = l1.calibrate(l2cfg, geom=geo)
     log.info(f"L2 computed ({args.l2}: {json.dumps(l2cfg.to_attrs())})")
 
     # Camera space keeps one unblended spectrum per pixel; the GLT projects on demand and the

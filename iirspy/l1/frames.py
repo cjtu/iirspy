@@ -17,7 +17,6 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import time
 import warnings
 import zipfile
 from itertools import pairwise
@@ -25,8 +24,6 @@ from pathlib import Path
 
 import numpy as np
 from scipy.ndimage import uniform_filter1d
-
-from iirspy import io
 
 NG = 64
 K = 8  # max |offset| searched, lines (A12 20210723T2153218013 reaches +6)
@@ -42,7 +39,26 @@ SKIP = {0, 1, 63}  # bands 1-8, 253-256: no usable signal
 MAX_BRIDGE = 9  # widest band span `fill` bridges: a hole of two neighbouring groups
 
 
-# ---------------------------------------------------------------- reading
+def retime(rad, qub, frame_offsets=None):
+    """Move each 4-band group of `rad` onto true frames; the lost frames ride along as the `lost_frames` coord.
+
+    `frame_offsets` is the strip's table (`build_table`). None builds it from the full cube `qub` and caches it beside
+    it as `<qub stem>_frames_offsets.csv`; a band-subset cube cannot be scanned, so `rad` comes back unchanged, with a
+    warning.
+    """
+    if frame_offsets is None:
+        frame_offsets = Path(qub).with_name(f"{Path(qub).stem}_frames_offsets.csv")
+        if not frame_offsets.exists():
+            try:
+                build_table(qub, frame_offsets)
+            except ValueError as e:
+                warnings.warn(f"fix_frames skipped: {e}", UserWarning, stacklevel=2)
+                return rad
+    out, lost = apply(rad, frame_offsets)
+    return out.assign_coords(lost_frames=(("band", "y"), lost))
+
+
+#  reading
 
 
 def _bands(path):
@@ -101,7 +117,7 @@ def scan(path):
     return rows, prof, dup, zero
 
 
-# ---------------------------------------------------------------- matching
+#  matching
 
 
 def _corr(rows, g, ref, y0, y1, stride=1):
@@ -392,7 +408,7 @@ def sources(fcsv, nl):
     return src
 
 
-# ---------------------------------------------------------------- radiance
+# radiance
 
 
 def apply(rad, fcsv):
@@ -474,27 +490,3 @@ def fill(rad, lost, depth=6):
 
     filled = da.map_overlap(block, data, mask, depth={0: 0, 1: depth, 2: 0}, boundary="none", dtype=data.dtype)
     return rad.copy(data=filled)
-
-
-def retime(rad, cfg, *, qub, frame_offsets=None, **_):
-    """Move each 4-band group of `rad` onto true frames; the lost frames ride along as the `lost_frames` coord.
-
-    No `frame_offsets` builds the table from the full cube `qub` and caches it beside it as
-    `<qub stem>_frames_offsets.csv`; a band-subset cube cannot be scanned, so its rows stay in raw order, with a warning.
-    """
-    if not cfg.fix_frames:
-        return rad
-    t0 = time.monotonic()
-    if frame_offsets is None:
-        frame_offsets = Path(qub).with_name(f"{Path(qub).stem}_frames_offsets.csv")
-        if not frame_offsets.exists():
-            try:
-                build_table(qub, frame_offsets)
-            except ValueError as e:
-                warnings.warn(f"fix_frames skipped: {e}", UserWarning, stacklevel=2)
-                return rad
-    out, lost = apply(rad, frame_offsets)
-    out = out.assign_coords(lost_frames=(("band", "y"), lost))
-    return io.get_step_log(
-        out, rad, "retime", "frame_table", t0, cfg, ("fix_frames",), frame_offsets=str(frame_offsets)
-    )

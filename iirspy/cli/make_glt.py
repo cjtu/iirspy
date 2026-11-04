@@ -1,3 +1,5 @@
+"""`iirs-make-glt`: build a scene group's GLT (map pixel -> camera pixel lookup) from its merged GCPs."""
+
 from __future__ import annotations
 
 import sys
@@ -15,7 +17,7 @@ def _glt_parser():
     ap = argparse.ArgumentParser(description="Build a scene's GLT from its merged GCPs.")
     ap.add_argument("sid", help="scene id, e.g. 20210103T1829495344")
     ap.add_argument("--group", required=True, choices=list(ck.GROUPS))
-    ap.add_argument("--gcps", default=None, help="merged .gcps (default the iirs-solve-scene --keep layout)")
+    ap.add_argument("--gcps", default=None, help="merged .gcps (default the iirs-georef-solve --keep layout)")
     ap.add_argument(
         "--out",
         default=None,

@@ -1,3 +1,9 @@
+"""Base class of the level configs (`L1Config`, `L2Config`): named presets, overrides and a JSON round trip.
+
+A config is a frozen dataclass whose fields each name one method choice. `resolve` accepts a preset name or an
+instance plus field overrides; `to_attrs` is what lands in a product's `l1_config` / `l2_config` attr.
+"""
+
 from __future__ import annotations
 
 import dataclasses

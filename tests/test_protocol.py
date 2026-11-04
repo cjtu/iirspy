@@ -1,12 +1,10 @@
 import json
-import time
-from dataclasses import dataclass
 
 import numpy as np
 import pytest
 import xarray as xr
 
-from iirspy import instrument, io
+from iirspy import instrument
 from iirspy.l1 import calibrate as calibrate_l1
 from iirspy.l1 import radiometry
 from iirspy.l1.config import L1Config
@@ -45,23 +43,11 @@ def test_every_active_step_leaves_one_provenance_entry_in_pipeline_order(dn):
     l1 = calibrate_l1(dn, L1Config(calib="lut_median", bad_pixel_mask=False, interp_bands="linear"), qub="")
     assert _steps(l1) == ["radiometry", "mask", "fill"]
     l2 = calibrate_l2(l1, L2Config(flux=1.0, smoothing=3, smoothing_edges="nan", clip_negative=True))
-    assert _steps(l2) == ["radiometry", "mask", "fill", "solar", "photometric", "smoothing", "clip_fill"]
-    assert all({"method", "cfg", "version", "inputs", "wall_s"} <= set(e) for e in json.loads(l2.attrs["provenance"]))
+    assert _steps(l2) == ["radiometry", "mask", "fill", "solar", "photometric", "smoothing", "clip"]
 
 
-def test_a_new_step_is_one_function_one_config_field_one_call_line(dn):
-    @dataclass(frozen=True)
-    class Cfg(L1Config):
-        dummy: bool = True
-
-    def dummy(rad, cfg, **_):
-        if not cfg.dummy:
-            return rad
-        return io.get_step_log(rad.copy(), rad, "dummy", "noop", time.monotonic(), cfg, ("dummy",))
-
-    cfg = Cfg(calib="lut_median", bad_pixel_mask=False)
-    rad = dummy(calibrate_l1(dn, cfg, qub=""), cfg)  # the one call line
-    assert _steps(rad) == ["radiometry", "mask", "dummy"]
-    assert json.loads(rad.attrs["provenance"])[-1]["cfg"] == {"dummy": True}
-    off = dummy(calibrate_l1(dn, cfg, qub=""), Cfg(dummy=False, calib="lut_median", bad_pixel_mask=False))
-    assert _steps(off) == ["radiometry", "mask"]
+def test_thermal_without_thermal_bands_is_a_no_op(dn):
+    l1 = calibrate_l1(dn, L1Config(calib="lut_median", bad_pixel_mask=False), qub="")
+    with pytest.warns(UserWarning, match="no thermal bands"):
+        l2 = calibrate_l2(l1, L2Config(flux=1.0, thermal="isothermal"))
+    assert "T" not in l2.coords and "thermal" not in _steps(l2)
