@@ -579,8 +579,8 @@ def solve_grade(agree_summary, p95_stop_m: float):
     human-verified-good scene has rejected chunks too -- while this does: over 11 verified scenes
     the worst good scene sat at 383 m and the best bad one at 6487 m.
 
-    >>> [solve_grade({"0-1": {"p95_m": v}}, 16.5) for v in (12.0, 382.9, 6486.6)]
-    ['tight', 'acceptable', 'failed']
+    >>> tuple(solve_grade({"0-1": {"p95_m": v}}, 16.5) for v in (12.0, 382.9, 6486.6))
+    ('tight', 'acceptable', 'failed')
     >>> solve_grade({}, 16.5) is None
     True
     """

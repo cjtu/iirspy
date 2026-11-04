@@ -343,7 +343,7 @@ def build_flat(img, dark, rs, lit, row_bright, ref_flat=None):
     qualifies. Never raises. Returns (flat, emp_notes) recording the rows used, whether the
     fallback fired, and the per-scene-vs-reference RMS deviation (the flat stability metric).
 
-    emp_notes["flat_runs"][bin] is [first, last + 1] of the rows sampled in that bin; the rows
+    `emp_notes["flat_runs"][bin]` is `[first, last + 1]` of the rows sampled in that bin; the rows
     are scattered within that span, not a solid block.
     """
     bad = on_bands(instrument.load_bad_pixel_mask(), img)
