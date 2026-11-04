@@ -2,6 +2,7 @@ import copy
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import TypeVar
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -50,10 +51,18 @@ def _try_load_next_level_metadata(basename, target_level, directory, xyextent):
     return result
 
 
-def _flip(da, flip):
-    """`da` reversed along y and/or x per `flip` = (flip_y, flip_x), keeping its ascending coords."""
-    sl = {d: slice(None, None, -1) for d, f in zip(("y", "x"), flip, strict=True) if f}
-    return da.isel(sl).assign_coords({d: da[d].values for d in sl})
+XR = TypeVar("XR", xr.DataArray, xr.Dataset)
+
+
+def _flip(da, flip: tuple[bool, bool]):
+    """Reverse the pixel order of `da` along y and/or x, leaving the coordinate labels ascending.
+
+    `flip` is `(flip_y, flip_x)`: True reverses that dimension's data, False leaves it alone.
+    """
+    flip_y, flip_x = flip
+    dims = [d for d, do in (("y", flip_y), ("x", flip_x)) if do]
+    out = da.isel({d: slice(None, None, -1) for d in dims})
+    return out.assign_coords({d: da[d].values for d in dims})
 
 
 def read_issdc_loc(fqub):
@@ -77,7 +86,8 @@ def read_issdc_loc(fqub):
     corners = [(i, j) for i in (0, -1) for j in (0, -1)]
     dlon = [((lon[c] - lon0 + 180) % 360 - 180) * np.cos(np.radians(lat0)) for c in corners]
     d = np.hypot(dlon, [lat[c] - lat0 for c in corners])
-    flip = tuple(bool(k) for k in corners[int(np.argmin(d))])
+    flip_y, flip_x = corners[int(np.argmin(d))]
+    flip = (bool(flip_y), bool(flip_x))
     return _flip(loc, flip), flip
 
 
@@ -559,7 +569,6 @@ class L0(IIRSData):
         calib_dir=instrument.DCALIB,
         output_bands=None,
         frame_offsets=None,
-        ws=None,
         **overrides,
     ):
         """Calibrate to an L1 object, with ISSDC L1 metadata if it exists (see `iirspy.l1.calibrate`).
@@ -573,7 +582,6 @@ class L0(IIRSData):
         img = l1.calibrate(
             self.img,
             L1Config.resolve(config, **overrides),
-            ws=ws,
             qub=self.qub,
             calib_dir=calib_dir,
             empirical_kws=empirical_kws,
@@ -773,13 +781,13 @@ class L1(IIRSData):
     def plot_spectra(self, bands=(None, None), yrange=(None, None), xrange=(None, None), **kwargs):
         return super().plot_spectra(bands, yrange, xrange, **kwargs)
 
-    def georef(self, method, *, ws=None, **inputs):
+    def georef(self, method, *, work=None, **inputs):
         """The scene's `Geometry` by `method` (a `georef.GEOREF` key); `inputs` are that method's own (see `iirspy.georef`)."""
         return georef.run_georef(
-            method, ws=ws, sid=self.basename, shape=self.img.shape[-2:], row0=self._cube_scan0(), **inputs
+            method, work=work, sid=self.basename, shape=self.img.shape[-2:], row0=self._cube_scan0(), **inputs
         )
 
-    def calibrate(self, config="iirspy", *, geom=None, ws=None, **overrides):
+    def calibrate(self, config="iirspy", *, geom=None, **overrides):
         """Calibrate to an L2 reflectance object (see `iirspy.l2.calibrate`; needs the SPM file for solar angles).
 
         `config` is an `L2Config` or a preset name; `overrides` replace individual fields, e.g.
@@ -790,7 +798,7 @@ class L1(IIRSData):
                 f"SPM file required for reflectance calibration. Expected: "
                 f"{self.directory}/miscellaneous/calibrated/ch2_iir_nci_{self.basename}_spm.dat"
             )
-        return L2._from_l1(self, L2Config.resolve(config, **overrides), geom, ws)
+        return L2._from_l1(self, L2Config.resolve(config, **overrides), geom)
 
 
 class L2(IIRSData):
@@ -865,7 +873,7 @@ class L2(IIRSData):
         return instance
 
     @classmethod
-    def _from_l1(cls, l1_instance, cfg, geom=None, ws=None):
+    def _from_l1(cls, l1_instance, cfg, geom=None):
         """Internal method to create L2 from L1 instance."""
         instance = cls.__new__(cls)
         instance.basename = l1_instance.basename
@@ -881,7 +889,7 @@ class L2(IIRSData):
         instance.metadata = l1_instance.metadata.copy()
 
         instance.img = l2.calibrate(
-            l1_instance.img, cfg, ws=ws, qub=l1_instance.qub if hasattr(l1_instance, "qub") else None, geom=geom
+            l1_instance.img, cfg, qub=l1_instance.qub if hasattr(l1_instance, "qub") else None, geom=geom
         )
         instance.img.attrs["calibration_source"] = "user"
 

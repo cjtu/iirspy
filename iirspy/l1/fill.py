@@ -35,7 +35,7 @@ def _interp_rows(rad, max_gap=ROW_GAP):
     return rad.copy(data=data.map_overlap(block, depth={ax: max_gap}, boundary="none", dtype=data.dtype))
 
 
-def fill(rad, cfg, *, ws=None, **_):
+def fill(rad, cfg, **_):
     """Rebuild the lost frames from each pixel's own spectrum, then interpolate the remaining band and spatial gaps."""
     lost = rad.lost_frames.values if "lost_frames" in rad.coords else None
     out = rad.drop_vars("lost_frames", errors="ignore")
@@ -50,4 +50,4 @@ def fill(rad, cfg, *, ws=None, **_):
         # max_gap=2 in 0.5-based x coords spans exactly one missing column
         out = out.interpolate_na("x", max_gap=2, keep_attrs=True, method="linear")
         out = _interp_rows(out)
-    return io.record_step(out, rad, "fill", "interpolate", t0, cfg, ("fill_frames", "interp_bands", "interp_spatial"))
+    return io.get_step_log(out, rad, "fill", "interpolate", t0, cfg, ("fill_frames", "interp_bands", "interp_spatial"))

@@ -14,7 +14,7 @@ l2 = l1.calibrate("issdc", geom=geom, sdist="spice")  # ...with one field overri
 l2.to_geotiff("map.tif", geom=geom, grid=geom.grid(500.0))  # the only place the cube is map-projected
 ```
 
-Each calibration is an ordered list of steps with one signature, `step(cube, cfg, *, ws=None, **inputs)`, in `iirspy.l1.calibrate` and `iirspy.l2.calibrate`. A step whose config fields are off returns its input unchanged; an active step appends one entry (step, method, fields read, version, inputs, wall time) to the JSON list `attrs["provenance"]`, which a later level continues. The wall time of a step on a lazy cube is the graph-build time. A new step is one function in the level's directory, one config field and one call line in that `calibrate`.
+Each calibration is an ordered list of steps with one signature, `step(cube, cfg, **inputs)`, in `iirspy.l1.calibrate` and `iirspy.l2.calibrate`. A step whose config fields are off returns its input unchanged; an active step appends one entry (step, method, fields read, version, inputs, wall time) to the JSON list `attrs["provenance"]`, which a later level continues. The wall time of a step on a lazy cube is the graph-build time. A new step is one function in the level's directory, one config field and one call line in that `calibrate`.
 
 ## L1: radiance
 

@@ -2,7 +2,7 @@ import ast
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1] / "iirspy"
-BASE = {"config.py", "instrument.py", "io.py", "workspace.py"}
+BASE = {"config.py", "instrument.py", "io.py"}
 LEVELS = {"l1", "l2", "georef", "cli"}
 FORBIDDEN = {"l1": {"l2", "georef", "cli"}, "georef": {"l2", "cli"}, "l2": {"cli"}}
 

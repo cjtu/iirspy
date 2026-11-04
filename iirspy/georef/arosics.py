@@ -4,15 +4,15 @@ Splits an L1 product cropped to the group's latitudes into chunks via `iirspy.ge
 chunk against its own bounded hillshade, then merges the chunks with a cosine cross-fade over each row overlap and
 warps the merged result.
 
-The work dir (`Workspace.dir`) doubles as the restart cache: a re-run reuses any chunk already solved at the same
-shape, so a rerun only re-solves what it did not finish. A step that would not finish inside `Workspace.deadline`
-raises `DeadlineReached` before starting.
+The work dir doubles as the restart cache: a re-run reuses any chunk already solved at the same shape, so a rerun
+only re-solves what it did not finish.
 """
 
 from __future__ import annotations
 
 import filecmp
 import json
+import logging
 import shutil
 import time
 import traceback
@@ -25,7 +25,8 @@ from iirspy.georef import ancillary
 from iirspy.georef import chunks as ck
 from iirspy.io import IIRSPY_VERSION
 from iirspy.l1.frames import table_key as frames_key
-from iirspy.workspace import Workspace, ncpu, phase
+
+log = logging.getLogger(__name__)
 
 WIDTH_RANGE_KM = (100.0, 150.0)
 OVERLAP_FRAC = 0.10
@@ -89,8 +90,7 @@ TWEAK_DEFAULTS = {
 def _dem_key(path: str) -> str:
     """Cache-comparable identity for a DEM path: the product filename, not the mount root.
 
-    `IIRS_DEM_ROOTS` differs between a cluster job and a local rerun (e.g. cluster `/scratch/...`
-    vs local `/mnt/d/...`), so comparing full paths would call every chunk's cache stale on a
+    `IIRS_DEM_ROOTS` differs between machines (e.g. `/scratch/...` vs `/mnt/d/...`), so comparing full paths would call every chunk's cache stale on a
     different machine even though the same DEM product solved it.
 
     >>> _dem_key("/scratch/cjtu/lro_lola/LOLA_GDR/POLAR/SOUTH_POLE/LDEM_75S_30M.tif")
@@ -102,7 +102,7 @@ def _dem_key(path: str) -> str:
 
 
 def _cached_chunk(
-    ws: Workspace, sid: str, group: str, frames: Path, c: dict, good_corr: float, decay_m: float, tweaks: dict
+    work: Path, sid: str, group: str, frames: Path, c: dict, good_corr: float, decay_m: float, tweaks: dict
 ):
     """The prior solve of chunk `c['i']` if it is still valid, else None.
 
@@ -111,7 +111,7 @@ def _cached_chunk(
     because none of the other fields say anything about the *code* that solved the chunk, so without
     it a rerun after an algorithm change mixes old and new solves in one
     product. `"0+source"` (not installed as a distribution, so the version cannot invalidate
-    anything) always misses; the cluster venv picks up a bump when iirspy is reinstalled into it.
+    anything) always misses.
 
     Convergence isn't required -- a non-converged chunk that still passed quality (5-iter cap, no
     plateau) re-solves to the same result every time, so treating it as cache-invalid just burns
@@ -120,7 +120,7 @@ def _cached_chunk(
     the far tier per chunk, so two runs can agree on shape and still have used different
     references. Returns (fit, gcps_by_rc).
     """
-    ffit, fgcp = ws.path(f"{sid}_{group}_chunk{c['i']}_fit.json"), ws.path(f"{sid}_{group}_chunk{c['i']}.gcps")
+    ffit, fgcp = work / f"{sid}_{group}_chunk{c['i']}_fit.json", work / f"{sid}_{group}_chunk{c['i']}.gcps"
     if not (ffit.exists() and fgcp.exists()):
         return None
     fit = json.loads(ffit.read_text())
@@ -177,7 +177,7 @@ def _peak_mb() -> float:
 
 
 def make_loc(
-    ws: Workspace,
+    work: Path,
     sid: str,
     group: str,
     dem_roots: tuple[Path, ...],
@@ -194,11 +194,10 @@ def make_loc(
     if floc.exists() and not overwrite:
         return floc
     peak0 = _peak_mb()
-    with phase(ws, "loc"):
-        lon, lat, radius = backplanes.group_loc_core(merged, group, dem_roots)
-        loc = {"lon": lon, "lat": lat, "radius": radius, "groups": {group: (scan0, scan0 + lon.shape[0] - 1)}}
-        backplanes.write_loc(floc, loc, sid, row0=scan0, fits=fits, dem_roots=dem_roots)
-    ws.log(f"loc: {floc} {lon.shape}, peak RSS {peak0:.0f} -> {_peak_mb():.0f} MB")
+    lon, lat, radius = backplanes.group_loc_core(merged, group, dem_roots)
+    loc = {"lon": lon, "lat": lat, "radius": radius, "groups": {group: (scan0, scan0 + lon.shape[0] - 1)}}
+    backplanes.write_loc(floc, loc, sid, row0=scan0, fits=fits, dem_roots=dem_roots)
+    log.info(f"loc: {floc} {lon.shape}, peak RSS {peak0:.0f} -> {_peak_mb():.0f} MB")
     return floc
 
 
@@ -221,7 +220,7 @@ def geometry(
     stage_dir=None,
     fgcps=None,
     topo_dir=None,
-    ws=None,
+    work=None,
 ):
     """`Geometry` of one solved group from its merged GCP lattice: LOC from the lattice + LOLA radius, topo
     (when `topo_dir` is given) and SPICE sun/sensor terms from that LOC, QA from the lattice and the solve summary
@@ -312,19 +311,19 @@ def keep_products(sid: str, group: str, out: Path, dest: Path) -> list[Path]:
     return copied
 
 
-def _write_and_keep(ws: Workspace, sid: str, group: str, summary: dict, dest: Path | None) -> None:
+def _write_and_keep(work: Path, sid: str, group: str, summary: dict, dest: Path | None) -> None:
     """Write the solve summary to the work dir and, with `dest`, copy the products there. Before LOC
     (`summary["loc"]` None) any earlier solve's LOC is deleted from both, since it would pair with the wrong GCPs."""
     if summary["loc"] is None:
-        for d in (ws.dir, dest or ws.dir):
+        for d in (work, dest or work):
             (d / f"{sid}_{group}_loc.tif").unlink(missing_ok=True)
-    ws.path(f"{sid}_{group}_solve_summary.json").write_text(json.dumps(summary, indent=1, default=str))
+    (work / f"{sid}_{group}_solve_summary.json").write_text(json.dumps(summary, indent=1, default=str))
     if dest:
-        ws.log(f"kept {len(keep_products(sid, group, ws.dir, dest))} file(s) -> {dest}")
+        log.info(f"kept {len(keep_products(sid, group, work, dest))} file(s) -> {dest}")
 
 
 def solve_group(
-    ws: Workspace,
+    work: Path,
     *,
     sid: str,
     group: str,
@@ -345,19 +344,19 @@ def solve_group(
     """Plan the group's chunks (`only`: comma-separated indices) and solve them against `ftif`, the one-band L1 crop
     starting at Scan `row0`. Unset `decay_m` and `tweaks` (keys of `TWEAK_DEFAULTS`) take `cfg`'s values.
     Returns (chunks, results, consensus info); results are empty for `hillshade_only`."""
-    chunks = plan_group_chunks(ws, sid, group, fgeom, paths.dem_roots, row0, shape[0], only, cfg.niter)
+    chunks = plan_group_chunks(work, sid, group, fgeom, paths.dem_roots, row0, shape[0], only)
     decay_m = cfg.decay_m if decay_m is None else decay_m
     tweaks = tweaks or {}
     tweaks = {k: getattr(cfg, k) if tweaks.get(k) is None else tweaks[k] for k in TWEAK_DEFAULTS}
     results, info = solve_chunks(
-        ws, sid, group, frames, kernels, chunks, cfg, ftif, fgeom, flabel, decay_m, tweaks, hillshade_only
+        work, sid, group, frames, kernels, chunks, cfg, ftif, fgeom, flabel, decay_m, tweaks, hillshade_only
     )
     return chunks, results, info
 
 
 def solve(
     *,
-    ws: Workspace,
+    work: Path,
     sid: str,
     group: str,
     row0: int,
@@ -376,14 +375,14 @@ def solve(
     tweaks: dict | None = None,
 ):
     """Solve every chunk, merge with a cross-fade, warp, and write the merged GCPs, GLT, LOC and solve summary to
-    `ws.dir` (and `keep`, the GCPs and GLT before the LOC). Returns the group's `Geometry` with those as sidecars;
+    `work` (and `keep`, the GCPs and GLT before the LOC). Returns the group's `Geometry` with those as sidecars;
     its LOC is read on demand."""
     from iirspy import georef
     from iirspy.georef.geometry import Geometry
 
     t_start = time.time()
     chunks, results, consensus_info = solve_group(
-        ws,
+        work,
         sid=sid,
         group=group,
         row0=row0,
@@ -403,21 +402,21 @@ def solve(
 
     results.sort(key=lambda r: r["chunk"]["i"])
     used_chunks = [r["chunk"] for r in results]
-    merged, agree_summary = merge_gcps(ws, results)
+    merged, agree_summary = merge_gcps(work, results)
 
-    fgcps = ws.path(f"{sid}_{group}.gcps")
+    fgcps = work / f"{sid}_{group}.gcps"
     save_gcps(fgcps, merged)
-    ws.log(f"\nmerged gcps: {len(merged)} points -> {fgcps}")
+    log.info(f"\nmerged gcps: {len(merged)} points -> {fgcps}")
 
     # The L1 raster holds a geotransform for `row0`, so its GCPs ride in a sidecar; without it the kept
     # raster is camera-space only and nothing but iirspy can place it.
-    ws.log(f"gcp vrt: {georef.save_gcp_vrt(ftif, gcp_list(merged), georef.stereo_crs(group))}")
+    log.info(f"gcp vrt: {georef.save_gcp_vrt(ftif, gcp_list(merged), georef.stereo_crs(group))}")
 
-    final_cfg, final = warp_merged(ws, sid, group, merged, used_chunks, cfg, ftif)
+    final_cfg, final = warp_merged(work, sid, group, merged, used_chunks, cfg, ftif)
     final_shape = list(final.shape)
     del final
-    fglt = make_glt(sid, group, merged, cfg, row0, str(ws.dir), overwrite=True)
-    ws.log(f"glt: {fglt}")
+    fglt = make_glt(sid, group, merged, cfg, row0, str(work), overwrite=True)
+    log.info(f"glt: {fglt}")
 
     summary = {
         "sid": sid,
@@ -443,11 +442,11 @@ def solve(
         "total_s": round(time.time() - t_start, 1),
     }
     # Keep the GCPs and GLT before LOC: a LOC that dies (OOM, wall clock) must not take the solve with it.
-    _write_and_keep(ws, sid, group, summary, keep)
-    floc = make_loc(ws, sid, group, paths.dem_roots, merged, row0, str(ws.dir), [r["fit"] for r in results], True)
+    _write_and_keep(work, sid, group, summary, keep)
+    floc = make_loc(work, sid, group, paths.dem_roots, merged, row0, str(work), [r["fit"] for r in results], True)
     summary |= {"loc": floc.name, "total_s": round(time.time() - t_start, 1)}
-    ws.log(f"\ndone in {summary['total_s']}s.")
-    _write_and_keep(ws, sid, group, summary, keep)
+    log.info(f"\ndone in {summary['total_s']}s.")
+    _write_and_keep(work, sid, group, summary, keep)
 
     return Geometry(
         sid,
@@ -455,7 +454,7 @@ def solve(
         row0,
         "arosics",
         _quality(summary),
-        sidecars={"gcps": fgcps, "glt": fglt, "loc": floc, "summary": ws.path(f"{sid}_{group}_solve_summary.json")},
+        sidecars={"gcps": fgcps, "glt": fglt, "loc": floc, "summary": work / f"{sid}_{group}_solve_summary.json"},
         provenance=[
             {
                 "step": "georef",
@@ -468,15 +467,15 @@ def solve(
     )
 
 
-def run(*, merged: dict | None = None, ws: Workspace | None = None, **inputs):
+def run(*, merged: dict | None = None, work: Path | None = None, **inputs):
     """The `arosics` georef method: `geometry` from already-solved `merged` GCPs, else `solve` first."""
     if merged is not None:
-        return geometry(merged=merged, ws=ws, **inputs)
-    assert ws is not None, "solving needs a Workspace"  # noqa: S101
-    return solve(ws=ws, **inputs)
+        return geometry(merged=merged, work=work, **inputs)
+    assert work is not None, "solving needs a work dir"  # noqa: S101
+    return solve(work=work, **inputs)
 
 
-def warp_merged(ws: Workspace, sid: str, group: str, merged: dict, used_chunks: list[dict], cfg0, ftif: Path):
+def warp_merged(work: Path, sid: str, group: str, merged: dict, used_chunks: list[dict], cfg0, ftif: Path):
     """Warp the band once through the merged GCPs, cropped to the union of the solved chunk AOIs."""
     from iirspy.georef.georef import project, read_band, save_grid
 
@@ -491,9 +490,9 @@ def warp_merged(ws: Workspace, sid: str, group: str, merged: dict, used_chunks: 
         ),
     )
     final = project(read_band(ftif, final_cfg.band), gcps, final_cfg)
-    ffinal = ws.path(f"{sid}_{group}_L1_b{final_cfg.band}.tif")
+    ffinal = work / f"{sid}_{group}_L1_b{final_cfg.band}.tif"
     save_grid(ffinal, final, final_cfg)
-    ws.log(
+    log.info(
         f"final merged+warped: shape={final.shape} -> {ffinal}, aoi_km={[round(v / 1000, 1) for v in final_cfg.aoi]}"
     )
     return final_cfg, final
@@ -516,7 +515,7 @@ def _blend_point(pa, pb, w_a: float):
     return (w_a * xa + (1 - w_a) * xb, w_a * ya + (1 - w_a) * yb), float(np.hypot(xa - xb, ya - yb))
 
 
-def merge_gcps(ws: Workspace, results) -> tuple[dict, dict]:
+def merge_gcps(work: Path, results) -> tuple[dict, dict]:
     """Blend the per-chunk GCP fields into one, cosine cross-fading each row overlap.
 
     Returns the merged {(row, col): (x, y)} and a per-overlap summary of how far the two
@@ -558,7 +557,7 @@ def merge_gcps(ws: Workspace, results) -> tuple[dict, dict]:
             if dist is not None:
                 agree.setdefault(key, []).append(dist)
 
-    ws.log("\noverlap agreement (independent chunk solves, before blending):")
+    log.info("\noverlap agreement (independent chunk solves, before blending):")
     agree_summary = {}
     for (ai, bi), dists in agree.items():
         arr = np.array(dists)
@@ -567,7 +566,9 @@ def merge_gcps(ws: Workspace, results) -> tuple[dict, dict]:
             "median_m": round(float(np.median(arr)), 1),
             "p95_m": round(float(np.percentile(arr, 95)), 1),
         }
-        ws.log(f"  chunk{ai}<->chunk{bi}: n={len(arr)} median={np.median(arr):.1f}m p95={np.percentile(arr, 95):.1f}m")
+        log.info(
+            f"  chunk{ai}<->chunk{bi}: n={len(arr)} median={np.median(arr):.1f}m p95={np.percentile(arr, 95):.1f}m"
+        )
 
     return merged, agree_summary
 
@@ -694,7 +695,9 @@ def _chunk_grade(r) -> str:
     return "suspect" if r["fit"].get("stats", {}).get("coarse", {}).get("accepted") else "fallback"
 
 
-def _solve_one(ws, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=False):
+def _solve_one(
+    work, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=False
+):
     """Solve chunk `c` seeded from `seed` (a prior coarse shift in metres), or reuse its cache.
 
     `pin_coarse` holds the chunk at `seed` exactly: `coarse_max_m=0` leaves the coarse search one
@@ -702,9 +705,7 @@ def _solve_one(ws, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flab
     tie-point iterations still run. The cache is keyed on everything but the seed, so a pinned
     re-solve must not read it -- it would hand back the very fit the reseed exists to replace.
 
-    Returns {"chunk", "gcps", "fit"}, or None on total failure. Raises `DeadlineReached` if this chunk
-    would not fit in the time left (`ws.deadline`) -- stopping *before* a chunk rather than
-    being killed inside one keeps every finished chunk's cache intact for the rerun.
+    Returns {"chunk", "gcps", "fit"}, or None on total failure.
     """
     from iirspy.georef.georef import (
         project,
@@ -718,14 +719,11 @@ def _solve_one(ws, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flab
     )
 
     i = c["i"]
-    cached = None if pin_coarse else _cached_chunk(ws, sid, group, frames, c, ck.GOOD_CORR, decay_m, tweaks)
+    cached = None if pin_coarse else _cached_chunk(work, sid, group, frames, c, ck.GOOD_CORR, decay_m, tweaks)
     if cached is not None:
         fit, gcps_by_rc = cached
-        ws.log(f"chunk {i} [{c['band']}]: reusing cached solve, corr={fit['corr']}")
+        log.info(f"chunk {i} [{c['band']}]: reusing cached solve, corr={fit['corr']}")
         return {"chunk": c, "gcps": gcps_by_rc, "fit": fit}
-
-    need_s = _band_estimate_s(c["band"], cfg0.niter)
-    ws.check_deadline(need_s, f"chunk {i} [{c['band']}]")
 
     cfg = replace(
         cfg0,
@@ -739,7 +737,7 @@ def _solve_one(ws, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flab
         **({"coarse_max_m": 0.0} if pin_coarse else {}),
         **tweaks,
     )
-    ws.log(
+    log.info(
         f"\n--- chunk {i} [{c['band']}] solve: aoi={c['aoi']} far={Path(c['dem_far']).name} "
         f"decay_m={decay_m} seed_m={seed}{' PINNED' if pin_coarse else ''} {tweaks} ---"
     )
@@ -750,32 +748,34 @@ def _solve_one(ws, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flab
     # above 70 deg ever matched one) and the scene reads as albedo, which is what WAC shows.
     _, elev, _ = sun_geometry(fgeom, flabel, cfg, kernels)
     wac = use_wac(elev, cfg)
-    hit = _cached_reference(ws, sid, group, c, "wac" if wac else "hillshade")
+    hit = _cached_reference(work, sid, group, c, "wac" if wac else "hillshade")
     if hit is None:
         ref, hs_info = (render_wac if wac else render_reference)(fgeom, flabel, cfg, kernels)
-        _save_reference(ws, sid, group, c, cfg, ref, hs_info, "wac" if wac else "hillshade")
+        _save_reference(work, sid, group, c, cfg, ref, hs_info, "wac" if wac else "hillshade")
     else:
         ref, hs_info = hit
     hs_s = time.time() - t0
-    ws.log(f"chunk {i}: {'wac' if wac else 'hillshade'} ref {hs_s:.1f}s{' (cached)' if hit else ''}, shape {ref.shape}")
+    log.info(
+        f"chunk {i}: {'wac' if wac else 'hillshade'} ref {hs_s:.1f}s{' (cached)' if hit else ''}, shape {ref.shape}"
+    )
 
-    with phase(ws, f"chunk {i} register") as ph:
-        try:
-            reg = register(ftif, fgeom, flabel, cfg, reference=ref, verbose=True)
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            ws.log(f"chunk {i}: FAILED -- {err}")
-            ws.log(traceback.format_exc())
-            fit = {"chunk": i, "band": c["band"], "row0": c["row0"], "row1": c["row1"], "corr": None, "error": err}
-            ws.path(f"{sid}_{group}_chunk{i}_fit.json").write_text(json.dumps(fit, indent=1))
-            return None
-    solve_s = ph.wall
+    t_solve = time.time()
+    try:
+        reg = register(ftif, fgeom, flabel, cfg, reference=ref, verbose=True)
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        log.info(f"chunk {i}: FAILED -- {err}")
+        log.info(traceback.format_exc())
+        fit = {"chunk": i, "band": c["band"], "row0": c["row0"], "row1": c["row1"], "corr": None, "error": err}
+        (work / f"{sid}_{group}_chunk{i}_fit.json").write_text(json.dumps(fit, indent=1))
+        return None
+    solve_s = time.time() - t_solve
 
     band_i = read_band(ftif, cfg.band)
     after = project(band_i, reg.gcps, cfg)
     m = np.isfinite(after) & np.isfinite(ref) & (after > 0) & (ref > 0)
     corr = float(np.corrcoef(after[m], ref[m])[0, 1]) if m.sum() > 1000 else None
-    save_grid(ws.path(f"{sid}_{group}_chunk{i}_final.tif"), after, cfg)
+    save_grid(work / f"{sid}_{group}_chunk{i}_final.tif", after, cfg)
 
     fit = {
         "chunk": i,
@@ -795,18 +795,16 @@ def _solve_one(ws, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flab
         "elev": round(hs_info["elev"], 3),
         "lit_frac": round(hs_info["lit_frac"], 4),
         "solve_s": round(solve_s, 2),
-        "solve_cores": round(ph.cores, 2),
-        "ncpu": ncpu(),
         "corr": corr,
         "converged": reg.stats.get("converged"),
         "converged_reason": reg.stats.get("converged_reason"),
         "quality": reg.stats.get("quality"),
         "stats": reg.stats,
     }
-    ws.path(f"{sid}_{group}_chunk{i}_fit.json").write_text(json.dumps(fit, indent=1, default=str))
+    (work / f"{sid}_{group}_chunk{i}_fit.json").write_text(json.dumps(fit, indent=1, default=str))
     q = reg.stats.get("quality", {})
     verdict = f"REJECTED ({q['reason']})" if q.get("rejected") else f"ok match_frac={q.get('match_frac')}"
-    ws.log(
+    log.info(
         f"chunk {i}: {verdict}, corr={corr}, converged={reg.stats.get('converged')} "
         f"({reg.stats.get('converged_reason')}), solve={solve_s:.1f}s "
         f"[setup={reg.stats.get('setup_s')}s project={reg.stats.get('project_s')}s "
@@ -814,7 +812,7 @@ def _solve_one(ws, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flab
     )
 
     gcps_by_rc = {(g.row, g.col): (g.x, g.y) for g in reg.gcps}
-    save_gcps(ws.path(f"{sid}_{group}_chunk{i}.gcps"), gcps_by_rc)
+    save_gcps(work / f"{sid}_{group}_chunk{i}.gcps", gcps_by_rc)
     return {"chunk": c, "gcps": gcps_by_rc, "fit": fit}
 
 
@@ -827,16 +825,16 @@ def _reference_key(c: dict, reference: str) -> dict:
     }
 
 
-def _save_reference(ws: Workspace, sid: str, group: str, c: dict, cfg, ref, hs_info: dict, reference: str) -> None:
+def _save_reference(work: Path, sid: str, group: str, c: dict, cfg, ref, hs_info: dict, reference: str) -> None:
     """Write chunk `c`'s reference image and the key `_cached_reference` reads it back by."""
     from iirspy.georef.georef import save_grid
 
-    save_grid(ws.path(f"{sid}_{group}_chunk{c['i']}_hs.tif"), ref, cfg)
+    save_grid(work / f"{sid}_{group}_chunk{c['i']}_hs.tif", ref, cfg)
     info = {k: hs_info[k] for k in ("az_grid", "elev", "lit_frac")}
-    ws.path(f"{sid}_{group}_chunk{c['i']}_hs.json").write_text(json.dumps({**_reference_key(c, reference), **info}))
+    (work / f"{sid}_{group}_chunk{c['i']}_hs.json").write_text(json.dumps({**_reference_key(c, reference), **info}))
 
 
-def _cached_reference(ws: Workspace, sid: str, group: str, c: dict, reference: str):
+def _cached_reference(work: Path, sid: str, group: str, c: dict, reference: str):
     """(image, info) of chunk `c`'s reference from an earlier run in this work dir, or None.
 
     A reference depends on the DEMs, the sun and the chunk's grid, never on the cube, so a re-solve on a re-timed
@@ -845,11 +843,11 @@ def _cached_reference(ws: Workspace, sid: str, group: str, c: dict, reference: s
     """
     import rasterio
 
-    fhs = ws.path(f"{sid}_{group}_chunk{c['i']}_hs.tif")
+    fhs = work / f"{sid}_{group}_chunk{c['i']}_hs.tif"
     finfo = next(
         (
             f
-            for f in (ws.path(f"{sid}_{group}_chunk{c['i']}_hs.json"), ws.path(f"{sid}_{group}_chunk{c['i']}_fit.json"))
+            for f in (work / f"{sid}_{group}_chunk{c['i']}_hs.json", work / f"{sid}_{group}_chunk{c['i']}_fit.json")
             if f.exists()
         ),
         None,
@@ -865,7 +863,7 @@ def _cached_reference(ws: Workspace, sid: str, group: str, c: dict, reference: s
         return src.read(1), info
 
 
-def _solve_chunks_hillshade(ws, sid, group, kernels, chunks, cfg0, fgeom, flabel):
+def _solve_chunks_hillshade(work, sid, group, kernels, chunks, cfg0, fgeom, flabel):
     """Render and save each chunk's reference hillshade only, no registration."""
     from iirspy.georef.georef import render_reference
 
@@ -873,8 +871,8 @@ def _solve_chunks_hillshade(ws, sid, group, kernels, chunks, cfg0, fgeom, flabel
         cfg = replace(cfg0, aoi=c["aoi"], dem_near=c["dem_near"], dem_far=c["dem_far"])
         t0 = time.time()
         ref, hs_info = render_reference(fgeom, flabel, cfg, kernels)
-        _save_reference(ws, sid, group, c, cfg, ref, hs_info, "hillshade")
-        ws.log(
+        _save_reference(work, sid, group, c, cfg, ref, hs_info, "hillshade")
+        log.info(
             f"chunk {c['i']} [{c['band']}] hillshade {time.time() - t0:.1f}s shape={ref.shape} "
             f"near={Path(c['dem_near']).name} far={Path(c['dem_far']).name} "
             f"az={hs_info['az_grid']:.1f} elev={hs_info['elev']:.2f} lit={hs_info['lit_frac']:.3f}"
@@ -886,7 +884,7 @@ def _s_mid(c) -> float:
     return 0.5 * float(c["s0"] + c["s1"])
 
 
-def _consensus_pass(ws, sid, group, frames, kernels, chunks, results, cfg0, ftif, fgeom, flabel, decay_m, tweaks):
+def _consensus_pass(work, sid, group, frames, kernels, chunks, results, cfg0, ftif, fgeom, flabel, decay_m, tweaks):
     """Re-solve every chunk that disagrees with the strip's consensus coarse shift, seeded from it.
 
     The coarse search estimates a quantity that is near-constant along a strip, so running it
@@ -901,7 +899,7 @@ def _consensus_pass(ws, sid, group, frames, kernels, chunks, results, cfg0, ftif
     """
     idx_a = [k for k, r in enumerate(results) if _is_anchor(r, cfg0)]
     if not idx_a:
-        ws.log("\nno anchor chunk in this strip: no consensus coarse shift, product is UNCORRECTED")
+        log.info("\nno anchor chunk in this strip: no consensus coarse shift, product is UNCORRECTED")
         return results, {"coarse_consensus_m": None, "uncorrected": True}
 
     spans = [c["s1"] - c["s0"] for c in chunks]
@@ -928,7 +926,7 @@ def _consensus_pass(ws, sid, group, frames, kernels, chunks, results, cfg0, ftif
         return bool(results[k]["fit"]["quality"]["match_frac"] >= min(a[1] for a in near))
 
     consensus = {c["i"]: [round(float(v), 1) for v in _frame(c).T @ [f(_s_mid(c)) for f in fits]] for c in chunks}
-    ws.log(
+    log.info(
         f"\nconsensus coarse shift (local lines in along-track distance) from {len(idx_a)} anchor chunk(s), "
         f"outlier anchors {outliers}, tol={CONSENSUS_TOL_M:.0f}m per component, max drift along/cross "
         f"{CONSENSUS_MAX_DRIFT_ALONG * 1000:.0f}/{CONSENSUS_MAX_DRIFT_CROSS * 1000:.0f} m/km"
@@ -941,21 +939,21 @@ def _consensus_pass(ws, sid, group, frames, kernels, chunks, results, cfg0, ftif
         worst = float(np.abs(dev).max())
         far = abs(dev[1]) > CONSENSUS_TOL_M or (abs(dev[0]) > CONSENSUS_TOL_M and not outmatched(idx))
         off = worst > 1.0 and (not _accepted(results[idx]) or far)
-        ws.log(
+        log.info(
             f"  chunk {c['i']}: shift={_shift_of(results[idx])} consensus={seed} "
             f"dev along/cross={dev[0]:.0f}/{dev[1]:.0f}m {'RESEED' if off else 'keep'}"
         )
         if not off:
             continue
         results[idx] = _solve_one(
-            ws, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=True
+            work, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=True
         )
         if results[idx] is not None:
             results[idx]["fit"]["reseeded"] = True
     return results, {"coarse_consensus_m": consensus, "consensus_outlier_anchors": outliers, "uncorrected": False}
 
 
-def solve_chunks(ws, sid, group, frames, kernels, chunks, cfg0, ftif, fgeom, flabel, decay_m, tweaks, hillshade_only):
+def solve_chunks(work, sid, group, frames, kernels, chunks, cfg0, ftif, fgeom, flabel, decay_m, tweaks, hillshade_only):
     """Solve each chunk against its own hillshade, reusing any prior good solve of the same shape.
 
     A forward pass seeds each chunk with the last accepted chunk's coarse shift, then
@@ -965,18 +963,20 @@ def solve_chunks(ws, sid, group, frames, kernels, chunks, cfg0, ftif, fgeom, fla
     decision, both empty when `hillshade_only`.
     """
     if hillshade_only:
-        _solve_chunks_hillshade(ws, sid, group, kernels, chunks, cfg0, fgeom, flabel)
+        _solve_chunks_hillshade(work, sid, group, kernels, chunks, cfg0, fgeom, flabel)
         return [], {}
 
     results: list[dict | None] = [None] * len(chunks)
     seed = (0.0, 0.0)
     for idx, c in enumerate(chunks):
-        results[idx] = _solve_one(ws, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks)
+        results[idx] = _solve_one(
+            work, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks
+        )
         if _accepted(results[idx]):
             seed = _shift_of(results[idx])
 
     results, info = _consensus_pass(
-        ws, sid, group, frames, kernels, chunks, results, cfg0, ftif, fgeom, flabel, decay_m, tweaks
+        work, sid, group, frames, kernels, chunks, results, cfg0, ftif, fgeom, flabel, decay_m, tweaks
     )
     solved = [r for r in results if r is not None]
     consensus = info.get("coarse_consensus_m")
@@ -987,40 +987,8 @@ def solve_chunks(ws, sid, group, frames, kernels, chunks, cfg0, ftif, fgeom, fla
     return solved, info
 
 
-# Per-band solve-time model: {hillshade_s, overhead_s, iter_s} @ the 4-core SBATCH default.
-# `overhead_s` is coarse_shift plus GCP-lattice setup, i.e. solve_s minus the sum of that chunk's
-# own iter_s. `--max-seconds` reads this to decide whether a chunk fits in the time left, so it
-# wants to run a little long rather than short.
-# north/north_midlat mirror south/south_midlat (same DEM tier structure) pending their own data.
-# `equatorial` re-measured 2026-09-04 (iirs-cluster/jobs/profiling): the old {3, 156, 47} predated
-# the gcp_lattice fix (428s -> 1.9s) and the bounded coarse search, and overshot 394s against a
-# measured 146s. south/south_midlat were fit the same way and are probably stale too -- unmeasured.
-BAND_TIMING: dict[str, dict[str, float]] = {
-    "south": {"hillshade_s": 18.0, "overhead_s": 77.0, "iter_s": 43.0},
-    "south_midlat": {"hillshade_s": 2.0, "overhead_s": 81.0, "iter_s": 57.0},
-    "equatorial": {"hillshade_s": 3.0, "overhead_s": 10.0, "iter_s": 30.0},
-    "north": {"hillshade_s": 18.0, "overhead_s": 77.0, "iter_s": 43.0},
-    "north_midlat": {"hillshade_s": 2.0, "overhead_s": 81.0, "iter_s": 57.0},
-}
-
-
-# Iterations a plateau-converged chunk lands around; a placeholder until measured under the
-# current convergence rule.
-TYPICAL_NITER = 4
-
-
-def _band_estimate_s(band: str, niter: int) -> float:
-    """Solve time for one `band` chunk run to `niter` iterations, from `BAND_TIMING`.
-
-    >>> round(_band_estimate_s("equatorial", 5))
-    163
-    """
-    t = BAND_TIMING[band]
-    return t["hillshade_s"] + t["overhead_s"] + niter * t["iter_s"]
-
-
 def plan_group_chunks(
-    ws: Workspace,
+    work: Path,
     sid: str,
     group: str,
     fgeom,
@@ -1028,12 +996,10 @@ def plan_group_chunks(
     scan0: int,
     ny: int,
     only: str | None,
-    niter_max: int,
 ) -> list[dict]:
     """This group's chunks, with cube row bounds attached and optionally filtered to `only`.
 
-    `only` is a comma-separated list of chunk indices. `niter_max` is `GeorefConfig.niter`, for the
-    worst-case estimate.
+    `only` is a comma-separated list of chunk indices.
     """
     all_chunks = ck.plan_chunks(fgeom, dem_roots, WIDTH_RANGE_KM, OVERLAP_FRAC)
     chunks = [c for c in all_chunks if c["group"] == group]
@@ -1054,32 +1020,12 @@ def plan_group_chunks(
             )
             raise ValueError(f"--chunks {sorted(missing)} not in group {group!r}: {detail}")
         chunks = [c for c in chunks if c["i"] in wanted]
-    ws.path(f"{sid}_{group}_chunks.json").write_text(json.dumps(chunks, indent=1))
-    ws.log(f"{len(chunks)} chunks planned ({group} group, {WIDTH_RANGE_KM[0]:.0f}-{WIDTH_RANGE_KM[1]:.0f}km):")
+    (work / f"{sid}_{group}_chunks.json").write_text(json.dumps(chunks, indent=1))
+    log.info(f"{len(chunks)} chunks planned ({group} group, {WIDTH_RANGE_KM[0]:.0f}-{WIDTH_RANGE_KM[1]:.0f}km):")
     for c in chunks:
-        ws.log(
+        log.info(
             f"  chunk {c['i']} [{c['band']}]: rows {c['row0']}-{c['row1']}, "
             f"s {c['s0'] / 1000:.0f}-{c['s1'] / 1000:.0f}km (w={(c['s1'] - c['s0']) / 1000:.0f}km), "
             f"aoi_km={[round(v / 1000, 1) for v in c['aoi']]}"
         )
-    bands_seen = list(dict.fromkeys(c["band"] for c in chunks))
-    ws.log("per-band summary:")
-    typical_s = worst_s = 0.0
-    for band in bands_seen:
-        bc = [c for c in chunks if c["band"] == band]
-        rows = sum(c["row1"] - c["row0"] + 1 for c in bc)
-        band_typical = len(bc) * _band_estimate_s(band, TYPICAL_NITER)
-        band_worst = len(bc) * _band_estimate_s(band, niter_max)
-        typical_s += band_typical
-        worst_s += band_worst
-        ws.log(
-            f"  {band}: {len(bc)} chunk(s), {rows} rows, near={Path(bc[0]['dem_near']).name}, "
-            f"far={Path(bc[0]['dem_far']).name}, ~{band_typical / 60:.0f} min typical / "
-            f"~{band_worst / 60:.0f} min worst-case"
-        )
-    ws.log(
-        f"estimated solve time: ~{typical_s / 60:.0f} min typical ({TYPICAL_NITER} iters/chunk, "
-        f"plateau-converged) / ~{worst_s / 60:.0f} min worst-case (every chunk hits the "
-        f"{niter_max}-iter cap) for {len(chunks)} chunks"
-    )
     return chunks

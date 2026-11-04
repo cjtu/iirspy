@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
-import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -35,10 +35,11 @@ from iirspy.georef import chunks as ck
 from iirspy.georef.georef import scan_order_reversed
 from iirspy.iirs import L1
 from iirspy.instrument import PAN_BANDS
+from iirspy.io import ncpu
 from iirspy.l1.fill import BAND_GAP
-from iirspy.workspace import DeadlineReached, ncpu
 
-EXIT_RESUME = 75
+log = logging.getLogger(__name__)
+
 
 # (flag, GeorefConfig field, type, help); an unset flag takes the field's tuned default.
 TUNING = (
@@ -70,13 +71,6 @@ def _parser() -> argparse.ArgumentParser:
         "scene's GLT/LOC backfill defaults to geometry/recalibrated/<day> under IIRS_RECAL_ROOT",
     )
     ap.add_argument("--resolve", action="store_true", help="re-solve even if merged GCPs already exist")
-    ap.add_argument(
-        "--max-seconds",
-        type=float,
-        default=float(os.environ.get("IIRS_MAX_SECONDS", 0)) or None,
-        help=f"stop before any step that would not finish inside this budget and exit {EXIT_RESUME}, leaving the "
-        "work dir resumable (env IIRS_MAX_SECONDS; default unbounded)",
-    )
     ap.add_argument("--clean", action="store_true", help="delete the work dir after --keep")
     ap.add_argument(
         "--chunks", default=None, help="comma-separated chunk indices to solve, e.g. 0,3,8; skips merge/warp"
@@ -105,40 +99,40 @@ def _write_reversed_csv(job: Job, fgeom: Path) -> Path:
     dst = ck.recal_dir(job.sid, job.paths) / fgeom.name
     dst.parent.mkdir(parents=True, exist_ok=True)
     df.sort_values(["Scan", "Pixel"]).to_csv(dst, index=False, float_format="%.9g")
-    job.ws.log(f"csv Scan runs against time (matches SPICE only reversed): using {dst}")
+    log.info(f"csv Scan runs against time (matches SPICE only reversed): using {dst}")
     return dst
 
 
 def _glt_only(job: Job, frames: Path, args, cfg, fgeom, lat_range) -> bool:
     """Already solved: build the GLT (and LOC, if missing) from the saved GCPs instead of restaging and re-solving."""
-    ws, sid, group = job.ws, job.sid, job.group
+    work, sid, group = job.work, job.sid, job.group
     name = f"{sid}_{group}.gcps"
-    fdone = next((f for f in (ws.dir / name, *([Path(args.keep) / name] if args.keep else [])) if f.exists()), None)
+    fdone = next((f for f in (work / name, *([Path(args.keep) / name] if args.keep else [])) if f.exists()), None)
     if fdone is None or args.resolve or args.chunks or args.hillshade_only:
         return False
     if predates_frames(fdone, frames):
-        ws.log(f"{fdone} predates {frames.name} -- re-solving on the re-timed cube")
+        log.info(f"{fdone} predates {frames.name} -- re-solving on the re-timed cube")
         return False
     if fgeom is None:
         sys.exit(f"missing geometry csv for {sid}")
     merged = arosics.load_gcps(fdone)
     keep = Path(args.keep or ck.recal_dir(sid, job.paths))
     scan0 = arosics.scene_scan0(fgeom, lat_range)
-    ws.log(f"{fdone} exists ({len(merged)} gcps) -- skipped solve")
+    log.info(f"{fdone} exists ({len(merged)} gcps) -- skipped solve")
     # GCPs found only in the work dir are an interrupted run's, so land them before anything else.
-    arosics.keep_products(sid, group, ws.dir, keep)
+    arosics.keep_products(sid, group, work, keep)
     ksummary = keep / f"{sid}_{group}_solve_summary.json"
     fits = json.loads(ksummary.read_text()).get("per_chunk_fit", []) if ksummary.exists() else []
     builds = {
-        "glt": lambda: arosics.make_glt(sid, group, merged, replace(cfg, lat_band=lat_range), scan0, str(ws.dir)),
-        "loc": lambda: arosics.make_loc(ws, sid, group, job.paths.dem_roots, merged, scan0, str(ws.dir), fits),
+        "glt": lambda: arosics.make_glt(sid, group, merged, replace(cfg, lat_band=lat_range), scan0, str(work)),
+        "loc": lambda: arosics.make_loc(work, sid, group, job.paths.dem_roots, merged, scan0, str(work), fits),
     }
     for kind, build in builds.items():
         f = keep / f"{sid}_{group}_{kind}.tif"
         if not f.exists():
             build()
-            arosics.keep_products(sid, group, ws.dir, keep)
-        ws.log(f"{kind}: {f}")
+            arosics.keep_products(sid, group, work, keep)
+        log.info(f"{kind}: {f}")
     return True
 
 
@@ -147,16 +141,15 @@ def main(argv: list[str] | None = None) -> None:
     if args.clean and not args.keep:
         sys.exit("--clean without --keep would discard the whole run")
     paths = paths_from_env()
-    deadline = time.monotonic() + args.max_seconds if args.max_seconds else None
 
     import dask
 
     dask.config.set(scheduler="threads", num_workers=ncpu())
 
-    job = open_run(args.sid, args.group, args.out, "solve", paths, deadline)
-    ws, sid, group = job.ws, job.sid, job.group
-    log_provenance(ws)
-    ws.log(f"{sid} group={group} zip={job.zip.name} ncpu={ncpu()} stage={job.stage}")
+    job = open_run(args.sid, args.group, args.out, "solve", paths)
+    work, sid, group = job.work, job.sid, job.group
+    log_provenance()
+    log.info(f"{sid} group={group} zip={job.zip.name} ncpu={ncpu()} stage={job.stage}")
 
     cfg = ck.chunk_cfg(group, paths.dem_roots)
     fgeom = ck.ancillary(sid, paths)["geometry/calibrated"]
@@ -165,7 +158,7 @@ def main(argv: list[str] | None = None) -> None:
     job = replace(job, frames=frames)
     lat_range = ck.l1_lat_range(group)
     if _glt_only(job, frames, args, cfg, fgeom, lat_range):
-        return clean_work(ws, args.clean)
+        return clean_work(work, args.clean)
 
     # Calibration only masks/interpolates the registration band's +-BAND_GAP window; the PAN_BANDS beyond it
     # feed the empirical dark/flat/smile derivation. Only the registration band is written.
@@ -173,7 +166,7 @@ def main(argv: list[str] | None = None) -> None:
         job,
         lat_range,
         sorted(set(PAN_BANDS) | set(_band_window(cfg.band))),
-        ws.path(f"{sid}_{group}_l1_group.tif"),
+        work / f"{sid}_{group}_l1_group.tif",
         calibrate_kwargs={"output_bands": _band_window(cfg.band)},
         out_bands=[cfg.band],
         chunk_y=args.chunk_y,
@@ -186,14 +179,14 @@ def main(argv: list[str] | None = None) -> None:
     l1 = L1.from_file(ftif, sid, str(job.stage))
     assert int(l1.img.y.values[0]) == scan0, "L1 crop does not start at the scan build_l1 reported"  # noqa: S101
     ny, nx = l1.img.shape[-2:]
-    ws.log(f"L1 cube ({group} group, lat {lat_range}): {ny} rows x {nx} cols, scan0={scan0}")
+    log.info(f"L1 cube ({group} group, lat {lat_range}): {ny} rows x {nx} cols, scan0={scan0}")
 
     kernels = ck.kernels(sid[:8], paths)
     try:
         reversed_, scan_source = scan_order_reversed(fgeom, flabel, ck.spm(sid, paths, job.stage), kernels)
     except FileNotFoundError as e:
         sys.exit(str(e))
-    ws.log(f"scan order reversed={reversed_} (track from {scan_source})")
+    log.info(f"scan order reversed={reversed_} (track from {scan_source})")
     if reversed_:
         fgeom = _write_reversed_csv(job, fgeom)
 
@@ -208,26 +201,22 @@ def main(argv: list[str] | None = None) -> None:
         "decay_m": args.decay_m,
         "tweaks": {k: getattr(args, k) for k in arosics.TWEAK_DEFAULTS},
     }
-    try:
-        if args.chunks or args.hillshade_only:
-            chunks, results, _ = arosics.solve_group(
-                ws,
-                sid=sid,
-                group=group,
-                row0=scan0,
-                shape=(ny, nx),
-                only=args.chunks,
-                hillshade_only=args.hillshade_only,
-                **inputs,
-            )
-            return ws.log(
-                f"\n{len(results)} of {len(chunks)} chunk(s) solved; no merge/warp for --chunks/--hillshade-only."
-            )
-        l1.georef("arosics", ws=ws, group=group, scan_source=scan_source, lat_range=lat_range, keep=keep, **inputs)
-    except DeadlineReached:
-        ws.log(f"chunks solved and cached; exiting {EXIT_RESUME} to resume.")
-        sys.exit(EXIT_RESUME)
-    clean_work(ws, args.clean)
+    if args.chunks or args.hillshade_only:
+        chunks, results, _ = arosics.solve_group(
+            work,
+            sid=sid,
+            group=group,
+            row0=scan0,
+            shape=(ny, nx),
+            only=args.chunks,
+            hillshade_only=args.hillshade_only,
+            **inputs,
+        )
+        return log.info(
+            f"\n{len(results)} of {len(chunks)} chunk(s) solved; no merge/warp for --chunks/--hillshade-only."
+        )
+    l1.georef("arosics", work=work, group=group, scan_source=scan_source, lat_range=lat_range, keep=keep, **inputs)
+    clean_work(work, args.clean)
 
 
 if __name__ == "__main__":

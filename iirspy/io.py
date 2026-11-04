@@ -1,8 +1,8 @@
 import hashlib
 import json
+import os
 import re
 import time
-import warnings
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
@@ -201,7 +201,7 @@ def get_iirs_shape_meta(fimg):
     return bands, lines, samples
 
 
-def record_step(out, prev, step: str, method: str, t0: float, cfg=None, fields=(), **inputs):
+def get_step_log(out, prev, step: str, method: str, t0: float, cfg=None, fields=(), **inputs):
     """`out` carrying `prev`'s attrs and its provenance list plus one entry for this step.
 
     `t0` is the step's `time.monotonic()` start; `fields` names the `cfg` fields the step read.
@@ -220,47 +220,23 @@ def record_step(out, prev, step: str, method: str, t0: float, cfg=None, fields=(
 
 
 def provenance(**extra) -> dict:
-    """Who/what/where made a product: package version and git state, environment, run ids, plus `extra`.
-
-    `git` is {"commit", "dirty"} when the package sits in a git checkout, else None; never raises.
-    """
+    """Package version, Python, UTC time and argv of this run, plus `extra`."""
     import datetime
-    import os
     import platform
-    import socket
-    import subprocess
     import sys
 
-    src = Path(__file__).parent
-    git = None
-    if "site-packages" not in src.parts:
-        try:
-
-            def run(*a):
-                cmd = ["git", "-C", str(src), *a]
-                return subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=True).stdout.strip()  # noqa: S603
-
-            git = {"commit": run("rev-parse", "HEAD"), "dirty": bool(run("status", "--porcelain", "--", "."))}
-        except Exception:
-            git = None
-    versions: dict[str, str | None] = {}
-    for pkg in ("numpy", "xarray", "rasterio", "dask"):
-        try:
-            versions[pkg] = metadata.version(pkg)
-        except metadata.PackageNotFoundError:
-            versions[pkg] = None
-    slurm = {k: os.environ[k] for k in ("SLURM_JOB_ID", "SLURM_ARRAY_JOB_ID", "SLURM_ARRAY_TASK_ID") if k in os.environ}
     return {
         "iirspy_version": IIRSPY_VERSION,
-        "git": git,
         "python": platform.python_version(),
-        "packages": versions,
-        "host": socket.gethostname(),
         "utc": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
         "argv": list(sys.argv),
-        "slurm": slurm,
         **extra,
     }
+
+
+def ncpu() -> int:
+    """Cores this process may use. `os.cpu_count()` reports the whole machine, not the cpuset."""
+    return len(os.sched_getaffinity(0))
 
 
 def spice_kernels(day, spice_dir=None) -> list[Path]:
@@ -482,15 +458,7 @@ def save_geotiff(fout, row_block, da, compress="ZSTD", predictor=None):
     if wls:
         # Which IIRS bands these planes are: 1..256 on a full cube, arbitrary on a subset
         tags["band_numbers"] = ",".join(str(int(b)) for b in da.band.values)
-    try:
-        dst = rasterio.open(fout, "w", **profile)
-    except rasterio.errors.RasterioIOError as e:
-        if "missing codec" not in str(e):
-            raise
-        # e.g. StdEnv/2026's libtiff has no ZSTD/LERC/LZMA: write DEFLATE (same predictor) instead of failing
-        warnings.warn(f"GDAL has no {profile['compress']} codec; writing {fout} with DEFLATE", stacklevel=2)
-        dst = rasterio.open(fout, "w", **{**profile, "compress": "DEFLATE"})
-    with dst, ProgressBar():
+    with rasterio.open(fout, "w", **profile) as dst, ProgressBar():
         if tags:
             dst.update_tags(**tags)
         for y0 in range(0, ny, row_block):

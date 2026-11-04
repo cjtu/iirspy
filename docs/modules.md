@@ -4,8 +4,6 @@
 
 ::: iirspy.instrument
 
-::: iirspy.workspace
-
 ::: iirspy.l1
 
 ::: iirspy.l1.config

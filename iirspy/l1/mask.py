@@ -13,7 +13,7 @@ def _in_wl_ranges(wl, ranges):
     return hit
 
 
-def mask(rad, cfg, *, ws=None, qub, calib_dir=instrument.DCALIB, **_):
+def mask(rad, cfg, *, qub, calib_dir=instrument.DCALIB, **_):
     """Null the OSF and invalid bands, `exclude_wl`, bad detector elements and saturated pixels."""
     t0 = time.monotonic()
     out = rad.where(~(rad.band.isin((*instrument.OSF, *instrument.INVALID)) | _in_wl_ranges(rad.wl, cfg.exclude_wl)))
@@ -27,4 +27,4 @@ def mask(rad, cfg, *, ws=None, qub, calib_dir=instrument.DCALIB, **_):
         out = out.where(~bad)
     out = out.drop_vars("calib_bad", errors="ignore")
     out = out.where(out < instrument.get_saturation_radiance(qub, calib_dir))
-    return io.record_step(out, rad, "mask", "bad_elements", t0, cfg, ("bad_pixel_mask", "exclude_wl"), qub=str(qub))
+    return io.get_step_log(out, rad, "mask", "bad_elements", t0, cfg, ("bad_pixel_mask", "exclude_wl"), qub=str(qub))

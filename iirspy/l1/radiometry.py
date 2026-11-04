@@ -147,9 +147,9 @@ def _empirical(dn, cfg, qub, calib_dir):
 RADIOMETRY = {"lut": _lut, "lut_median": _lut_median, "g1": _g1, "empirical": _empirical}
 
 
-def radiometry(dn, cfg, *, ws=None, qub, calib_dir=DCALIB, **_):
+def radiometry(dn, cfg, *, qub, calib_dir=DCALIB, **_):
     """DN (dark and flat/smile corrected when `cfg.empirical`) -> radiance [W/m^2/sr/um]."""
     t0 = time.monotonic()
     method = "empirical" if cfg.empirical else cfg.calib if cfg.calib in CALIB else "g1"
     rad = RADIOMETRY[method](dn, cfg, qub, calib_dir)
-    return io.record_step(rad, dn, "radiometry", method, t0, cfg, ("calib",), qub=str(qub))
+    return io.get_step_log(rad, dn, "radiometry", method, t0, cfg, ("calib",), qub=str(qub))

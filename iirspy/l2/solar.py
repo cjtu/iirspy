@@ -91,9 +91,9 @@ def solar_flux(cfg, sdist, qub):
     return get_solar_flux(sdist, {"pradan": FSOLAR, "hsrs": FSOLAR_HSRS}.get(cfg.flux, cfg.flux))
 
 
-def divide_flux(rad, cfg, *, ws=None, qub, sdist, **_):
+def divide_flux(rad, cfg, *, qub, sdist, **_):
     """Radiance -> radiance factor: divide by the solar flux at `sdist`."""
     t0 = time.monotonic()
     out = rad / solar_flux(cfg, sdist, qub)
     out.attrs["solar_distance_au"] = sdist
-    return io.record_step(out, rad, "solar", str(cfg.flux), t0, cfg, ("flux", "sdist"), qub=str(qub))
+    return io.get_step_log(out, rad, "solar", str(cfg.flux), t0, cfg, ("flux", "sdist"), qub=str(qub))

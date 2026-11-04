@@ -5,7 +5,7 @@ import xarray as xr
 from iirspy.l2 import photometry, polish, solar, thermal
 
 
-def calibrate(rad, cfg, *, ws=None, qub=None, geom=None):
+def calibrate(rad, cfg, *, qub=None, geom=None):
     """L1 radiance cube (band, y, x) [W/m^2/sr/um] -> L2 reflectance, one step per `cfg` field group.
 
     `qub` is the scene's label, for the solar distance and monthly flux (None means 1 AU). `geom` is the
@@ -21,13 +21,13 @@ def calibrate(rad, cfg, *, ws=None, qub=None, geom=None):
     kw = {"qub": qub, "sdist": solar.sun_distance(cfg, qub), "inc": inc, "geom": geom}
     cube = rad.copy()
     cube.attrs = {"provenance": rad.attrs["provenance"]} if "provenance" in rad.attrs else {}
-    cube = thermal.subtract(cube, cfg, ws=ws, **kw)
-    cube = solar.divide_flux(cube, cfg, ws=ws, **kw)
-    cube = photometry.photometric(cube, cfg, ws=ws, **kw)
-    cube = polish.polish(cube, cfg, ws=ws, **kw)
-    cube = photometry.phase(cube, cfg, ws=ws, **kw)
-    cube = polish.smooth(cube, cfg, ws=ws, **kw)
-    cube = polish.clip_fill(cube, cfg, ws=ws, **kw)
+    cube = thermal.subtract(cube, cfg, **kw)
+    cube = solar.divide_flux(cube, cfg, **kw)
+    cube = photometry.photometric(cube, cfg, **kw)
+    cube = polish.polish(cube, cfg, **kw)
+    cube = photometry.phase(cube, cfg, **kw)
+    cube = polish.smooth(cube, cfg, **kw)
+    cube = polish.clip_fill(cube, cfg, **kw)
 
     cube.name = "Reflectance"
     cube.attrs |= {"name": "Reflectance", "units": "", "l2_config": json.dumps(cfg.to_attrs())}

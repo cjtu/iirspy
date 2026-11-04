@@ -7,31 +7,16 @@ import pdr
 import xarray as xr
 
 PKG_DATA = files("iirspy").joinpath("data")
-
-
 DCALIB = PKG_DATA.joinpath("iir/calibration")
-
-
 FBADBANDS = str(PKG_DATA.joinpath("iirs_bad_bands.csv"))
-
-
 FBADPIXELS = str(PKG_DATA.joinpath("bad_pixel_mask.csv"))
-
-
 FWAVELENGTHS = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_wavelength.csv"))
-
-
 OSF = (*range(29, 35), *range(69, 76), *range(162, 172))  # Order sorting filters
-
-
 INVALID = (*range(1, 7), *range(252, 257))  # Invalid band list
 PAN_BANDS = [b for b in range(10, 251, 8) if b not in OSF and b not in INVALID]  # broadband, beats single-band noise
 
-
-# IIRS L1 radiance is stored in [1000 mW/cm^2/sr/um]; multiply to get physical [W/m^2/sr/um].
+# IIRS L1 radiance is stored in [1000 mW/cm^2/sr/um]; multiply to get SI units [W/m^2/sr/um].
 RAD_NATIVE_SCALE = 0.01  # [1000 mW/cm^2/sr/um] -> [W/m^2/sr/um]
-
-
 E1_EXPOSURE_MS = 1.0  # exposure duration the e1g2 gain LUT was measured at (see get_gain_offset)
 
 

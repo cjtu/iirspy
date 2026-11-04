@@ -1083,9 +1083,8 @@ def _coreg_pass(gref, gtgt, cfg, max_shift_px, grid_res, transform, ref, bad_tgt
         progress=False,
         min_reliability=cfg.min_reliability,
         tieP_filter_level=3,
-        # arosics defaults `CPUs` to `multiprocessing.cpu_count()`, which reports the machine's
-        # cores and not the available cores on a cluster. Use `sched_getaffinity` instead.
-        CPUs=len(os.sched_getaffinity(0)),
+        # arosics defaults `CPUs` to `multiprocessing.cpu_count()`, the machine's cores, not the available ones
+        CPUs=io.ncpu(),
         **kw,
     )
     tp = crl.CoRegPoints_table
@@ -1385,14 +1384,13 @@ def data_window(arr, pad=8):
 
 def warp_destination(shape, dtype) -> np.ndarray:
     """Uninitialised destination for a GDAL warp: in RAM up to `MAX_RAM_BYTES`, else a disk-backed
-    memmap in `$SLURM_TMPDIR` (local disk on a node; `/tmp` there may be RAM-backed and count against
-    `--mem`). Left uninitialised because `reproject`'s `init_dest_nodata` fills it with `dst_nodata`.
+    memmap in the temp dir (`$TMPDIR`). Left uninitialised because `reproject`'s `init_dest_nodata` fills it with `dst_nodata`.
     The spill file is unlinked on return and lives only as long as the array.
     """
     dtype = np.dtype(dtype)
     if np.prod(shape) * dtype.itemsize <= MAX_RAM_BYTES:
         return np.empty(shape, dtype)
-    with tempfile.NamedTemporaryFile(dir=os.environ.get("SLURM_TMPDIR")) as tmp:
+    with tempfile.NamedTemporaryFile() as tmp:
         return np.memmap(tmp.name, dtype=dtype, mode="w+", shape=shape)
 
 
@@ -1425,7 +1423,7 @@ def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None, out=No
         src_nodata=np.nan,
         dst_nodata=dst_nodata,
         tolerance=0.0,
-        num_threads=len(os.sched_getaffinity(0)),  # parallize warp kernel over available cores
+        num_threads=io.ncpu(),  # parallize warp kernel over available cores
         SRC_METHOD="GCP_TPS",
     )
     return out

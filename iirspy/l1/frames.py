@@ -476,7 +476,7 @@ def fill(rad, lost, depth=6):
     return rad.copy(data=filled)
 
 
-def retime(rad, cfg, *, ws=None, qub, frame_offsets=None, **_):
+def retime(rad, cfg, *, qub, frame_offsets=None, **_):
     """Move each 4-band group of `rad` onto true frames; the lost frames ride along as the `lost_frames` coord.
 
     No `frame_offsets` builds the table from the full cube `qub` and caches it beside it as
@@ -495,4 +495,6 @@ def retime(rad, cfg, *, ws=None, qub, frame_offsets=None, **_):
                 return rad
     out, lost = apply(rad, frame_offsets)
     out = out.assign_coords(lost_frames=(("band", "y"), lost))
-    return io.record_step(out, rad, "retime", "frame_table", t0, cfg, ("fix_frames",), frame_offsets=str(frame_offsets))
+    return io.get_step_log(
+        out, rad, "retime", "frame_table", t0, cfg, ("fix_frames",), frame_offsets=str(frame_offsets)
+    )

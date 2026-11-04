@@ -5,10 +5,12 @@ import datetime
 import errno
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from pathlib import Path
 
@@ -18,10 +20,12 @@ import rasterio
 from iirspy import instrument, io
 from iirspy.georef import ancillary
 from iirspy.georef import chunks as ck
+from iirspy.io import ncpu
 from iirspy.l1.config import CALIB, L1Config
 from iirspy.l1.frames import table_key as frames_key
 from iirspy.l2.config import L2Config
-from iirspy.workspace import Workspace, ncpu, phase
+
+log = logging.getLogger(__name__)
 
 
 def paths_from_env() -> io.Paths:
@@ -48,11 +52,11 @@ class Job:
     stage: Path
     logfile: Path
     paths: io.Paths
-    ws: Workspace
+    work: Path
     frames: Path | None = None
 
 
-def open_run(sid: str, group: str, out: str | None, step: str, paths: io.Paths, deadline: float | None = None) -> Job:
+def open_run(sid: str, group: str, out: str | None, step: str, paths: io.Paths) -> Job:
     """Locate the scene's zip and prepare the work dir, `<sid>_<group>_<step>.log` and stage."""
     if not paths.archive.exists():
         sys.exit(f"{paths.archive} missing -- archive not mounted, set IIRS_ARCHIVE")
@@ -62,51 +66,26 @@ def open_run(sid: str, group: str, out: str | None, step: str, paths: io.Paths, 
     work = Path(out) if out else Path.cwd() / "runs" / f"{sid}_{group}"
     logfile = work / f"{sid}_{group}_{step}.log"
     work.mkdir(parents=True, exist_ok=True)
-    if os.environ.get("IIRS_STAGE"):
-        stage = Path(os.environ["IIRS_STAGE"])
-    elif os.environ.get("SLURM_TMPDIR"):
-        stage = Path(os.environ["SLURM_TMPDIR"]) / "stage"
-    else:
-        stage = work.parent / "stage"
+    stage = Path(os.environ.get("IIRS_STAGE") or work.parent / "stage")
     stage.mkdir(parents=True, exist_ok=True)
-    logfile.write_text("")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        handlers=[logging.StreamHandler(), logging.FileHandler(logfile, mode="w")],
+        force=True,
+    )
+    return Job(sid, group, zip_path, stage, logfile, paths, work)
 
-    def log(msg):
-        print(msg, flush=True)
-        with logfile.open("a") as f:
-            f.write(str(msg) + "\n")
 
-    return Job(sid, group, zip_path, stage, logfile, paths, Workspace(work, deadline, log))
+@contextmanager
+def timed(name: str):
+    t0 = time.monotonic()
+    yield
+    log.info("%s: %.0fs", name, time.monotonic() - t0)
 
 
-def log_provenance(ws: Workspace) -> None:
-    """Slurm allocation + host details, `seff`-style, so a slow/failed run can be triaged later.
-
-    Env vars are unset outside Slurm (e.g. a dev-box run), so every lookup falls back to "n/a" or
-    the plain hostname/cpu count instead of raising.
-    """
-    import getpass
-    import platform
-
-    def _gb(mb: str) -> str:
-        try:
-            return f"{int(mb) / 1024:.0f}G"
-        except ValueError:
-            return "n/a"
-
-    log = ws.log
-    job_id = os.environ.get("SLURM_JOB_ID")
-    array_job, array_task = os.environ.get("SLURM_ARRAY_JOB_ID"), os.environ.get("SLURM_ARRAY_TASK_ID")
-    log("--- job ---")
-    log(f"Job ID: {job_id or 'n/a'}")
-    if array_job:
-        log(f"Array Job ID: {array_job}_{array_task}")
-    log(f"Cluster: {os.environ.get('SLURM_CLUSTER_NAME', 'n/a')}")
-    log(f"User: {getpass.getuser()}")
-    log(f"Node: {os.environ.get('SLURMD_NODENAME', platform.node())}")
-    log(f"Cores per node: {os.environ.get('SLURM_CPUS_PER_TASK', ncpu())} (ncpu()={ncpu()})")
-    log(f"Memory: {_gb(os.environ.get('SLURM_MEM_PER_NODE', ''))}/node")
-    log(f"Python: {platform.python_version()}")
+def log_provenance() -> None:
+    log.info("provenance: %s", json.dumps(io.provenance(), default=str))
 
 
 def stage_inputs(job: Job, day: str, bands: list[int]) -> Path:
@@ -118,8 +97,8 @@ def stage_inputs(job: Job, day: str, bands: list[int]) -> Path:
     """
     raw_qub = job.stage / f"data/raw/{day}/{job.zip.stem}.qub"
     if not raw_qub.exists():
-        job.ws.log(f"extracting {job.zip.name} ({len(bands)} bands) -> {job.stage}")
-        with phase(job.ws, "extraction"):
+        log.info(f"extracting {job.zip.name} ({len(bands)} bands) -> {job.stage}")
+        with timed("extraction"):
             io.extract(job.zip, job.stage, bands=bands)
     for sub in (
         f"geometry/calibrated/{day}",
@@ -229,20 +208,20 @@ def build_l1(
             and meta.get("frames") == frames_key(job.frames)
             and meta.get("crop_geom") == crop_geom
         ):
-            job.ws.log(f"L1 already built: {ftif_out} (covers {cached_range}, requested {lat_range})")
+            log.info(f"L1 already built: {ftif_out} (covers {cached_range}, requested {lat_range})")
             return ftif_out, meta["scan0"], cached_range
-        job.ws.log(
+        log.info(
             f"cached L1 {cached_range}/bands={meta.get('bands')}/"
             f"calibrate_kwargs={meta.get('calibrate_kwargs', '<unrecorded>')} does not match requested "
             f"{lat_range}/{bands}/{effective_calibrate_kws} -- rebuilding"
         )
     from iirspy import L0
 
-    with phase(job.ws, "staging"):
+    with timed("staging"):
         raw_qub = stage_inputs(job, day, bands)
 
     # `chunk_y` sets both the dask y-chunk and, through `_row_block`, the write block.
-    with phase(job.ws, "L0 read + calibrate (graph build; the compute lands in the write)"):
+    with timed("L0 read + calibrate (graph build; the compute lands in the write)"):
         l0 = L0(job.sid, job.stage, chunk={"band": -1, "y": chunk_y, "x": -1})
         l1 = (
             l0.calibrate(**effective_calibrate_kws)
@@ -252,13 +231,13 @@ def build_l1(
     # l1.img already holds exactly `bands` -- that's what _stage_inputs staged.
     _, xyext = ancillary.parse_geom(fgeom or l1.csv, latlonextent=(-180, 180, *lat_range))
     ymin, ymax = xyext[2], xyext[3]
-    job.ws.log(f"L1 crop lat={lat_range}: scan {ymin}-{ymax} ({ymax - ymin} rows)")
+    log.info(f"L1 crop lat={lat_range}: scan {ymin}-{ymax} ({ymax - ymin} rows)")
     l1.img = l1.img.sel(y=slice(ymin, ymax))
     l1.img = l1.img / instrument.RAD_NATIVE_SCALE
     l1.img.attrs["units"] = "1000 mW/cm^2/sr/um"
     if out_bands is not None:
         l1.img = l1.img.sel(band=out_bands)
-    with phase(job.ws, f"L1 write ({l1.img.shape[0]} band x {l1.img.shape[1]} rows, chunk_y={chunk_y})"):
+    with timed(f"L1 write ({l1.img.shape[0]} band x {l1.img.shape[1]} rows, chunk_y={chunk_y})"):
         l1.save(str(ftif_out))
     fmeta.write_text(
         json.dumps({
@@ -273,7 +252,7 @@ def build_l1(
     if not keep_raw:
         raw_qub.unlink(missing_ok=True)
         raw_qub.with_suffix(".hdr").unlink(missing_ok=True)
-    job.ws.log(f"L1 saved: {ftif_out}")
+    log.info(f"L1 saved: {ftif_out}")
     return ftif_out, int(ymin), lat_range
 
 
@@ -305,11 +284,11 @@ def build_l1_nci(
             and tuple(meta["lat_range"]) == tuple(lat_range)
             and meta.get("frames") == [fix_frames, fill_frames, frames_key(job.frames) if fix_frames else None]
         ):
-            job.ws.log(f"nci L1 already built: {ftif_out}")
+            log.info(f"nci L1 already built: {ftif_out}")
             return ftif_out, meta["scan0"], lat_range
-    with phase(job.ws, "nci unzip"):
+    with timed("nci unzip"):
         ck.ensure_nci(job.sid, job.paths)
-    with phase(job.ws, "nci L1 read + crop"):
+    with timed("nci L1 read + crop"):
         l1 = L1(
             job.sid, job.paths.archive, lonlatextent=(-180, 180, *lat_range), chunk={"band": -1, "y": chunk_y, "x": -1}
         )
@@ -318,7 +297,7 @@ def build_l1_nci(
         l1.img.attrs["units"] = "1000 mW/cm^2/sr/um"
         if fix_frames:
             l1.fix_frames(job.frames, fill_frames)
-    with phase(job.ws, f"nci L1 write ({l1.img.shape[0]} band x {l1.img.shape[1]} rows)"):
+    with timed(f"nci L1 write ({l1.img.shape[0]} band x {l1.img.shape[1]} rows)"):
         l1.save(str(ftif_out), snr_sidecar=False, empirical_sidecar=False)
     frames_meta = [fix_frames, fill_frames, frames_key(job.frames) if fix_frames else None]
     fmeta.write_text(
@@ -330,7 +309,7 @@ def build_l1_nci(
             "frames": frames_meta,
         })
     )
-    job.ws.log(f"nci L1 saved: {ftif_out}")
+    log.info(f"nci L1 saved: {ftif_out}")
     return ftif_out, scan0, lat_range
 
 
@@ -349,8 +328,8 @@ def ensure_frame_offsets(job: Job, dest: Path | None = None) -> Path:
 
     f = frame_offsets_path(job.sid, job.paths, dest)
     if not f.exists():
-        job.ws.log(f"frame table missing, building from {job.zip.name} -> {f}")
-        with phase(job.ws, "frame table"):
+        log.info(f"frame table missing, building from {job.zip.name} -> {f}")
+        with timed("frame table"):
             frames.build_table(job.zip, f)
     return f
 
@@ -360,13 +339,13 @@ def predates_frames(fgcps: Path, fframes: Path) -> bool:
     return not fframes.exists() or fgcps.stat().st_mtime < fframes.stat().st_mtime
 
 
-def clean_work(ws: Workspace, clean: bool) -> None:
+def clean_work(work: Path, clean: bool) -> None:
     if clean:
-        shutil.rmtree(ws.dir, ignore_errors=True)
-        print(f"removed work dir {ws.dir}", flush=True)
+        shutil.rmtree(work, ignore_errors=True)
+        print(f"removed work dir {work}", flush=True)
 
 
-def keep(ws: Workspace, dest_dir: str | None, *files: Path) -> None:
+def keep(work: Path, dest_dir: str | None, *files: Path) -> None:
     """Copy products out of the work dir into `dest_dir` (a no-op without one)."""
     if not dest_dir:
         return
@@ -374,7 +353,7 @@ def keep(ws: Workspace, dest_dir: str | None, *files: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     for f in files:
         shutil.copyfile(f, dest / f.name)
-    ws.log(f"kept {len(files)} file(s) -> {dest}")
+    log.info(f"kept {len(files)} file(s) -> {dest}")
 
 
 def is_disk_full(exc: BaseException) -> bool:
@@ -393,7 +372,7 @@ def file_info(f, sha=False) -> dict:
 
 
 def resource_report(img) -> str:
-    """Whether the cube's y-blocks keep `ncpu` dask threads busy, and the peak RSS against the Slurm allocation."""
+    """Whether the cube's y-blocks keep `ncpu` dask threads busy, and the peak RSS."""
     import resource
 
     n, ny, nx = img.shape
@@ -401,9 +380,7 @@ def resource_report(img) -> str:
     block_mb = n * max(ychunks) * nx * 4 / 2**20
     busy = "ok" if len(ychunks) >= ncpu() else "STARVED: fewer blocks than cores"
     peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-    limit = os.environ.get("SLURM_MEM_PER_NODE")
-    of = f" of --mem={int(limit) / 1024:.0f}G ({100 * peak_mb / int(limit):.0f}%)" if limit else ""
-    return f"L1 {img.shape} in {len(ychunks)} y-blocks of <={block_mb:.0f} MB for {ncpu()} workers ({busy}); peak RSS {peak_mb:.0f} MB{of}"
+    return f"L1 {img.shape} in {len(ychunks)} y-blocks of <={block_mb:.0f} MB for {ncpu()} workers ({busy}); peak RSS {peak_mb:.0f} MB"
 
 
 def solve_quality(fgcps: Path) -> dict:
@@ -496,7 +473,7 @@ def write_refl_outputs(
     from iirspy.iirs import L2
     from iirspy.l2 import stats as l2_stats
 
-    ws, sid, group = job.ws, job.sid, job.group
+    work, sid, group = job.work, job.sid, job.group
     nci = args.l2 == "issdc-nci"
     l2cfg = args.l2_config
     ftopo = geo.sidecars.get("topo")
@@ -514,12 +491,14 @@ def write_refl_outputs(
         )
     except Exception as e:  # sanity stats must never fail a refl run
         stats = {"error": f"{type(e).__name__}: {e}"}
-    ws.log(f"l2_stats: {time.time() - t_stats:.1f}s {stats.get('error', 'ok')}")
+    log.info(f"l2_stats: {time.time() - t_stats:.1f}s {stats.get('error', 'ok')}")
     fglt = fgcps.parent / f"{sid}_{group}_glt.tif" if fgcps else None
     if fglt is not None:
-        ws.log(f"glt: {fglt}" if fglt.is_file() else f"glt: {fglt} not found -- iirs-solve-scene should have built it")
+        log.info(
+            f"glt: {fglt}" if fglt.is_file() else f"glt: {fglt} not found -- iirs-solve-scene should have built it"
+        )
     resources = f"{resource_report(l1.img)}; ncpu={ncpu()}"
-    ws.log(resources)
+    log.info(resources)
 
     notes = json.loads(l1.img.attrs["empirical_notes"]) if "empirical_notes" in l1.img.attrs else None
     topo_tags = {}
@@ -561,9 +540,9 @@ def write_refl_outputs(
         "l2_stats": stats,
         "total_s": round(time.time() - t_start, 1),
     }
-    fsummary = ws.path(f"{sid}_{group}_refl_summary.json")
+    fsummary = work / f"{sid}_{group}_refl_summary.json"
     fsummary.write_text(json.dumps(summary, indent=1, default=str))
-    ws.log(f"\ndone in {summary['total_s']}s.")
+    log.info(f"\ndone in {summary['total_s']}s.")
 
     prov_inputs = {
         "nri_zip": file_info(job.zip),
@@ -583,7 +562,7 @@ def write_refl_outputs(
         empirical_notes=notes,
         steps=json.loads(l2.img.attrs["provenance"]),
     )
-    fprov = ws.path(f"{sid}_{group}_provenance.json")
+    fprov = work / f"{sid}_{group}_provenance.json"
     fprov.write_text(json.dumps(prov, indent=1, default=str))
     for f in (ftif, fl2):
         with rasterio.open(f, "r+") as dst:
@@ -593,7 +572,7 @@ def write_refl_outputs(
         f for f in (ftif.with_name(ftif.stem + "_empirical.npz"), ftif.with_name(ftif.stem + "_snr.tif")) if f.exists()
     ]
     vrt = lambda f: [f.with_suffix(".vrt")] if f.with_suffix(".vrt").exists() else []
-    keep(ws, args.keep_l1, ftif, *vrt(ftif), *sidecars, fprov)
-    keep(ws, args.keep, fl2, *vrt(fl2), *gfiles.values(), fsummary, fprov, job.logfile)
+    keep(work, args.keep_l1, ftif, *vrt(ftif), *sidecars, fprov)
+    keep(work, args.keep, fl2, *vrt(fl2), *gfiles.values(), fsummary, fprov, job.logfile)
     if ftopo and fgcps:  # geometry, so it lands beside the GCPs rather than with L2
-        keep(ws, str(fgcps.parent) if args.keep else None, ftopo)
+        keep(work, str(fgcps.parent) if args.keep else None, ftopo)

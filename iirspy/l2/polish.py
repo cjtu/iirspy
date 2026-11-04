@@ -105,29 +105,29 @@ def smooth_savgol(data: xr.DataArray, savgol_window: int = 9, savgol_polyorder: 
     return result
 
 
-def polish(rad, cfg, *, ws=None, **_):
+def polish(rad, cfg, **_):
     """Divide by the per-band polish table named by `cfg.polish`."""
     if cfg.polish is None:
         return rad
     t0 = time.monotonic()
     out = rad / spectral_polish(rad.band, POLISH.get(cfg.polish, cfg.polish))
-    return io.record_step(out, rad, "polish", cfg.polish, t0, cfg, ("polish",))
+    return io.get_step_log(out, rad, "polish", cfg.polish, t0, cfg, ("polish",))
 
 
-def smooth(rad, cfg, *, ws=None, **_):
+def smooth(rad, cfg, **_):
     """Spectral moving average of width `cfg.smoothing`."""
     if cfg.smoothing <= 1:
         return rad
     t0 = time.monotonic()
     out = moving_average(rad, cfg.smoothing, cfg.smoothing_edges)
-    return io.record_step(out, rad, "smoothing", "moving_average", t0, cfg, ("smoothing", "smoothing_edges"))
+    return io.get_step_log(out, rad, "smoothing", "moving_average", t0, cfg, ("smoothing", "smoothing_edges"))
 
 
-def clip_fill(rad, cfg, *, ws=None, **_):
+def clip_fill(rad, cfg, **_):
     """Zero negative reflectance, then write `cfg.fill_nan` over every NaN."""
     if not cfg.clip_negative and cfg.fill_nan is None:
         return rad
     t0 = time.monotonic()
     out = rad.clip(min=0) if cfg.clip_negative else rad
     out = out if cfg.fill_nan is None else out.fillna(cfg.fill_nan)
-    return io.record_step(out, rad, "clip_fill", "clip_fill", t0, cfg, ("clip_negative", "fill_nan"))
+    return io.get_step_log(out, rad, "clip_fill", "clip_fill", t0, cfg, ("clip_negative", "fill_nan"))

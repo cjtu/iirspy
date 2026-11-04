@@ -578,7 +578,7 @@ def detect_stripes_2D(data, threshold):
     return is_stripe_x
 
 
-def residual_dark(dn, cfg, *, ws=None, qub, calib_dir=instrument.DCALIB, empirical_kws=None, **_):
+def residual_dark(dn, cfg, *, qub, calib_dir=instrument.DCALIB, empirical_kws=None, **_):
     """Derive the empirical frames from `dn` and, with `cfg.empirical`, subtract the scene's residual dark.
 
     The frames ride along as `empirical_*` coords, the broadband SNR as `snr` (shadow scenes with `cfg.attach_snr`),
@@ -602,13 +602,13 @@ def residual_dark(dn, cfg, *, ws=None, qub, calib_dir=instrument.DCALIB, empiric
         out = out.assign_coords(snr=(("y", "x"), snr.values))
     out.attrs["empirical_notes"] = json.dumps(notes)
     method = "scene" if notes["has_shadow"] else "none"
-    return io.record_step(out, dn, "residual_dark", method, t0, cfg, ("empirical", "attach_snr"), qub=str(qub))
+    return io.get_step_log(out, dn, "residual_dark", method, t0, cfg, ("empirical", "attach_snr"), qub=str(qub))
 
 
-def flat_smile(dn, cfg, *, ws=None, **_):
+def flat_smile(dn, cfg, **_):
     """Divide out the empirical sensor flat and band-relative smile."""
     if not cfg.empirical:
         return dn
     t0 = time.monotonic()
     out = dn / (dn.empirical_flat * dn.empirical_smile).clip(min=FLAT_SMILE_MIN)  # avoid divide by 0
-    return io.record_step(out, dn, "flat_smile", "empirical", t0, cfg, ("empirical",))
+    return io.get_step_log(out, dn, "flat_smile", "empirical", t0, cfg, ("empirical",))

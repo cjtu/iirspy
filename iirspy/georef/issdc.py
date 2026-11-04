@@ -7,7 +7,9 @@ from iirspy.georef.geometry import Geometry, quality
 from iirspy.georef.georef import MOON_RADIUS_M
 
 
-def geometry(*, sid: str, group: str, fgeom, flabel, fspm, shape: tuple[int, int], row0: int = 0, ws=None) -> Geometry:
+def geometry(
+    *, sid: str, group: str, fgeom, flabel, fspm, shape: tuple[int, int], row0: int = 0, work=None
+) -> Geometry:
     """Reproduces ISSDC geometry per the SIS: csv lon/lat, spm angles per line."""
     ny, nx = shape
     scans = row0 + np.arange(ny)

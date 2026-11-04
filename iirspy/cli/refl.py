@@ -20,6 +20,7 @@ cache key. `--l2 issdc-nci` runs the `issdc` L2 on ISSDC's own nci cube (unzippe
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time
 from dataclasses import replace
@@ -50,7 +51,9 @@ from iirspy.cli._run import (
 )
 from iirspy.georef import chunks as ck
 from iirspy.instrument import PAN_BANDS
-from iirspy.workspace import ncpu
+from iirspy.io import ncpu
+
+log = logging.getLogger(__name__)
 
 
 def _parser():
@@ -124,16 +127,16 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901
     if frames:
         job = replace(job, frames=frames)
     elif args.l2 != "issdc-nci" or args.fix_frames or args.fill_frames:
-        job = replace(job, frames=ensure_frame_offsets(job, job.ws.dir))
-    log_provenance(job.ws)
-    job.ws.log(
+        job = replace(job, frames=ensure_frame_offsets(job, job.work))
+    log_provenance()
+    log.info(
         f"{sid} group={group} zip={job.zip.name} ncpu={ncpu()} stage={job.stage} georef={args.georef} gcps={fgcps}"
     )
     try:
         _run(job, args, fgcps, time.time())
     except Exception as e:
         if is_disk_full(e):
-            job.ws.log(f"FATAL: disk full/quota exceeded -- run `diskusage_report` to check usage. ({e})")
+            log.info(f"FATAL: disk full/quota exceeded -- run `diskusage_report` to check usage. ({e})")
             sys.exit(f"{sid} {group}: disk full/quota exceeded -- run `diskusage_report` to check usage")
         raise
 
@@ -142,7 +145,7 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
     from iirspy.georef import arosics, backplanes, georef
     from iirspy.iirs import L1
 
-    ws, sid, group, paths = job.ws, job.sid, job.group, job.paths
+    work, sid, group, paths = job.work, job.sid, job.group, job.paths
     lat_range = ck.l1_lat_range(group)
     gcps = cfg = None
     merged: dict = {}
@@ -153,18 +156,18 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
             sys.exit(str(e))
         merged = arosics.load_gcps(fgcps)
         cfg = replace(ck.chunk_cfg(group, paths.dem_roots), aoi=aoi, lat_band=lat_range)
-        ws.log(f"aoi from {len(gcps)} merged gcps: {[round(v / 1000, 1) for v in aoi]} km")
+        log.info(f"aoi from {len(gcps)} merged gcps: {[round(v / 1000, 1) for v in aoi]} km")
 
     # topo-only needs the scan crop, not the spectrum
     bands = PAN_BANDS if args.topo_only else sorted(set(range(1, 257)) - set(instrument.OSF) - set(instrument.INVALID))
     nci = args.l2 == "issdc-nci"
-    ftif = ws.path(f"{sid}_{group}_l1_rad.tif")
+    ftif = work / f"{sid}_{group}_l1_rad.tif"
     if nci:
         kw = {k: v for k in ("fix_frames", "fill_frames") if (v := getattr(args, k)) is not None}
         ftif, scan0, lat_range = build_l1_nci(job, lat_range, bands, ftif, **kw)
     else:
         ftif, scan0, lat_range = build_l1(job, lat_range, bands, ftif, l1_config=args.l1_config)
-    ws.log(f"L1 built ({'ISSDC nci' if nci else 'iirspy'}): {ftif} ({len(bands)} bands), scan0={scan0}")
+    log.info(f"L1 built ({'ISSDC nci' if nci else 'iirspy'}): {ftif} ({len(bands)} bands), scan0={scan0}")
     # GCP rows are cube rows of the solve's crop: a different crop start would shift every GCP row.
     fsum = fgcps.parent / f"{fgcps.stem}_solve_summary.json" if fgcps else None
     solve_scan0 = json.loads(fsum.read_text()).get("scan0") if fsum and fsum.exists() else None
@@ -175,11 +178,11 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
     prov_kw = {"sid": sid, "group": group, "l1_preset": None if nci else args.l1}
     prov_kw["l1_config"] = None if nci else args.l1_config.to_attrs()
     if args.l1_only:
-        fnpz, fprov = ftif.with_name(ftif.stem + "_empirical.npz"), ws.path(f"{sid}_{group}_provenance.json")
+        fnpz, fprov = ftif.with_name(ftif.stem + "_empirical.npz"), work / f"{sid}_{group}_provenance.json"
         fprov.write_text(json.dumps(io.provenance(**prov_kw, l1_only=True), indent=1, default=str))
-        keep(ws, args.keep_l1, *[f for f in (fnpz, fprov) if f.exists()])
-        ws.log(f"--l1-only: done in {time.time() - t_start:.0f} s")
-        return clean_work(ws, args.clean)
+        keep(work, args.keep_l1, *[f for f in (fnpz, fprov) if f.exists()])
+        log.info(f"--l1-only: done in {time.time() - t_start:.0f} s")
+        return clean_work(work, args.clean)
 
     anc = ck.ancillary(sid, paths)
     fgeom, flabel = anc["geometry/calibrated"], ck.label(sid, paths, job.stage)
@@ -191,24 +194,22 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
     if args.georef == "arosics":
         kernels = ck.kernels(sid[:8], paths)
         az, elev, r_sun = georef.sun_geometry(fgeom, flabel, cfg, kernels)
-        ws.log(f"sun (grid frame): az={az:.1f} elev={elev:.2f} r_sun={r_sun:.4f} deg")
+        log.info(f"sun (grid frame): az={az:.1f} elev={elev:.2f} r_sun={r_sun:.4f} deg")
 
     if args.topo_only:
         assert fgcps is not None  # noqa: S101 -- main() routes only the arosics method here
         with rasterio.open(ftif) as src:
             nrow, ncol = src.height, src.width
         lon, lat, _ = backplanes.group_loc_core(merged, group, paths.dem_roots, nrow=nrow, ncol=ncol)
-        topo = georef.scene_topo(
-            sid, group, lon, lat, fgeom, flabel, cfg, kernels, ws.dir, paths.dem_roots, scan0=scan0
-        )
-        keep(ws, str(fgcps.parent), topo)
-        ws.log(f"--topo-only: {topo} -> {fgcps.parent}, done in {time.time() - t_start:.0f} s")
-        return clean_work(ws, args.clean)
+        topo = georef.scene_topo(sid, group, lon, lat, fgeom, flabel, cfg, kernels, work, paths.dem_roots, scan0=scan0)
+        keep(work, str(fgcps.parent), topo)
+        log.info(f"--topo-only: {topo} -> {fgcps.parent}, done in {time.time() - t_start:.0f} s")
+        return clean_work(work, args.clean)
 
     l1 = L1.from_file(ftif, sid, str(paths.archive if nci else job.stage))
     if nci:
         l1.img.attrs["calibration_source"] = "issdc"
-    ws.log(resource_report(l1.img))
+    log.info(resource_report(l1.img))
     inputs: dict[str, Any]
     if args.georef == "issdc":
         inputs = {"fspm": ck.spm(sid, paths, job.stage)}
@@ -221,27 +222,27 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
             "fl1": ftif,
             "stage_dir": job.stage,
             "fgcps": fgcps,
-            "topo_dir": ws.dir if l2cfg.use_slope_az else None,
+            "topo_dir": work if l2cfg.use_slope_az else None,
         }
-    geo = l1.georef(args.georef, ws=ws, group=group, fgeom=fgeom, flabel=flabel, **inputs)
+    geo = l1.georef(args.georef, work=work, group=group, fgeom=fgeom, flabel=flabel, **inputs)
     if geo.row0 != scan0:
         sys.exit(f"geometry row0 {geo.row0} != L1 scan0 {scan0}")
     ftopo = geo.sidecars.get("topo")
-    ws.log(f"geometry: {geo.method} {geo.quality}; topo: {ftopo or 'none'}")
+    log.info(f"geometry: {geo.method} {geo.quality}; topo: {ftopo or 'none'}")
 
-    l2 = l1.calibrate(l2cfg, geom=geo, ws=ws)
-    ws.log(f"L2 computed ({args.l2}: {json.dumps(l2cfg.to_attrs())})")
+    l2 = l1.calibrate(l2cfg, geom=geo, work=work)
+    log.info(f"L2 computed ({args.l2}: {json.dumps(l2cfg.to_attrs())})")
 
     # Camera space keeps one unblended spectrum per pixel; the GLT projects on demand and the
     # .vrt beside each product carries the GCPs for other GDAL readers.
-    fl2 = ws.path(f"{sid}_{group}_l2_refl.tif")
+    fl2 = work / f"{sid}_{group}_l2_refl.tif"
     l2.save(str(fl2))
-    ws.log(f"L2 saved: {fl2}")
+    log.info(f"L2 saved: {fl2}")
     if gcps:
         for f in (ftif, fl2):
-            ws.log(f"gcp vrt -> {georef.save_gcp_vrt(f, gcps, georef.stereo_crs(group))}")
-    gfiles = geo.save(ws.dir)
-    ws.log(
+            log.info(f"gcp vrt -> {georef.save_gcp_vrt(f, gcps, georef.stereo_crs(group))}")
+    gfiles = geo.save(work)
+    log.info(
         f"geometry saved: {', '.join(f.name for f in gfiles.values())} (sensor geometry from {geo.tags['SENSOR_SOURCE']})"
     )
 
@@ -267,7 +268,7 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
         prov_kw=prov_kw,
         t_start=t_start,
     )
-    clean_work(ws, args.clean)
+    clean_work(work, args.clean)
 
 
 if __name__ == "__main__":

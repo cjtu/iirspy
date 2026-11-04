@@ -54,10 +54,10 @@ def test_a_new_step_is_one_function_one_config_field_one_call_line(dn):
     class Cfg(L1Config):
         dummy: bool = True
 
-    def dummy(rad, cfg, *, ws=None, **_):
+    def dummy(rad, cfg, **_):
         if not cfg.dummy:
             return rad
-        return io.record_step(rad.copy(), rad, "dummy", "noop", time.monotonic(), cfg, ("dummy",))
+        return io.get_step_log(rad.copy(), rad, "dummy", "noop", time.monotonic(), cfg, ("dummy",))
 
     cfg = Cfg(calib="lut_median", bad_pixel_mask=False)
     rad = dummy(calibrate_l1(dn, cfg, qub=""), cfg)  # the one call line

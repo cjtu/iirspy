@@ -232,7 +232,7 @@ def slope_az_from_geom(geom):
     return o.facet_slope.values, o.facet_aspect.values, o.lit_frac.values, sun
 
 
-def photometric(rad, cfg, *, ws=None, inc, geom=None, **_):
+def photometric(rad, cfg, *, inc, geom=None, **_):
     """Divide by the disk function times the lit fraction; facet terms come from `geom` when it has topo."""
     t0 = time.monotonic()
     slope_az = slope_az_from_geom(geom) if cfg.use_slope_az and geom is not None and geom.has_topo else None
@@ -258,13 +258,13 @@ def photometric(rad, cfg, *, ws=None, inc, geom=None, **_):
         "inc_mean_deg": float(inc.mean()),
     }
     fields = ("photom", "use_slope_az", "cos_min", "min_lit")
-    return io.record_step(out, rad, "photometric", str(cfg.photom), t0, cfg, fields, geom=geom and geom.method)
+    return io.get_step_log(out, rad, "photometric", str(cfg.photom), t0, cfg, fields, geom=geom and geom.method)
 
 
-def phase(rad, cfg, *, ws=None, **_):
+def phase(rad, cfg, **_):
     """Rescale onto Besse's 30 deg phase reference."""
     if not cfg.phase:
         return rad
     t0 = time.monotonic()
     out = besse_rescale(rad.drop_vars("phase_g"), cfg.photom, rad.phase_g, rad.wl)
-    return io.record_step(out, rad, "phase", "besse", t0, cfg, ("photom",))
+    return io.get_step_log(out, rad, "phase", "besse", t0, cfg, ("photom",))

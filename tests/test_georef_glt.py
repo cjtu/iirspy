@@ -54,7 +54,7 @@ def test_glt_and_projection_are_unchanged_when_spilled_to_disk(tmp_path, monkeyp
     g_ram = georef.make_glt(gcps, CFG, (NY, NX))
     p_ram = georef.project(cube, gcps, CFG)
     monkeypatch.setattr(georef, "MAX_RAM_BYTES", 0)
-    monkeypatch.setenv("SLURM_TMPDIR", str(tmp_path))
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
     g_disk = georef.make_glt(gcps, CFG, (NY, NX))
     p_disk = georef.project(cube, gcps, CFG)
     assert isinstance(g_disk, np.memmap) and isinstance(p_disk, np.memmap)

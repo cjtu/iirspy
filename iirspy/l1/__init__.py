@@ -5,9 +5,7 @@ from iirspy.l1 import empirical, fill, frames, mask, radiometry
 from iirspy.l1.config import CALIB
 
 
-def calibrate(
-    dn, cfg, *, ws=None, qub, calib_dir=instrument.DCALIB, empirical_kws=None, frame_offsets=None, output_bands=None
-):
+def calibrate(dn, cfg, *, qub, calib_dir=instrument.DCALIB, empirical_kws=None, frame_offsets=None, output_bands=None):
     """L0 digital number cube (band, y, x) -> L1 radiance [W/m^2/sr/um], one step per `cfg` field group.
 
     `qub` is the scene's raw label. `empirical_kws` go to `empirical.empirical_frames`; `frame_offsets` is the
@@ -15,13 +13,13 @@ def calibrate(
     empirical frames still see every band of `dn`.
     """
     kw = {"qub": qub, "calib_dir": calib_dir, "empirical_kws": empirical_kws, "frame_offsets": frame_offsets}
-    rad = empirical.residual_dark(dn, cfg, ws=ws, **kw)
-    rad = empirical.flat_smile(rad, cfg, ws=ws, **kw)
-    rad = radiometry.radiometry(rad, cfg, ws=ws, **kw)
+    rad = empirical.residual_dark(dn, cfg, **kw)
+    rad = empirical.flat_smile(rad, cfg, **kw)
+    rad = radiometry.radiometry(rad, cfg, **kw)
     rad = rad if output_bands is None else rad.sel(band=output_bands)
-    rad = frames.retime(rad, cfg, ws=ws, **kw)
-    rad = mask.mask(rad, cfg, ws=ws, **kw)
-    rad = fill.fill(rad, cfg, ws=ws, **kw)
+    rad = frames.retime(rad, cfg, **kw)
+    rad = mask.mask(rad, cfg, **kw)
+    rad = fill.fill(rad, cfg, **kw)
 
     drop = [c for c in rad.coords if str(c).startswith("empirical_") and not cfg.attach_empirical_frames]
     out = rad.drop_vars(drop).astype("float32")

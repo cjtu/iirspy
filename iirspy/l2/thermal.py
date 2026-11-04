@@ -50,7 +50,7 @@ def thermal_radiance(rad, eps=1.0, bands=(227, 247), inc=None, sdist=1.0, t_min=
     return eps * bbr, t
 
 
-def subtract(rad, cfg, *, ws=None, sdist, inc, **_):
+def subtract(rad, cfg, *, sdist, inc, **_):
     """Remove the isothermal thermal tail eps * B(T) from `rad`; the temperature [K] rides along as coord `T`."""
     if cfg.thermal == "none":
         return rad
@@ -60,4 +60,4 @@ def subtract(rad, cfg, *, ws=None, sdist, inc, **_):
     )
     out = (rad - trad).assign_coords(T=temp)
     fields = ("thermal_eps", "thermal_bands", "thermal_t_min")
-    return io.record_step(out, rad, "thermal", cfg.thermal, t0, cfg, fields)
+    return io.get_step_log(out, rad, "thermal", cfg.thermal, t0, cfg, fields)
