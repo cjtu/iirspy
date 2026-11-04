@@ -910,19 +910,6 @@ def _topk_peaks(xcorr, shape, cap_px, k, min_sep_px):
     return peaks
 
 
-def _bounded_peak(xcorr, shape, cap_px):
-    """Peak of a full-mode masked cross-correlation, searched only within `cap_px` of no shift.
-
-    >>> x = np.zeros((9, 9)); x[4, 4] = 1.0; x[0, 0] = 5.0  # zero shift, and a taller peak at +4
-    >>> [float(v) for v in _bounded_peak(x, (5, 5), 4)]
-    [4.0, 4.0]
-    >>> [float(v) for v in _bounded_peak(x, (5, 5), 2)]
-    [0.0, 0.0]
-    """
-    row, col, _ = _topk_peaks(xcorr, shape, cap_px, k=1, min_sep_px=0)[0]
-    return np.array([row, col], dtype=float)
-
-
 def coarse_shift(img, ref, cfg):
     """
     Masked phase correlation bounded to `coarse_max_m`, with an injected-shift control gate.
@@ -1370,18 +1357,6 @@ def window_of(cfg, window=None):
     return (r1 - r0, c1 - c0), tr * rasterio.Affine.translation(c0, r0)
 
 
-def data_window(arr, pad=8):
-    """(r0, r1, c0, c1) bounding the finite pixels of a projected band, padded by `pad`."""
-    r, c = np.where(np.isfinite(arr))
-    h, w = arr.shape[-2:]
-    return (
-        max(int(r.min()) - pad, 0),
-        min(int(r.max()) + 1 + pad, h),
-        max(int(c.min()) - pad, 0),
-        min(int(c.max()) + 1 + pad, w),
-    )
-
-
 def warp_destination(shape, dtype) -> np.ndarray:
     """Uninitialised destination for a GDAL warp: in RAM up to `MAX_RAM_BYTES`, else a disk-backed
     memmap in the temp dir (`$TMPDIR`). Left uninitialised because `reproject`'s `init_dest_nodata` fills it with `dst_nodata`.
@@ -1400,7 +1375,7 @@ def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None, out=No
     Pass the cube, not one band at a time: GDAL solves the warp once per call.
     - `window` crops the output to (r0, r1, c0, c1) of the AOI grid (down from several GB strip).
     - `out` is a `rasterio.band(dataset, indexes)` to warp straight into, for a destination too big
-    to hold -- see :func:`warp`. Default allocates an array and returns it.
+    to hold. Default allocates an array and returns it.
     - `dst_nodata` must match `out`'s dtype when `out` is given (e.g. an int sentinel for an int32
     `out`) -- GDAL writes it verbatim, it is not a float-only convention.
     - SRC_METHOD=GCP_TPS: thin-plate-spline interpolation.
@@ -1730,40 +1705,6 @@ def register(ftif, fgeom, flabel, cfg, kernels=None, reference=None, verbose=Fal
             "band": cfg.band,
         },
     )
-
-
-def warp(cube, reg, cfg, resampling=Resampling.bilinear, window=None):
-    """
-    Apply a :class:`Registration` to a cube or single band. Returns a DataArray on the AOI grid.
-
-    `cube` may be a path to an IIRS product or a (band, y, x) DataArray in camera space. Every
-    band is resampled once, straight from camera space. A strip fills ~10% of the AOI, so pass
-    `window` (see :func:`data_window`) unless the whole 160 km box is wanted -- a 256-band cube on
-    the full grid is tens of GB. For a scene-sized warp, use a GLT (:func:`make_glt`) instead --
-    this is for small targeted AOIs (e.g. a quick look in QGIS), never a whole scene.
-    """
-    if isinstance(cube, str | Path):
-        da = xr.open_dataarray(cube, engine="rasterio")
-        da = da.assign_coords(band=io.band_numbers(da))
-    else:
-        da = cube
-    if "band" not in da.dims:
-        da = da.expand_dims("band")
-
-    xs, ys, _, _ = grid_of(cfg)
-    (ny, nx), tr = window_of(cfg, window)
-    r0, c0 = (window[0], window[2]) if window else (0, 0)
-    ys, xs = ys[r0 : r0 + ny], xs[c0 : c0 + nx]
-    out = project(da.values.astype("float32"), reg.gcps, cfg, resampling, window)
-    res = xr.DataArray(
-        out,
-        dims=("band", "y", "x"),
-        coords={"band": da.band.values, "y": ys, "x": xs},
-        attrs=dict(da.attrs) | {"georef_converged": str(reg.converged)},
-    )
-    if "wl" in da.coords:
-        res = res.assign_coords(wl=("band", da.wl.values))
-    return res.rio.write_crs(reg.crs).rio.write_transform(tr)
 
 
 # --- Geographic Lookup Tables ------------------------------------------------------------------

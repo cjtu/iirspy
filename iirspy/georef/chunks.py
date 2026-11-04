@@ -204,12 +204,6 @@ def l1_lat_range(group: str) -> tuple[float, float]:
     return (max(-90.0, lo - L1_BUFFER_DEG if lo > -90.0 else lo), min(90.0, hi + L1_BUFFER_DEG if hi < 90.0 else hi))
 
 
-def group_xy_half(group: str) -> tuple[float, float]:
-    """The widest `xy_half` among `group`'s bands, set by whichever sits closest to the equator."""
-    halves: list[tuple[float, float]] = [b["xy_half"] for b in BANDS.values() if b["group"] == group]
-    return max(halves, key=lambda h: h[0])
-
-
 def chunk_cfg(group: str, dem_roots: tuple[Path, ...]) -> GeorefConfig:
     """`group`'s base `GeorefConfig`. Callers replace `aoi`, `dem_near` and `dem_far` per chunk."""
     primary = bands(dem_roots)[GROUP_PRIMARY_BAND[group]]
