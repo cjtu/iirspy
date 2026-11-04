@@ -27,7 +27,7 @@ Check out the fully worked examples notebooks [here](https://github.com/cjtu/iir
 
 ## Quickstart
 
-1. Download IIRS data from the PRADAN / ISSDC system (requires an account).
+1. Download IIRS data from ISSDC (requires an account).
 2. Use `iirspy` to read data by giving the datetime basename and a local directory. Use `L0` for raw or `L1` for calibrated. The package unzips the downloaded files if necessary.
 
     ```python
@@ -64,6 +64,16 @@ Check out the fully worked examples notebooks [here](https://github.com/cjtu/iir
     l1_radiance = iirs_l0_raw.calibrate()
     l2_reflectance = iirs_l1_rad.calibrate()
     ```
+
+### Command-line tools
+
+`iirs-solve-scene`, `iirs-compute-refl`, `iirs-make-glt` and `iirs-fix-frames` need these set:
+
+- `IIRS_ARCHIVE`: ISSDC-layout tree holding `zips/`, `data/`, `geometry/`.
+- `IIRS_DEM_ROOTS`: `:`-separated dirs holding the LOLA / WAC DEMs.
+- `IIRS_RECAL_ROOT`: where recalibrated geometry (GCPs, GLT, LOC) is kept.
+
+Optional: `IIRS_SPICE` (default `$IIRS_ARCHIVE/spice`), `IIRS_ANC_ROOTS`, `IIRS_STAGE`.
 
 ## Other features
 

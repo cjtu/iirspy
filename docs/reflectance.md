@@ -49,7 +49,7 @@ Table 2: L2 presets. Unlisted fields keep the `L2Config` defaults.
 | Preset | Non-default fields | Purpose |
 |---|---|---|
 | `iirspy` (default) | `thermal="isothermal"` | Sun distance from SPICE, isothermal thermal removal at emissivity 1 over bands 227–247, Lambert disk function, terrain used when supplied. |
-| `issdc` | `sdist="none"`, `thermal="isothermal"`, `clip_negative=True`, `polish="issdc_empirical"`, `use_slope_az=False`, `smoothing=3` | Reproduces the ISSDC PRADAN L2 reflectance product. |
+| `issdc` | `sdist="none"`, `thermal="isothermal"`, `clip_negative=True`, `polish="issdc_empirical"`, `use_slope_az=False`, `smoothing=3` | Reproduces the ISSDC L2 reflectance product. |
 | `verma2022` | as `issdc`, but `thermal_eps=0.95`, `polish="verma2022"` | The Verma et al. (2022) thermal correction and polish. |
 
 The spectral polish of the `issdc` preset was inferred empirically from published ISSDC L2 products. On 9 windows from 3 scenes, `issdc` matches them to within 0.2% median over 750–2300 nm. Bands 172 and above (3.6–4.9 µm) were fitted from ISSDC NCI against NDI on five pixel-aligned scenes (hw1 and d18). For each band the polish is the sum of our reflectance divided by the sum of NDI's, over the pixels where both are positive, averaged over the scenes: 1.0 to 3.4 µm (so the existing table is consistent), 1.05–1.19 across 3.6–4.2 µm, 0.90 near 4.25 µm, and 1.3–1.6 at 4.4–4.6 µm. Above about 4.4 µm NDI is clipped to zero in half the pixels, so those values are biased by the positivity selection and are provisional; bands 172 and 251–256 had no estimate and take their nearest neighbour. The fit used the clip before the smoothing and should be refit now that the clip runs last.

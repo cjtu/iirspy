@@ -3,7 +3,6 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 from typing import Any
@@ -26,13 +25,56 @@ except metadata.PackageNotFoundError:  # running from a source tree not pip-inst
     IIRSPY_VERSION = "0+source"
 
 
-@dataclass(frozen=True)
 class Paths:
-    archive: Path
-    anc_roots: tuple[Path, ...]
-    dem_roots: tuple[Path, ...]
-    spice: Path
-    recal_root: Path
+    """Data locations. A field not passed falls back to its `IIRS_*` env var when first read, so a run
+    only needs the ones it touches: `IIRS_ARCHIVE`, `IIRS_DEM_ROOTS`, `IIRS_RECAL_ROOT`, and optionally
+    `IIRS_ANC_ROOTS` (default: the archive) and `IIRS_SPICE` (default: `<archive>/spice`).
+    """
+
+    def __init__(self, archive=None, anc_roots=None, dem_roots=None, spice=None, recal_root=None):
+        self._given: dict[str, Any] = {
+            "archive": archive,
+            "anc_roots": anc_roots,
+            "dem_roots": dem_roots,
+            "spice": spice,
+            "recal_root": recal_root,
+        }
+
+    @staticmethod
+    def _env(var: str) -> str:
+        if var not in os.environ:
+            raise RuntimeError(f"set {var} (see README)")
+        return os.environ[var]
+
+    @property
+    def archive(self) -> Path:
+        return self._given["archive"] or Path(self._env("IIRS_ARCHIVE"))
+
+    @property
+    def anc_roots(self) -> tuple[Path, ...]:
+        if self._given["anc_roots"]:
+            return tuple(self._given["anc_roots"])
+        return (
+            tuple(Path(p) for p in os.environ["IIRS_ANC_ROOTS"].split(":"))
+            if "IIRS_ANC_ROOTS" in os.environ
+            else (self.archive,)
+        )
+
+    @property
+    def dem_roots(self) -> tuple[Path, ...]:
+        return (
+            self._given["dem_roots"]
+            if self._given["dem_roots"] is not None
+            else tuple(Path(p) for p in self._env("IIRS_DEM_ROOTS").split(":"))
+        )
+
+    @property
+    def spice(self) -> Path:
+        return self._given["spice"] or Path(os.environ.get("IIRS_SPICE", self.archive / "spice"))
+
+    @property
+    def recal_root(self) -> Path:
+        return self._given["recal_root"] or Path(self._env("IIRS_RECAL_ROOT"))
 
 
 def band_numbers(img):
@@ -67,13 +109,11 @@ def extract(fzip, out_dir, **kw):
 
 
 def unzip_iirs(ddir, basename, level):
-    """Find a PRADAN bundle for `basename` under `ddir` and extract all of it, qub included, beside itself."""
+    """Find an ISSDC bundle for `basename` under `ddir` and extract all of it, qub included, beside itself."""
     mtc = LVL2MTC[level]
     f = next((f for f in Path(ddir).glob(f"**/*{mtc}*.zip") if basename in f.stem), None)
     if f is None:
-        raise FileNotFoundError(
-            f"Image {basename} not found in {ddir}. Please download from PRADAN or check file path."
-        )
+        raise FileNotFoundError(f"Image {basename} not found in {ddir}. Please download from ISSDC or check file path.")
     extract(f, f.parent, exclude=())
     paths = get_iirs_paths(f.parent, level=level, basenames=[basename])
     if "qub" not in paths:
@@ -121,7 +161,7 @@ def _find_recursive(ddir, subdir, ext, wanted):
 
 def _find_reprocessed(ddir, subdir, bnames, suffix, group=None):
     """Reprocessed products at `<ddir>/<subdir>/<sid[:8]>/<sid>_<group><suffix>`, the flat day-dir
-    layout of PRADAN's own trees. `group=None` matches any group but raises if a sid has several."""
+    layout of ISSDC's own trees. `group=None` matches any group but raises if a sid has several."""
     found: dict[str, Path] = {}
     for sid in bnames:
         hits = sorted((Path(ddir) / subdir / sid[:8]).glob(f"{sid}_{group or '*'}{suffix}"))

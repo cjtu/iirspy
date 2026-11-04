@@ -44,7 +44,6 @@ from iirspy.cli._run import (
     l2_config,
     log_provenance,
     open_run,
-    paths_from_env,
     predates_frames,
     resource_report,
     write_refl_outputs,
@@ -109,7 +108,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901
     if args.georef == "issdc" and args.topo_only:
         sys.exit("--topo-only needs --georef arosics: the issdc method has no DEM topo")
 
-    paths = paths_from_env()
+    paths = io.Paths()
     fgcps = frames = None
     if args.georef == "arosics":
         fgcps = Path(args.gcps) if args.gcps else ck.merged_gcps_path(sid, group, paths)

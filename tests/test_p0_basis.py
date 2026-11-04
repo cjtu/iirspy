@@ -1,4 +1,4 @@
-"""P0 basis: lut_median and G1-table calibration, HSRS flux with distance scaling, refl CLI configs."""
+"""Calibration presets: lut_median and G1-table calibration, HSRS flux with distance scaling, refl CLI configs."""
 
 from types import SimpleNamespace
 

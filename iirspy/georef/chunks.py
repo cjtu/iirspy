@@ -240,7 +240,7 @@ def recal_dir(sid: str, paths: io.Paths, tree: str = "geometry/recalibrated") ->
     Laid out like the archive's own `<category>/<level>/<day>/` tree so the two read the same way,
     but separate from `paths.archive`: these are derived, not PDS-shipped.
 
-    Flat like PRADAN's own `<tree>/<level>/<day>/`: every file in it is named `<sid>_<group>_*`, so
+    Flat like ISSDC's own `<tree>/<level>/<day>/`: every file in it is named `<sid>_<group>_*`, so
     scenes and groups share the dir. Trees: `geometry/recalibrated` (solve: GCPs, chunk fits, GLT,
     LOC, topo, summary, log), `data/recalibrated` (L1 radiance), `data/rederived` (L2, OBS).
     """
@@ -248,8 +248,8 @@ def recal_dir(sid: str, paths: io.Paths, tree: str = "geometry/recalibrated") ->
 
 
 def merged_gcps_path(sid: str, group: str, paths: io.Paths) -> Path:
-    """Where `sid`/`group`'s merged GCPs land once solved -- the durable `--keep` layout every
-    cluster script and CLI default assumes, independent of any particular run's `--out`."""
+    """Where `sid`/`group`'s merged GCPs land once solved -- the durable `--keep` layout the CLI
+    defaults assume, independent of any particular run's `--out`."""
     return recal_dir(sid, paths) / f"{sid}_{group}.gcps"
 
 

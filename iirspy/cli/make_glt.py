@@ -4,7 +4,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from iirspy.cli._run import paths_from_env
+from iirspy import io
 from iirspy.georef import chunks as ck
 from iirspy.georef.georef import gcps_and_aoi, make_glt, save_glt
 
@@ -33,7 +33,7 @@ def _glt_parser():
 
 def main(argv: list[str] | None = None) -> None:
     args = _glt_parser().parse_args(argv)
-    paths = paths_from_env()
+    paths = io.Paths()
     fgcps = Path(args.gcps) if args.gcps else ck.merged_gcps_path(args.sid, args.group, paths)
     if not fgcps.is_file() or fgcps.stat().st_size == 0:
         sys.exit(f"{fgcps} missing or empty -- {args.sid} {args.group} is not solved yet")

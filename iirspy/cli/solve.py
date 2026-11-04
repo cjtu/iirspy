@@ -20,6 +20,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
+from iirspy import io
 from iirspy.cli._run import (
     Job,
     build_l1,
@@ -27,7 +28,6 @@ from iirspy.cli._run import (
     ensure_frame_offsets,
     log_provenance,
     open_run,
-    paths_from_env,
     predates_frames,
 )
 from iirspy.georef import ancillary, arosics
@@ -140,7 +140,7 @@ def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
     if args.clean and not args.keep:
         sys.exit("--clean without --keep would discard the whole run")
-    paths = paths_from_env()
+    paths = io.Paths()
 
     import dask
 

@@ -28,22 +28,6 @@ from iirspy.l2.config import L2Config
 log = logging.getLogger(__name__)
 
 
-def paths_from_env() -> io.Paths:
-    archive = Path(os.environ.get("IIRS_ARCHIVE", "/mnt/d/ddata/moon/ch2_iirs"))
-    return io.Paths(
-        archive=archive,
-        anc_roots=tuple(Path(p) for p in os.environ["IIRS_ANC_ROOTS"].split(":"))
-        if "IIRS_ANC_ROOTS" in os.environ
-        else (archive,),
-        dem_roots=tuple(
-            Path(p)
-            for p in os.environ.get("IIRS_DEM_ROOTS", "/mnt/d/ddata/moon/lro_lola:/mnt/d/ddata/moon/lro_wac").split(":")
-        ),
-        spice=Path(os.environ.get("IIRS_SPICE", str(archive / "spice"))),
-        recal_root=Path(os.environ.get("IIRS_RECAL_ROOT", str(Path.home() / "data" / "ch2_iirs"))),
-    )
-
-
 @dataclass(frozen=True)
 class Job:
     sid: str

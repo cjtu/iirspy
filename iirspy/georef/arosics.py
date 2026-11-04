@@ -87,20 +87,6 @@ TWEAK_DEFAULTS = {
 }
 
 
-def _dem_key(path: str) -> str:
-    """Cache-comparable identity for a DEM path: the product filename, not the mount root.
-
-    `IIRS_DEM_ROOTS` differs between machines (e.g. `/scratch/...` vs `/mnt/d/...`), so comparing full paths would call every chunk's cache stale on a
-    different machine even though the same DEM product solved it.
-
-    >>> _dem_key("/scratch/cjtu/lro_lola/LOLA_GDR/POLAR/SOUTH_POLE/LDEM_75S_30M.tif")
-    'LDEM_75S_30M.tif'
-    >>> _dem_key("/mnt/d/ddata/moon/lro_lola/LOLA_GDR/POLAR/SOUTH_POLE/LDEM_75S_30M.tif")
-    'LDEM_75S_30M.tif'
-    """
-    return Path(path).name
-
-
 def _cached_chunk(
     work: Path, sid: str, group: str, frames: Path, c: dict, good_corr: float, decay_m: float, tweaks: dict
 ):
@@ -116,7 +102,7 @@ def _cached_chunk(
     Convergence isn't required -- a non-converged chunk that still passed quality (5-iter cap, no
     plateau) re-solves to the same result every time, so treating it as cache-invalid just burns
     wall-clock re-deriving an answer that won't change.
-    The DEM pair is part of the key (by product name, see `_dem_key`) because `plan_chunks` picks
+    The DEM pair is part of the key (by product name: `IIRS_DEM_ROOTS` differs between machines) because `plan_chunks` picks
     the far tier per chunk, so two runs can agree on shape and still have used different
     references. Returns (fit, gcps_by_rc).
     """
@@ -128,8 +114,8 @@ def _cached_chunk(
         IIRSPY_VERSION != "0+source"
         and fit.get("version") == IIRSPY_VERSION
         and fit.get("band") == c["band"]
-        and _dem_key(fit.get("dem_near", "")) == _dem_key(c["dem_near"])
-        and _dem_key(fit.get("dem_far", "")) == _dem_key(c["dem_far"])
+        and Path(fit.get("dem_near", "")).name == Path(c["dem_near"]).name
+        and Path(fit.get("dem_far", "")).name == Path(c["dem_far"]).name
         and fit.get("row0") == c["row0"]
         and fit.get("row1") == c["row1"]
         and fit.get("decay_m") == decay_m
@@ -820,8 +806,8 @@ def _reference_key(c: dict, reference: str) -> dict:
     return {
         "reference": reference,
         "aoi": list(c["aoi"]),
-        "dem_near": _dem_key(c["dem_near"]),
-        "dem_far": _dem_key(c["dem_far"]),
+        "dem_near": Path(c["dem_near"]).name,
+        "dem_far": Path(c["dem_far"]).name,
     }
 
 
@@ -855,7 +841,7 @@ def _cached_reference(work: Path, sid: str, group: str, c: dict, reference: str)
     if not fhs.exists() or finfo is None:
         return None
     info = json.loads(finfo.read_text())
-    seen = {**info, "dem_near": _dem_key(info.get("dem_near", "")), "dem_far": _dem_key(info.get("dem_far", ""))}
+    seen = {**info, "dem_near": Path(info.get("dem_near", "")).name, "dem_far": Path(info.get("dem_far", "")).name}
     key = _reference_key(c, reference)
     if "az_grid" not in info or any(seen.get(k) != v for k, v in key.items()):
         return None

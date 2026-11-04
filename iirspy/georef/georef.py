@@ -237,7 +237,7 @@ def load_lola_elev(path, bounds=None, dec=1):
         # halves every height and is silent about it.
         scale, offset = 1.0, MOON_RADIUS_M
     elif Path(path).suffix.lower() in (".tif", ".tiff"):
-        # COG rebuild of a GDR (local-workspace/make_dem_cogs.py) -- the raw int16 counts are
+        # COG rebuild of a GDR -- the raw int16 counts are
         # copied through untouched, and every LOLA GDR label carries these same two constants,
         # so they are inlined rather than shipped in a sidecar. GDAL's own scale/offset tags stay
         # untrusted here for the same reason as above.
@@ -1429,7 +1429,7 @@ def _has_arosics():
 
     A directory called `arosics/` with no `__init__.py` anywhere on the path makes `find_spec`
     succeed as a *namespace* package, whose `loader` is None and which of course has no
-    `COREG_LOCAL`. `local-workspace/arosics/` in this repo is exactly that, so the plain
+    `COREG_LOCAL`. A source checkout with an `arosics/` directory beside it is exactly that, so the plain
     `find_spec(...) is None` test used to report the package present and send the solve down the
     in-process branch, dying with "cannot import name 'COREG_LOCAL' from 'arosics' (unknown
     location)" instead of subprocessing to the conda environment that actually has it.
@@ -1738,7 +1738,7 @@ def make_glt(gcps, cfg, camera_shape, scan0=0, window=None) -> np.ndarray:
     shape, _ = window_of(cfg, window)
     # Nearest resampling copies whole-number camera indices exactly, so GDAL can cast and fill
     # NODATA straight into one int32 buffer -- no separate float `warped` array or isfinite mask.
-    # A near-pole-to-pole equatorial strip's AOI grid alone can exceed a solve's --mem.
+    # A near-pole-to-pole equatorial strip's AOI grid alone can exceed available memory.
     out = warp_destination((2, *shape), "int32")
     project(np.stack([cols, rows]), gcps, cfg, resampling=Resampling.nearest, window=window, out=out, dst_nodata=NODATA)
     return out

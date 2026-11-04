@@ -16,14 +16,8 @@ from iirspy.instrument import PKG_DATA
 # Solar Irradiance (NNLSSI), Version 3. Monthly SSI, 2010-01 to 2025-12. NOAA National Centers for
 # Environmental Information. https://doi.org/10.25921/esjz-1w61. Accessed 2026-10-09.
 FNOAA = str(PKG_DATA.joinpath("solar_flux_noaa_cdr_v03.csv"))
-
-
 FSOLAR = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_solar_flux.txt"))
-
-
 FSOLAR_HSRS = str(PKG_DATA.joinpath("ch2_iirs_solar_flux_hsrs.txt"))
-
-
 AU_KM = 1.495978707e8
 
 
@@ -88,7 +82,7 @@ def solar_flux(cfg, sdist, qub):
         return get_noaa_flux(sdist)
     if cfg.flux == "noaa_cdr_monthly":
         return get_noaa_flux(sdist, pd.Timestamp(pdr.open(qub).metaget("start_date_time")).strftime("%Y-%m"))
-    return get_solar_flux(sdist, {"pradan": FSOLAR, "hsrs": FSOLAR_HSRS}.get(cfg.flux, cfg.flux))
+    return get_solar_flux(sdist, {"issdc": FSOLAR, "hsrs": FSOLAR_HSRS}.get(cfg.flux, cfg.flux))
 
 
 def divide_flux(rad, cfg, *, qub, sdist, **_):

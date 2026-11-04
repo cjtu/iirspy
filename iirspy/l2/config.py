@@ -21,7 +21,7 @@ from iirspy.config import Config
 from iirspy.l2 import photometry, polish
 
 POLISH = polish.POLISH
-FLUX = ("pradan", "hsrs", "noaa_cdr_mean", "noaa_cdr_monthly")
+FLUX = ("issdc", "hsrs", "noaa_cdr_mean", "noaa_cdr_monthly")
 SDIST = ("spice", "none")
 THERMAL = ("none", "isothermal")
 SMOOTHING_EDGES = ("pair", "nan", "reflect")
@@ -35,9 +35,9 @@ class L2Config(Config):
     Besse phase, spectral smoothing, clip.
 
     Attributes:
-        flux: Solar spectrum. "pradan" (the PRADAN flux file), "noaa_cdr_mean" (NOAA SSI CDR v03,
+        flux: Solar spectrum. "issdc" (the ISSDC flux file), "noaa_cdr_mean" (NOAA SSI CDR v03,
             2010-2019 mean), "noaa_cdr_monthly" (the CDR month of the scene's start time), "hsrs"
-            (HSRS v2 through the IIRS SRFs, packaged in PRADAN's format), a path to a file in PRADAN's
+            (HSRS v2 through the IIRS SRFs, packaged in ISSDC's format), a path to a file in ISSDC's
             format (tab-separated nm, mW/cm^2/um at 1 AU; scaled by 1/sdist^2), or a per-band
             sequence in W/m^2/sr/um for bands 1..N, used as is (NO distance scaling).
         sdist: Sun distance for scaling the flux: "spice", "none" (1 AU) or a float in AU.
@@ -60,7 +60,7 @@ class L2Config(Config):
         smoothing_edges: End bands of the moving average (`polish.moving_average`).
     """
 
-    flux: Any = "pradan"
+    flux: Any = "issdc"
     sdist: str | float = "spice"
     thermal: str = "none"
     thermal_eps: float = 1.0
