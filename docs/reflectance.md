@@ -33,10 +33,11 @@ Per-scene inputs are keyword arguments, not config fields: `empirical_kws` (for 
 
 The steps run in this order. Band numbers are IIRS band numbers, 1-indexed.
 
+0. ISSDC polish (`polish="issdc"` only, before thermal removal as in SIS Appendix L): in I/F, multiply by ISSDC's gain per band and column (`issdc_gsp.csv`), mirrored when longitude falls along the columns since ISSDC indexes it in its east-right image; then, with d_b = R_b − (R_b−1 + R_b+1)/2, replace R_b by (R_b−1 + R_b+1)/2 where |d_b| > 0.9 · rms(d_b−1, d_b, d_b+1). Needs `geom`, all 256 bands and all 250 columns.
 1. Thermal removal: `thermal`, `thermal_eps` (emissivity) and `thermal_bands`, the inclusive `(first, last)` band range whose mean brightness temperature is the pixel temperature. `thermal_eps * B(T)` is subtracted at every band, in radiance, so it precedes the flux division.
 2. Solar flux: `flux` selects the solar spectrum and `sdist` scales it by the squared Sun distance.
-3. Photometric normalization to the standard geometry i = 30°, e = 0°, g = 30°: `photom` is the model r, and reflectance = I/F · r(30, 0, 30) / r(i, e, g). A model is a `photometry.MODELS` name (`none`, `lambert`, `lommel_seeliger`, `lunar_lambert`, `besse_m3_highland`, `issdc`) or any callable of `cos_inc`, `cos_view`, `g` and `wl`, passed by name; one that also takes `iof` returns the reflectance itself (Hapke-type models, and `issdc`, which reproduces ISSDC's I/F / cos_inc). `besse_m3_highland` is fitted to M3 highlands, for comparison with M3, not an IIRS model. `use_slope_az` applies the geometry's facet terms when it has topo; `cos_min` floors both cosines; `min_lit` nulls pixels less lit than it.
-4. Polish: `polish` divides each band by a per-band factor, mapped by band number. Bands absent from the table get 1.0.
+3. Photometric normalization to the standard geometry i = 30°, e = 0°, g = 30°: `photom` is the model r, and reflectance = I/F · r(30, 0, 30) / r(i, e, g). A model is a `photometry.MODELS` name (`none`, `lambert`, `lommel_seeliger`, `lunar_lambert`, `besse_m3_highland`, `apparent`, `issdc`) or any callable of `cos_inc`, `cos_view`, `g` and `wl`, passed by name; one that also takes `iof` returns the reflectance itself (Hapke-type models; `apparent`, I/F / cos_inc as in SIS Appendix K; and `issdc`, 0.9018 × apparent, as in ISSDC's NDI; the factor is not in the SIS). `besse_m3_highland` is fitted to M3 highlands, for comparison with M3, not an IIRS model. `use_slope_az` applies the geometry's facet terms when it has topo; `cos_min` floors both cosines; `min_lit` nulls pixels less lit than it.
+4. Polish: a per-band `polish` (anything but `"issdc"`) divides each band by a per-band factor, mapped by band number. Bands absent from the table get 1.0.
 5. Spectral smoothing: `smoothing` is the moving-average width in bands and `smoothing_edges` sets the end bands. `"pair"` (width 3 only) sets the first band to the mean of bands 2–3 and the last to the mean of the last two.
 6. Clip: `clip_negative` sets negative reflectance to zero. It runs last, after smoothing, as range validation does in the ISSDC product. Past about 4.4 µm, where the signal is almost all thermal, this zeroes about half of the pixels of an ISSDC NDI band.
 7. Fill: `fill_nan` writes a value over every NaN (null pixels, lost frames, dropped bands) as the very last step. The `issdc` presets use 0, as ISSDC's NDI marks all its nulls with 0; the `iirspy` preset keeps NaN.
@@ -48,10 +49,8 @@ Table 2: L2 presets. Unlisted fields keep the `L2Config` defaults.
 | Preset | Non-default fields | Purpose |
 |---|---|---|
 | `iirspy` (default) | `thermal="isothermal"` | Sun distance from SPICE, isothermal thermal removal at emissivity 1 over bands 227–247, Lambert model at the standard geometry, terrain used when supplied. |
-| `issdc` | `sdist="none"`, `photom="issdc"`, `thermal="isothermal"`, `clip_negative=True`, `polish="issdc_empirical"`, `use_slope_az=False`, `smoothing=3` | Reproduces the ISSDC L2 reflectance product. |
-| `verma2022` | as `issdc`, but `thermal_eps=0.95`, `polish="verma2022"` | The Verma et al. (2022) thermal correction and polish. |
-
-The spectral polish of the `issdc` preset was inferred empirically from published ISSDC L2 products. On 9 windows from 3 scenes, `issdc` matches them to within 0.2% median over 750–2300 nm. Bands 172 and above (3.6–4.9 µm) were fitted from ISSDC NCI against NDI on five pixel-aligned scenes (hw1 and d18). For each band the polish is the sum of our reflectance divided by the sum of NDI's, over the pixels where both are positive, averaged over the scenes: 1.0 to 3.4 µm (so the existing table is consistent), 1.05–1.19 across 3.6–4.2 µm, 0.90 near 4.25 µm, and 1.3–1.6 at 4.4–4.6 µm. Above about 4.4 µm NDI is clipped to zero in half the pixels, so those values are biased by the positivity selection and are provisional; bands 172 and 251–256 had no estimate and take their nearest neighbour. The fit used the clip before the smoothing and should be refit now that the clip runs last.
+| `issdc` | `sdist="none"`, `photom="issdc"`, `thermal="isothermal"`, `clip_negative=True`, `fill_nan=0`, `polish="issdc"`, `use_slope_az=False` | Reproduces the ISSDC L2 reflectance product (NDI). |
+| `verma2022` | `sdist="none"`, `photom="apparent"`, `thermal="isothermal"`, `thermal_eps=0.95`, `thermal_bands=(225, 246)`, `clip_negative=True`, `polish="verma2022"`, `use_slope_az=False`, `smoothing=3` | The Verma et al. (2022) plugin's thermal correction, polish and smoothing. |
 
 ### Geometry input
 
@@ -71,7 +70,7 @@ Table 3: Data files read by the L2 steps, under `iirspy/data/`.
 | File | Used by | Content |
 |---|---|---|
 | `spectral_polish_verma2022.csv` | `polish="verma2022"` | Per-band polish, bands 8–254. |
-| `spectral_polish_issdc_empirical.csv` | `polish="issdc_empirical"` | Per-band polish inferred from ISSDC L2 products; `ci95_lo`, `ci95_hi`, `n_scenes` give the fit's spread. |
+| `issdc_gsp.csv` | `polish="issdc"` | ISSDC's polish gain, band 1–256 by column `c000`–`c249` of the NDI (north-up, east-right) image, measured as NDI ard radiance / NCI radiance over 13 scenes. |
 | `solar_flux_noaa_cdr_v03.csv` | `flux="noaa_cdr_mean"`, `"noaa_cdr_monthly"` | `mean_2010_2019` and one `YYYY-MM` column per month, mW/cm²/µm at 1 AU, convolved to the IIRS bands. The monthly lookup uses the scene label's start time. |
 
 ## References

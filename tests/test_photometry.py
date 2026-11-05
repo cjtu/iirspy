@@ -29,7 +29,7 @@ def test_slope_toward_sun_gains_light_and_away_loses_it():
     assert away < 0  # a 10 deg back-slope under a 5 deg sun is unlit, not dim
 
 
-@pytest.mark.parametrize("name", sorted(set(ph.MODELS) - {"issdc"}))
+@pytest.mark.parametrize("name", sorted(set(ph.MODELS) - {"issdc", "apparent"}))  # not standard-geometry models
 def test_every_model_leaves_a_scene_at_the_standard_geometry_unchanged(name):
     """At i = 30, nadir view (g = 30) the ratio r(30, 0, 30) / r(i, e, g) is 1, so reflectance = I/F."""
     rad = _synthetic_l1()

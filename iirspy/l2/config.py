@@ -26,8 +26,8 @@ SMOOTHING_EDGES = ("pair", "nan", "reflect")
 class L2Config(Config):
     """L1 radiance -> L2 reflectance choices (see `iirspy.l2.calibrate`).
 
-    Steps run in order: thermal removal, solar flux, photometric normalization, polish,
-    spectral smoothing, clip, NaN fill.
+    Steps run in order: ISSDC polish (polish="issdc" only), thermal removal, solar flux, photometric
+    normalization, per-band polish, spectral smoothing, clip, NaN fill.
 
     Attributes:
         flux: Solar spectrum. "issdc" (the ISSDC flux file), "noaa_cdr_mean" (NOAA SSI CDR v03,
@@ -44,8 +44,9 @@ class L2Config(Config):
             equilibrium temperature at its incidence (`thermal.flat_surface_temperature`).
         clip_negative: Zero negative reflectance after smoothing.
         fill_nan: Value written over every NaN as the last step (ISSDC's ndi marks all nulls with 0), or None to keep NaN.
-        polish: Per-band divisor: None, "verma2022", "issdc_empirical", or a csv path with `band`
-            and `polish` columns. Mapped by band number; bands the table lacks get 1.0.
+        polish: None; "issdc", ISSDC's polish (`polish.issdc_polish`), run before thermal removal; or a per-band
+            divisor after the photometric step, "verma2022" or a csv with `band` and `polish` columns (missing
+            bands get 1.0).
         photom: Photometric model taking the cube to i = 30, e = 0, g = 30: a `photometry.MODELS` name or any
             callable of `cos_inc`, `cos_view`, `g`, `wl` (and `iof`), see `iirspy.l2.photometry`.
         use_slope_az: Use the `Geometry`'s facet terms when it has topo.
@@ -80,8 +81,8 @@ class L2Config(Config):
             raise ValueError(f"flux {self.flux!r}: not one of {FLUX} or an existing file")
         if isinstance(self.polish, Path):
             object.__setattr__(self, "polish", str(self.polish))
-        if self.polish is not None and self.polish not in POLISH and not Path(self.polish).is_file():
-            raise ValueError(f"polish {self.polish!r}: not one of {tuple(POLISH)} or an existing file")
+        if self.polish is not None and self.polish not in ("issdc", *POLISH) and not Path(self.polish).is_file():
+            raise ValueError(f"polish {self.polish!r}: not one of {('issdc', *POLISH)} or an existing file")
         if isinstance(self.sdist, str) and self.sdist not in SDIST:
             raise ValueError(f"sdist {self.sdist!r}: not one of {SDIST} or a float")
         if self.thermal not in THERMAL:
@@ -116,13 +117,12 @@ L2Config.PRESETS = {
         "thermal_eps": 1.0,
         "clip_negative": True,
         "fill_nan": 0.0,
-        "polish": "issdc_empirical",
+        "polish": "issdc",
         "use_slope_az": False,
-        "smoothing": 3,
     },
     "verma2022": {
         "sdist": "none",
-        "photom": "issdc",
+        "photom": "apparent",
         "thermal": "isothermal",
         "thermal_eps": 0.95,
         "thermal_bands": (225, 246),

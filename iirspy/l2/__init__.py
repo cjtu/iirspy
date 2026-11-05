@@ -1,6 +1,6 @@
 """L1 -> L2 pipeline: radiance [W/m^2/sr/um] to reflectance. `L1.calibrate` calls it.
 
-    rad -> thermal removal -> / solar flux -> -> standard geometry (photometric model) -> polish -> smoothing -> clip, fill
+    rad -> [ISSDC polish] -> thermal removal -> / solar flux -> standard geometry (photometric model) -> polish -> smoothing -> clip, fill
 
 Each step is switched by `L2Config` fields and appends {"step", "method"} to the JSON list `attrs["provenance"]`,
 continuing L1's. The step modules take plain arguments; only this module reads the config.
@@ -19,7 +19,7 @@ def calibrate(rad, cfg, *, qub=None, geom=None):
     `qub` is the scene's label, for the solar distance and monthly flux (None means 1 AU). `geom` is the
     scene's `Geometry`: with topo and `cfg.use_slope_az` the photometric step uses its facet terms and the
     incidence is the cube's per-line `solar_inc`; without topo the incidence is `geom.obs.sun_zenith`; with no `geom`
-    at all the cube's per-line `solar_inc`.
+    at all the cube's per-line `solar_inc`. `polish="issdc"` needs `geom` for the scene's longitude.
     """
     if geom is not None and geom.shape != rad.shape[1:]:
         raise ValueError(f"geometry {geom.shape} does not match the cube {rad.shape[1:]}")
@@ -35,6 +35,10 @@ def calibrate(rad, cfg, *, qub=None, geom=None):
     with xr.set_options(keep_attrs=True):  # older xarray drops attrs in arithmetic
         cube = rad.copy()
         cube.attrs = {}
+        if cfg.polish == "issdc":
+            f = solar.solar_flux(cfg.flux, sdist, qub)
+            cube = polish.issdc_polish(cube / f, geom and geom.loc.lon.values) * f
+            log("polish", "issdc")
         if cfg.thermal != "none":
             cube = thermal.subtract(
                 cube, cfg.thermal_eps, cfg.thermal_bands, inc=inc, sdist=sdist, t_min=cfg.thermal_t_min
@@ -47,7 +51,7 @@ def calibrate(rad, cfg, *, qub=None, geom=None):
             cube, inc, geom if topo else None, photom=cfg.photom, cos_min=cfg.cos_min, min_lit=cfg.min_lit
         )
         log("photometric", getattr(cfg.photom, "__name__", cfg.photom), geom=geom and geom.method)
-        if cfg.polish is not None:
+        if cfg.polish not in (None, "issdc"):
             cube = cube / polish.spectral_polish(cube.band, cfg.polish)
             log("polish", cfg.polish)
         if cfg.smoothing > 1:

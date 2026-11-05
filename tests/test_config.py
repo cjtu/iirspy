@@ -40,7 +40,7 @@ def test_every_field_survives_to_attrs(cfg):
         lambda: L2Config.preset("issdc", polsh=None),
         lambda: L2Config(thermal="verma"),
         lambda: L2Config(flux="noaa"),
-        lambda: L2Config(polish="issdc"),
+        lambda: L2Config(polish="issdc_empirical"),
         lambda: L2Config(sdist="spcie"),
         lambda: L2Config(photom="hapke"),
         lambda: L2Config(smoothing_edges="pairs"),

@@ -15,8 +15,8 @@ A model takes any of `cos_inc`, `cos_view`, `g` [deg] and `wl` [nm], passed by p
     besse_m3_highland(cos_inc, cos_view, g, wl)   lunar_lambert x Besse et al. (2013) M3 highland f(g, wl)
 
 A model that also takes `iof` returns the reflectance itself. That covers models nonlinear in albedo, such as Hapke
-(invert w per pixel and band, then evaluate at the standard geometry), and `issdc`, which reproduces ISSDC's
-I/F / cos_inc.
+(invert w per pixel and band, then evaluate at the standard geometry), `apparent` (I/F / cos_inc, SIS Appendix K),
+and `issdc`, which reproduces ISSDC's NDI: 0.9018 x apparent.
 
 Without terrain the surface is the flat local horizontal: cos_inc = cos(solar_inc), nadir view, g = incidence.
 With a `Geometry` that has topo, both cosines are taken about each DEM facet and r is scaled by the lit fraction.
@@ -127,9 +127,17 @@ def besse_m3_highland(cos_inc, cos_view, g, wl):
     return lunar_lambert(cos_inc, cos_view, g) * f
 
 
-def issdc(iof, cos_inc):
-    """ISSDC's L2 normalization, I/F / cos_inc (Lambert to overhead sun, not the standard geometry)."""
+ISSDC_SCALE = 0.9018  # ISSDC NDI / apparent reflectance; constant over scenes, bands and geometry, not in the SIS
+
+
+def apparent(iof, cos_inc):
+    """Apparent reflectance I/F / cos_inc (SIS Appendix K)."""
     return iof / cos_inc.where(cos_inc > 0)
+
+
+def issdc(iof, cos_inc):
+    """ISSDC's NDI reflectance: `ISSDC_SCALE` x apparent reflectance."""
+    return ISSDC_SCALE * apparent(iof, cos_inc)
 
 
 MODELS = {
@@ -138,6 +146,7 @@ MODELS = {
     "lommel_seeliger": lommel_seeliger,
     "lunar_lambert": lunar_lambert,
     "besse_m3_highland": besse_m3_highland,
+    "apparent": apparent,
     "issdc": issdc,
 }
 

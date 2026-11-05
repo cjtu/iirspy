@@ -158,7 +158,12 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
         log.info(f"aoi from {len(gcps)} merged gcps: {[round(v / 1000, 1) for v in aoi]} km")
 
     # topo-only needs the scan crop, not the spectrum
-    bands = PAN_BANDS if args.topo_only else sorted(set(range(1, 257)) - set(instrument.OSF) - set(instrument.INVALID))
+    if args.topo_only:
+        bands = PAN_BANDS
+    elif args.l2_config.polish == "issdc":  # its spike step reads each band's neighbours, over the whole cube
+        bands = list(range(1, 257))
+    else:
+        bands = sorted(set(range(1, 257)) - set(instrument.OSF) - set(instrument.INVALID))
     nci = args.l2 == "issdc-nci"
     ftif = work / f"{sid}_{group}_l1_rad.tif"
     if nci:

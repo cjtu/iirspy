@@ -1,9 +1,8 @@
-"""Spectral polish and smoothing, the late L2 steps that clean up the reflectance spectrum.
+"""Spectral polish and smoothing, the L2 steps that clean up the reflectance spectrum.
 
-`spectral_polish` is a per-band divisor for residual band-to-band calibration structure: the Verma et al. (2022)
-table, or one fitted to ISSDC's published L2 so `L2Config.preset("issdc")` reproduces it. `moving_average` is the
-3-band smoothing ISSDC applies to its L2. `apply_smoothing` (boxcar, Gaussian, Savitzky-Golay) defines other spectral
-smoothing operations.
+`issdc_polish` is ISSDC's polish (SIS Appendix L, step 3). `spectral_polish` is a per-band divisor, the Verma et al.
+(2022) table. `moving_average` is the 3-band smoothing of the Verma et al. (2022) plugin. `apply_smoothing` (boxcar,
+Gaussian, Savitzky-Golay) defines other spectral smoothing operations.
 """
 
 import numpy as np
@@ -15,9 +14,33 @@ from scipy.stats import norm
 from iirspy.instrument import PKG_DATA
 
 FPOLISH = str(PKG_DATA.joinpath("spectral_polish_verma2022.csv"))
-# Per-band polish inferred from published ISSDC L2 (NDI) products; bands without a fit are 1.0
-FPOLISH_ISSDC_EMPIRICAL = str(PKG_DATA.joinpath("spectral_polish_issdc_empirical.csv"))
-POLISH = {"verma2022": FPOLISH, "issdc_empirical": FPOLISH_ISSDC_EMPIRICAL}
+POLISH = {"verma2022": FPOLISH}
+# ISSDC's polish gain, band 1-256 x column 0-249 of the north-up, east-right NDI image
+FGSP = str(PKG_DATA.joinpath("issdc_gsp.csv"))
+
+
+def issdc_polish(iof, lon):
+    """ISSDC's spectral polish of I/F (band, y, x), all 256 bands and 250 columns; `lon` is the scene's longitude
+    with x last.
+
+    1. Multiply by the `FGSP` gain. ISSDC indexes it in its east-right image, so it is mirrored when longitude
+       falls along x.
+    2. With d_b = R_b - (R_b-1 + R_b+1) / 2, replace R_b by (R_b-1 + R_b+1) / 2 where
+       |d_b| > 0.9 * rms(d_b-1, d_b, d_b+1), using the unreplaced neighbours.
+    """
+    if lon is None or iof.sizes["band"] != 256 or iof.sizes["x"] != 250:
+        raise ValueError(f"issdc polish needs the scene longitude, 256 bands and 250 columns, got {dict(iof.sizes)}")
+    lon = np.atleast_2d(lon)
+    row = lon[len(lon) // 2]
+    g = pd.read_csv(FGSP, index_col="band").to_numpy()
+    if (row[-1] - row[0] + 180) % 360 - 180 < 0:
+        g = g[:, ::-1]
+    r = iof * xr.DataArray(g, dims=("band", "x"), coords={"band": iof.band, "x": iof.x})
+    mean = (r.shift(band=1) + r.shift(band=-1)) / 2
+    d = r - mean
+    dm, dp = d.shift(band=1).fillna(d), d.shift(band=-1).fillna(d)
+    spike = abs(d) > 0.9 * np.sqrt((dm**2 + d**2 + dp**2) / 3)
+    return xr.where(spike, mean, r).transpose(*iof.dims)
 
 
 def spectral_polish(band, fpolish=FPOLISH):

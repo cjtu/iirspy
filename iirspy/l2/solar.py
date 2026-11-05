@@ -33,6 +33,13 @@ AU_KM = 1.495978707e8
 
 def divide_flux(rad, flux="issdc", sdist=1.0, qub=None):
     """`rad` over the solar flux at `sdist` AU; `flux` is an `L2Config.flux` value, `qub` the label (monthly CDR)."""
+    out = rad / solar_flux(flux, sdist, qub)
+    out.attrs["solar_distance_au"] = sdist
+    return out
+
+
+def solar_flux(flux="issdc", sdist=1.0, qub=None):
+    """Solar flux F_sun / (pi d^2) [W/m^2/sr/um] by band for an `L2Config.flux` value (see `divide_flux`)."""
     if isinstance(flux, tuple):
         n = len(flux)
         f = flux[0] if n == 1 else xr.DataArray(np.asarray(flux), coords={"band": np.arange(1, n + 1)})
@@ -42,9 +49,7 @@ def divide_flux(rad, flux="issdc", sdist=1.0, qub=None):
         f = get_noaa_flux(sdist, pd.Timestamp(pdr.open(qub).metaget("start_date_time")).strftime("%Y-%m"))
     else:
         f = get_solar_flux(sdist, {"issdc": FSOLAR, "hsrs": FSOLAR_HSRS}.get(flux, flux))
-    out = rad / f
-    out.attrs["solar_distance_au"] = sdist
-    return out
+    return f
 
 
 def sun_distance(sdist, qub=None):
