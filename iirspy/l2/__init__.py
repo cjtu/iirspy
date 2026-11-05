@@ -41,7 +41,13 @@ def calibrate(rad, cfg, *, qub=None, geom=None):
             log("polish", "issdc")
         if cfg.thermal != "none":
             cube = thermal.subtract(
-                cube, cfg.thermal_eps, cfg.thermal_bands, inc=inc, sdist=sdist, t_min=cfg.thermal_t_min
+                cube,
+                cfg.thermal_eps,
+                cfg.thermal_bands,
+                inc=inc,
+                sdist=sdist,
+                t_min=cfg.thermal_t_min,
+                model=cfg.thermal,
             )
             if "T" in cube.coords:
                 log("thermal", cfg.thermal)

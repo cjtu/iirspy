@@ -18,7 +18,7 @@ from iirspy.l2 import photometry, polish
 POLISH = polish.POLISH
 FLUX = ("issdc", "hsrs", "noaa_cdr_mean", "noaa_cdr_monthly")
 SDIST = ("spice", "none")
-THERMAL = ("none", "isothermal")
+THERMAL = ("none", "isothermal", "issdc")
 SMOOTHING_EDGES = ("pair", "nan", "reflect")
 
 
@@ -36,7 +36,8 @@ class L2Config(Config):
             format (tab-separated nm, mW/cm^2/um at 1 AU; scaled by 1/sdist^2), or a per-band
             sequence in W/m^2/sr/um for bands 1..N, used as is (NO distance scaling).
         sdist: Sun distance for scaling the flux: "spice", "none" (1 AU) or a float in AU.
-        thermal: Thermal tail model, "none" or "isothermal" (one temperature per pixel).
+        thermal: Thermal tail model, "none", "isothermal" (one temperature per pixel) or "issdc" (ISSDC's NDI
+            temperature, `thermal.issdc_thermal_radiance`).
         thermal_eps: Emissivity, used both to estimate T and to remove eps * B(T).
         thermal_bands: (first, last) IIRS band numbers, 1-indexed and inclusive, whose mean
             brightness temperature is T.
@@ -113,8 +114,8 @@ L2Config.PRESETS = {
     "issdc": {
         "sdist": "none",
         "photom": "issdc",
-        "thermal": "isothermal",
-        "thermal_eps": 1.0,
+        "thermal": "issdc",
+        "thermal_bands": (226, 244),
         "clip_negative": True,
         "fill_nan": 0.0,
         "polish": "issdc",
