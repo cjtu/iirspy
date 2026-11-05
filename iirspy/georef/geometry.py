@@ -12,8 +12,10 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
+from iirspy import io
+from iirspy.georef import ancillary
 from iirspy.georef import backplanes as bp
-from iirspy.georef.georef import GeorefConfig, glt_from_loc, to_stereo
+from iirspy.georef.georef import MOON_RADIUS_M, GeorefConfig, glt_from_loc, to_stereo
 
 GRADES = ("pass", "warn", "fail")
 
@@ -65,6 +67,49 @@ class Geometry:
         qa_da = _dataset({"qa_bits": np.asarray(qa, "uint16")}, row0)["qa_bits"]
         return cls(
             sid, group, row0, method, quality, _loc=_dataset(loc, row0), _obs=_dataset(obs, row0), _qa=qa_da, **kw
+        )
+
+    @classmethod
+    def from_issdc(
+        cls, *, sid: str, group: str, fgeom, flabel, fspm, shape: tuple[int, int], row0: int = 0, work=None
+    ) -> "Geometry":
+        """Rebuild ISSDC's own geometry per the SIS: csv lon/lat, spm angles per line.
+
+        No registration and no DEM: the flat-Moon reference for comparing against "arosics" solves.
+        """
+        ny, nx = shape
+        scans = row0 + np.arange(ny)
+        tl = ancillary.get_line_times(flabel)[scans]
+        lon, lat, _ = ancillary.geom2grid(fgeom, xs=np.arange(nx), ys=scans, xyextent=(0, nx - 1, scans[0], scans[-1]))
+
+        def per_line(col):
+            return np.broadcast_to(ancillary.get_spm_interpolator(fspm, col)(tl)[:, None], (ny, nx))
+
+        zenith = 90 - np.abs(per_line("sun_elev"))
+        bands = {
+            "sun_azimuth": per_line("sun_az"),
+            "sun_zenith": zenith,
+            "sensor_zenith": np.zeros((ny, nx)),
+            "phase": per_line("phase"),
+            "facet_cos_i": np.cos(np.radians(zenith)),
+        }
+        loc = {"lon": lon, "lat": lat, "radius": np.full((ny, nx), MOON_RADIUS_M)}
+        nan = np.full((ny, nx), np.nan, "float32")
+        qa = bp.build_qa(loc, {"bands": {**dict.fromkeys(bp.OBS_NAMES, nan), **bands}}) | bp.qa_mask("no_topo")
+        return cls.from_arrays(
+            sid,
+            group,
+            row0,
+            "issdc",
+            loc,
+            bands,
+            qa,
+            quality("issdc", "warn"),
+            provenance=[{"step": "georef", "method": "issdc", "version": io.IIRSPY_VERSION}],
+            tags={
+                "GEOMETRY_BASIS": "Reproduces ISSDC geometry per the SIS: csv lon/lat, spm angles per line.",
+                "SENSOR_SOURCE": "spm",
+            },
         )
 
     @property

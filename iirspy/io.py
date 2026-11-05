@@ -5,6 +5,7 @@ extension, in ISSDC's `<subdir>/<YYYYMMDD>/` layout first, then flat, then by a 
 stream row blocks, so peak memory is one block whatever the scene size.
 """
 
+import functools
 import hashlib
 import os
 import re
@@ -16,6 +17,7 @@ import numpy as np
 import pandas as pd
 import pdr
 import rasterio
+import xarray as xr
 
 CHUNKSIZE = 128 * 2**20  # [B] dask y-chunk target (dask's array.chunk-size default; profiled fastest + lowest RAM)
 
@@ -248,6 +250,17 @@ def provenance(**extra) -> dict:
         "argv": list(sys.argv),
         **extra,
     }
+
+
+def xarray_keep_attrs(fn):
+    """Decorator: run `fn` with xarray's `keep_attrs=True` (older xarray drops attrs in arithmetic)."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with xr.set_options(keep_attrs=True):
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 def ncpu() -> int:

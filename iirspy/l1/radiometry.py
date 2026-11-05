@@ -4,7 +4,7 @@
 
 `calib` picks gain and offset: the ISSDC per-element LUT ("lut"), its per-band median ("lut_median", no
 cross-track structure), the median on an empirically corrected cube ("empirical", offset dropped when the scene's
-own dark was subtracted), or a G1 table `.npz` of per-epoch gains fitted on orbit.
+own dark was subtracted), or a calib LUT `.npz` (e.g. `iirspy_recal_e1g2_lut_coeff.npz`) of per-epoch gains fitted on orbit.
 
 Only the e1g2 LUT (1 ms) is a real calibration; every scene uses it with the gain scaled by 1 ms / exposure, which
 is what ISSDC's own nci L1 does (see `get_gain_offset`).
@@ -25,10 +25,10 @@ from iirspy.l1.config import CALIB
 
 
 def radiometry(dn, qub, calib="lut", *, calib_dir=DCALIB, has_shadow=False):
-    """`dn` -> radiance [W/m^2/sr/um] by `calib`: "lut", "lut_median", "empirical" or a G1 table path.
+    """`dn` -> radiance [W/m^2/sr/um] by `calib`: "lut", "lut_median", "empirical" or a calib LUT path.
 
-    `has_shadow` (empirical only) says the scene's residual dark was subtracted, so the LUT offset is dropped. A G1
-    table's provenance rides along as attrs and its bad-element mask as the `calib_bad` (band, x) coord.
+    `has_shadow` (empirical only) says the scene's residual dark was subtracted, so the LUT offset is dropped. A calib
+    LUT's provenance rides along as attrs and its bad-element mask as the `calib_bad` (band, x) coord.
     """
     if calib in (*CALIB, "empirical"):
         gain, offset = get_gain_offset(qub, calib_dir=calib_dir)
@@ -37,7 +37,7 @@ def radiometry(dn, qub, calib="lut", *, calib_dir=DCALIB, has_shadow=False):
         if calib == "empirical" and has_shadow:
             offset = 0.0
         return 10 * (dn * gain + offset)
-    gain, offset, bad, attrs = _read_g1_table(calib, pd.Timestamp(pdr.open(qub).metaget("start_date_time")))
+    gain, offset, bad, attrs = _read_calib_lut(calib, pd.Timestamp(pdr.open(qub).metaget("start_date_time")))
     rad = 10 * (dn * gain * (E1_EXPOSURE_MS / instrument.get_exposure_duration(qub)) + offset)  # e1 units, as the LUT
     rad.attrs.update(attrs)
     return rad if bad is None else rad.assign_coords(calib_bad=(("band", "x"), bad.values))
@@ -106,8 +106,8 @@ def get_gain_offset(fimg, denoise=False, gain_z=None, offset_z=None, calib_dir=D
     return gain, off
 
 
-def _read_g1_table(fnpz, t):
-    """Gain, offset, bad-pixel mask (or None) and provenance attrs of the G1 table epoch covering `t`.
+def _read_calib_lut(fnpz, t):
+    """Gain, offset, bad-pixel mask (or None) and provenance attrs of the calib LUT epoch covering `t`.
 
     The npz holds `gain` (n_epoch, 256, 250) and `offset` (n_epoch, 256) or (256,), both in the LUT's
     units [mW/cm^2/sr/um per DN] for e1 (1 ms; scaled by exposure like the LUT), `epoch_start` (n_epoch,) ISO
@@ -134,9 +134,9 @@ def _read_g1_table(fnpz, t):
         raise ValueError(f"{fnpz}: mask {z['mask'].shape} is not (n_epoch, 256, 250)")
     mask = xr.DataArray(z["mask"][e].astype(bool), coords=coords) if "mask" in z else None
     attrs = {
-        "calib_table": str(fnpz),
-        "calib_table_sha256": hashlib.sha256(Path(fnpz).read_bytes()).hexdigest(),
-        "calib_table_version": str(z["version"]) if "version" in z else "",
-        "calib_table_epoch": str(starts[e].date()),
+        "calib_lut": str(fnpz),
+        "calib_lut_sha256": hashlib.sha256(Path(fnpz).read_bytes()).hexdigest(),
+        "calib_lut_version": str(z["version"]) if "version" in z else "",
+        "calib_lut_epoch": str(starts[e].date()),
     }
     return gain, offset, mask, attrs

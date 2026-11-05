@@ -14,10 +14,6 @@
 
 ::: iirspy.l1.frames
 
-::: iirspy.l1.mask
-
-::: iirspy.l1.fill
-
 ::: iirspy.l2
 
 ::: iirspy.l2.config
@@ -35,7 +31,5 @@
 ::: iirspy.georef.geometry
 
 ::: iirspy.georef.ancillary
-
-::: iirspy.georef.issdc
 
 ::: iirspy.georef.arosics

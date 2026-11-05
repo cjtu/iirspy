@@ -32,7 +32,7 @@ class L1Config(Config):
             (diagnostic only when `empirical` is off: they are saved, not applied).
         calib: Radiometric scale when not `empirical`. "lut" is the per-element LUT gain/offset,
             "lut_median" the LUT's per-band median gain/offset (no cross-track structure), or a path
-            to a G1 table `.npz` (see `iirspy.l1.radiometry`). `empirical` already uses the median, so
+            to a calib LUT `.npz` (see `iirspy.l1.radiometry`). `empirical` already uses the median, so
             it needs "lut".
     """
 
@@ -51,7 +51,7 @@ class L1Config(Config):
         if isinstance(self.calib, Path):
             object.__setattr__(self, "calib", str(self.calib))
         if self.calib not in CALIB and not Path(self.calib).is_file():
-            raise ValueError(f"calib {self.calib!r}: not one of {CALIB} or an existing G1 table")
+            raise ValueError(f"calib {self.calib!r}: not one of {CALIB} or an existing calib LUT")
         if self.empirical and self.calib != "lut":
             raise ValueError(
                 f"empirical already uses the band-median LUT scale; calib must be 'lut', not {self.calib!r}"
@@ -69,7 +69,7 @@ L1Config.PRESETS = {
         "fill_frames": True,
     },
     "issdc": {},
-    "p0": {
+    "lut-only": {
         "calib": "lut_median",
         "empirical": False,
         "fix_frames": True,

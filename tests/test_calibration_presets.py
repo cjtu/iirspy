@@ -1,4 +1,4 @@
-"""Calibration presets: lut_median and G1-table calibration, HSRS flux with distance scaling, refl CLI configs."""
+"""Calibration presets: lut_median and calib LUT calibration, HSRS flux with distance scaling, refl CLI configs."""
 
 from types import SimpleNamespace
 
@@ -15,7 +15,7 @@ from iirspy.l2 import solar
 
 BASENAME = "20201202T1527488942"
 BANDS = [10, 18, 54]
-P0_KW = {"bad_pixel_mask": False, "fix_frames": False, "attach_empirical_frames": False}
+LUT_ONLY_KW = {"bad_pixel_mask": False, "fix_frames": False, "attach_empirical_frames": False}
 
 
 @pytest.fixture
@@ -44,40 +44,46 @@ def l0(tmp_path, monkeypatch):
 
 def _cal(l0, **kw):
     cfg = L1Config.resolve(
-        "iirspy", **{**P0_KW, "empirical": False, "interp_bands": None, "interp_spatial": False, **kw}
+        "iirspy", **{**LUT_ONLY_KW, "empirical": False, "interp_bands": None, "interp_spatial": False, **kw}
     )
     return calibrate(l0.img, cfg, qub=l0.qub)
 
 
-def test_p0_and_identity_g1_table(l0, tmp_path):
+def test_lut_median_and_identity_calib_lut(l0, tmp_path):
     obj, gain, offset = l0
     rad = _cal(obj, calib="lut_median")
     gm, om = gain.median("x"), offset.median("x")
     np.testing.assert_allclose(rad.values, (10 * (obj.img * gm + om)).values, rtol=1e-6)
 
     ngain = np.stack([np.broadcast_to(gm.values[:, None], (256, 250))] * 2)
-    ft = tmp_path / "g1.npz"
+    ft = tmp_path / "iirspy_recal_e1g2_lut_coeff.npz"
     np.savez(
         ft, gain=ngain * 5, offset=np.stack([om.values] * 2) * 5, epoch_start=["2019-01-01", "2020-12-03"], version="t"
     )  # epoch 2 starts after the scene: must not be picked
-    np.savez(ft.with_name("g1b.npz"), gain=ngain[:1], offset=om.values, epoch_start=["2019-01-01"], version="t")
-    rad_t = _cal(obj, calib=str(ft.with_name("g1b.npz")))
+    np.savez(
+        ft.with_name("iirspy_recal_e1g2_lut_coeff_b.npz"),
+        gain=ngain[:1],
+        offset=om.values,
+        epoch_start=["2019-01-01"],
+        version="t",
+    )
+    rad_t = _cal(obj, calib=str(ft.with_name("iirspy_recal_e1g2_lut_coeff_b.npz")))
     np.testing.assert_allclose(rad_t.values, rad.values, rtol=1e-6)
-    assert rad_t.attrs["calib_table_version"] == "t" and len(rad_t.attrs["calib_table_sha256"]) == 64
-    assert radiometry._read_g1_table(ft, pd.Timestamp("2020-12-02T15:27:48Z"))[3]["calib_table_epoch"] == "2019-01-01"
+    assert rad_t.attrs["calib_lut_version"] == "t" and len(rad_t.attrs["calib_lut_sha256"]) == 64
+    assert radiometry._read_calib_lut(ft, pd.Timestamp("2020-12-02T15:27:48Z"))[3]["calib_lut_epoch"] == "2019-01-01"
     with pytest.MonkeyPatch.context() as mp:  # table gain is in e1 (1 ms) units, scaled by exposure like the LUT
         mp.setattr(instrument, "get_exposure_duration", lambda *a: 10.0)
-        rad_e3 = _cal(obj, calib=str(ft.with_name("g1b.npz")))
+        rad_e3 = _cal(obj, calib=str(ft.with_name("iirspy_recal_e1g2_lut_coeff_b.npz")))
     np.testing.assert_allclose(rad_e3.values, (10 * (obj.img * gm / 10 + om)).values, rtol=1e-6)
     with pytest.raises(ValueError, match="precedes"):
         np.savez(ft, gain=ngain[:1], offset=om.values, epoch_start=["2021-01-01"])
         _cal(obj, calib=str(ft))
 
 
-def test_g1_table_mask_union_and_open_ended_warning(tmp_path):
+def test_calib_lut_mask_union_and_open_ended_warning(tmp_path):
     m = np.zeros((3, 256, 250), bool)
     m[:, 5, 7] = True
-    ft = tmp_path / "g1m.npz"
+    ft = tmp_path / "iirspy_recal_e1g2_lut_coeff_mask.npz"
     np.savez(
         ft,
         gain=np.ones((3, 256, 250)),
@@ -85,10 +91,10 @@ def test_g1_table_mask_union_and_open_ended_warning(tmp_path):
         mask=m,
         epoch_start=["2019-01-01", "2019-07-01", "2020-01-01"],
     )
-    tm = radiometry._read_g1_table(ft, pd.Timestamp("2020-01-02"))[2]
+    tm = radiometry._read_calib_lut(ft, pd.Timestamp("2020-01-02"))[2]
     assert bool((instrument.load_bad_pixel_mask() | tm)[5, 7])
     with pytest.warns(UserWarning, match="past the last epoch"):
-        radiometry._read_g1_table(ft, pd.Timestamp("2021-01-01"))
+        radiometry._read_calib_lut(ft, pd.Timestamp("2021-01-01"))
 
 
 def test_attach_empirical_frames_does_not_apply(l0, monkeypatch):
@@ -117,14 +123,14 @@ def test_refl_cli_resolves_configs(tmp_path):
         "--group",
         "equatorial",
         "--l1",
-        "p0",
+        "lut-only",
         "--l1-calib",
         "lut_median",
         "--l2",
         "l2d",
     ])
     c1, c2 = refl.l1_config(args), refl.l2_config(args)
-    assert c1 == L1Config.preset("p0") and c1.attach_empirical_frames and not c1.empirical
+    assert c1 == L1Config.preset("lut-only") and c1.attach_empirical_frames and not c1.empirical
     assert c2.flux == "hsrs" and c2.thermal == "isothermal" and not c2.clip_negative
     with pytest.raises(ValueError, match="empirical"):
         L1Config(empirical=True, calib="lut_median")

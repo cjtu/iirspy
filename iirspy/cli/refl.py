@@ -8,7 +8,7 @@ Writes full-band L1 radiance, L2 reflectance and the LOC/OBS/QA `Geometry` in ca
 (default) builds the geometry from the GCPs `iirs-georef-solve` produced and refuses to run on an unsolved scene;
 `--georef issdc` (default for the `issdc`/`issdc-nci` L2 presets) needs only the ISSDC bundle files.
 
-`--l1`/`--l2` pick an `L1Config`/`L2Config` preset (`p0` is the frozen L1 derivation basis); each
+`--l1`/`--l2` pick an `L1Config`/`L2Config` preset (`lut-only` is the LUT median gain with no empirical corrections); each
 `--l1-<field>`/`--l2-<field>` overrides one field, parsed as JSON else a string, e.g.
 `--l2-photom lunar_lambert --l2-thermal-bands [225,246] --l2-polish null`. The resolved L1 config is part of the L1
 cache key. `--l2 issdc-nci` runs the `issdc` L2 on ISSDC's own nci cube (unzipped into the archive tree on first use).

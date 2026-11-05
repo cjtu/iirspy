@@ -2,7 +2,7 @@
 Photometric normalization, the L2 step after the solar flux: I/F -> reflectance at the standard geometry.
 
 I/F depends on the illumination and view as well as on the surface. A photometric model r(i, e, g) describes that
-dependence, and this step moves every pixel onto i = 30, e = 0, g = 30 (`STANDARD_GEOMETRY`, the RELAB/M3 convention):
+dependence, and this step moves every pixel onto i = 30, e = 0, g = 30 (`STANDARD_GEOMETRY`, the M3 convention):
 
     reflectance = I/F * r(30, 0, 30) / r(i, e, g),    I/F = (rad - thermal) / (F_sun / π)
 
@@ -39,6 +39,7 @@ from iirspy.instrument import PKG_DATA
 
 M3_DATA = PKG_DATA.joinpath("m3")
 STANDARD_GEOMETRY = (30.0, 0.0, 30.0)  # (i, e, g) [deg]
+ISSDC_SCALE = 0.9018  # ISSDC NDI / apparent reflectance; constant over scenes, bands and geometry, not in the SIS
 
 
 def photometric(iof, inc, geom=None, *, photom="lambert", cos_min=0.0, min_lit=0.9):
@@ -125,9 +126,6 @@ def besse_m3_highland(cos_inc, cos_view, g, wl):
     """
     f = xr.DataArray(besse_phase(np.asarray(g), np.asarray(wl)), dims=("band", *getattr(g, "dims", ())))
     return lunar_lambert(cos_inc, cos_view, g) * f
-
-
-ISSDC_SCALE = 0.9018  # ISSDC NDI / apparent reflectance; constant over scenes, bands and geometry, not in the SIS
 
 
 def apparent(iof, cos_inc):

@@ -39,8 +39,7 @@ class L2Config(Config):
         thermal: Thermal tail model, "none", "isothermal" (one temperature per pixel) or "issdc" (ISSDC's NDI
             temperature, `thermal.issdc_thermal_radiance`).
         thermal_eps: Emissivity, used both to estimate T and to remove eps * B(T).
-        thermal_bands: (first, last) IIRS band numbers, 1-indexed and inclusive, whose mean
-            brightness temperature is T.
+        thermal_bands: (first, last) IIRS band numbers, 1-indexed and inclusive, that set T (see `thermal`).
         thermal_t_min: T [K] at or below which (or NaN) a pixel's T falls back to the flat-surface
             equilibrium temperature at its incidence (`thermal.flat_surface_temperature`).
         clip_negative: Zero negative reflectance after smoothing.

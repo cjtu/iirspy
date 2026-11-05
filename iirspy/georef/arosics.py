@@ -6,6 +6,10 @@ warps the merged result.
 
 The work dir doubles as the restart cache: a re-run reuses any chunk already solved at the same shape, so a rerun
 only re-solves what it did not finish.
+
+Scheffler, D., Hollstein, A., Diedrich, H., Segl, K., & Hostert, P. (2017). AROSICS: An Automated and Robust 
+Open-Source Image Co-Registration Software for Multi-Sensor Satellite Data. Remote Sensing, 9(7), 676. 
+https://doi.org/10.3390/rs9070676
 """
 
 from __future__ import annotations

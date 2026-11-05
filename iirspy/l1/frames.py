@@ -9,7 +9,8 @@ own, with nothing in the DN to say so:
 
 `build_table` finds all three from one pass over the raw cube and writes them to `<sid>_frames_offsets.csv`.
 `apply` moves every group onto true frames and masks the lost ones; `fill` rebuilds those from the pixel's own
-spectrum. ISSDC's nci carries the same defects uncorrected.
+spectrum. ISSDC's nci carries the same defects uncorrected. `fill_gaps` is the last L1 step: it calls `fill`, then
+bridges the short NaN runs left by masking (up to `BAND_GAP` bands, one column across x, `ROW_GAP` rows along y).
 """
 
 from __future__ import annotations
@@ -22,11 +23,13 @@ import zipfile
 from itertools import pairwise
 from pathlib import Path
 
+import dask.array as da
 import numpy as np
+import xarray as xr
 from scipy.ndimage import uniform_filter1d
 
 NG = 64
-K = 8  # max |offset| searched, lines (A12 20210723T2153218013 reaches +6)
+K = 8  # max |offset| searched, lines (20210723T2153218013 reaches +6)
 X0, X1, XBIN = 15, 235, 2  # cross-track span and binning of the matching rows
 HPX = 15  # cross-track high-pass window, px
 WIN = 1000  # pre-screen window, lines
@@ -37,6 +40,8 @@ REF_THERM = 50  # bands 201-204
 THERMAL = range(43, 63)  # bands 173-252 sit in thermal emission, matched against REF_THERM
 SKIP = {0, 1, 63}  # bands 1-8, 253-256: no usable signal
 MAX_BRIDGE = 9  # widest band span `fill` bridges: a hole of two neighbouring groups
+BAND_GAP = 9  # widest spectral hole `interpolate_na` bridges: two dropped groups (8 bands) in a row
+ROW_GAP = 5  # likewise along y: up to 4 lost frames in a row
 
 
 def retime(rad, qub, frame_offsets=None):
@@ -417,9 +422,6 @@ def apply(rad, fcsv):
     `rad` is any y-range of the full strip the table was built on: its y coords are raw line numbers. A lost frame
     (dropped, copied or black, or sourced from outside `rad`) becomes NaN.
     """
-    import dask.array as da
-    import xarray as xr
-
     lines = np.floor(rad.y.values).astype(np.int64)
     src = sources(fcsv, int(lines[-1]) + 1)[:, lines] - lines[0]
     src[(src < 0) | (src >= len(lines))] = -1
@@ -461,8 +463,6 @@ def fill(rad, lost, depth=6):
     >>> bool(np.allclose(fill(fixed, lost).values, truth))
     True
     """
-    import dask.array as da
-
     nums = rad.band.values
     rad = rad.transpose("band", "y", "x")
     data = rad.data if isinstance(rad.data, da.Array) else da.from_array(rad.data)
@@ -490,3 +490,45 @@ def fill(rad, lost, depth=6):
 
     filled = da.map_overlap(block, data, mask, depth={0: 0, 1: depth, 2: 0}, boundary="none", dtype=data.dtype)
     return rad.copy(data=filled)
+
+
+def fill_gaps(rad, *, fill_frames=False, interp_bands=None, interp_spatial=False):
+    """`rad` with lost frames rebuilt (`fill_frames`), then band gaps (`interp_bands` method) and x/y gaps filled.
+
+    The `lost_frames` coord is consumed.
+    """
+    lost = rad.lost_frames.values if "lost_frames" in rad.coords else None
+    out = rad.drop_vars("lost_frames", errors="ignore")
+    if fill_frames and lost is not None:
+        out = fill(out, lost)
+    if interp_bands is not None:
+        out = out.interpolate_na("band", max_gap=BAND_GAP, keep_attrs=True, method=interp_bands)
+    if interp_spatial:
+        # max_gap=2 in 0.5-based x coords spans exactly one missing column
+        out = out.interpolate_na("x", max_gap=2, keep_attrs=True, method="linear")
+        out = _interp_rows(out)
+    return out
+
+
+def _interp_rows(rad, max_gap=ROW_GAP):
+    """Linear fill along y of NaN runs shorter than `max_gap` rows, chunk by chunk (overlapped so a run on a chunk edge fills).
+
+    A 2-row run straddling the chunk edge fills; a run of `max_gap` rows or more stays NaN:
+
+    >>> a = np.ones((1, 12, 1)); a[0, 5:7] = np.nan; a[0, 8:] = np.nan
+    >>> r = xr.DataArray(da.from_array(a, chunks=(1, 6, 1)), dims=("band", "y", "x"))
+    >>> np.isnan(_interp_rows(r, 4).values[0, :, 0]).astype(int).tolist()
+    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1]
+    """
+    ax = rad.get_axis_num("y")
+    data = rad.data if isinstance(rad.data, da.Array) else da.from_array(rad.data)
+    data = data.rechunk({a: -1 for a in range(rad.ndim) if a != ax})
+
+    def block(b):
+        dims = [f"d{i}" for i in range(b.ndim)]
+        dims[ax] = "y"
+        return (
+            xr.DataArray(b, dims=dims, coords={"y": np.arange(b.shape[ax])}).interpolate_na("y", max_gap=max_gap).values
+        )
+
+    return rad.copy(data=data.map_overlap(block, depth={ax: max_gap}, boundary="none", dtype=data.dtype))

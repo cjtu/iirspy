@@ -34,7 +34,7 @@ Per-scene inputs are keyword arguments, not config fields: `empirical_kws` (for 
 The steps run in this order. Band numbers are IIRS band numbers, 1-indexed.
 
 0. ISSDC polish (`polish="issdc"` only, before thermal removal as in SIS Appendix L): in I/F, multiply by ISSDC's gain per band and column (`issdc_gsp.csv`), mirrored when longitude falls along the columns since ISSDC indexes it in its east-right image; then, with d_b = R_b − (R_b−1 + R_b+1)/2, replace R_b by (R_b−1 + R_b+1)/2 where |d_b| > 0.9 · rms(d_b−1, d_b, d_b+1). Needs `geom`, all 256 bands and all 250 columns.
-1. Thermal removal: `thermal`, `thermal_eps` (emissivity) and `thermal_bands`, the inclusive `(first, last)` band range whose mean brightness temperature is the pixel temperature. `thermal_eps * B(T)` is subtracted at every band, in radiance, so it precedes the flux division.
+1. Thermal removal: `thermal`, `thermal_eps` (emissivity) and `thermal_bands`, the inclusive `(first, last)` band range that sets the pixel temperature (`isothermal`: mean brightness temperature; `issdc`: the T whose Planck radiance has the same band mean as the data). `thermal_eps * B(T)` is subtracted at every band, in radiance, so it precedes the flux division.
 2. Solar flux: `flux` selects the solar spectrum and `sdist` scales it by the squared Sun distance.
 3. Photometric normalization to the standard geometry i = 30°, e = 0°, g = 30°: `photom` is the model r, and reflectance = I/F · r(30, 0, 30) / r(i, e, g). A model is a `photometry.MODELS` name (`none`, `lambert`, `lommel_seeliger`, `lunar_lambert`, `besse_m3_highland`, `apparent`, `issdc`) or any callable of `cos_inc`, `cos_view`, `g` and `wl`, passed by name; one that also takes `iof` returns the reflectance itself (Hapke-type models; `apparent`, I/F / cos_inc as in SIS Appendix K; and `issdc`, 0.9018 × apparent, as in ISSDC's NDI; the factor is not in the SIS). `besse_m3_highland` is fitted to M3 highlands, for comparison with M3, not an IIRS model. `use_slope_az` applies the geometry's facet terms when it has topo; `cos_min` floors both cosines; `min_lit` nulls pixels less lit than it.
 4. Polish: a per-band `polish` (anything but `"issdc"`) divides each band by a per-band factor, mapped by band number. Bands absent from the table get 1.0.
@@ -49,8 +49,10 @@ Table 2: L2 presets. Unlisted fields keep the `L2Config` defaults.
 | Preset | Non-default fields | Purpose |
 |---|---|---|
 | `iirspy` (default) | `thermal="isothermal"` | Sun distance from SPICE, isothermal thermal removal at emissivity 1 over bands 227–247, Lambert model at the standard geometry, terrain used when supplied. |
-| `issdc` | `sdist="none"`, `photom="issdc"`, `thermal="isothermal"`, `clip_negative=True`, `fill_nan=0`, `polish="issdc"`, `use_slope_az=False` | Reproduces the ISSDC L2 reflectance product (NDI). |
+| `issdc` | `sdist="none"`, `photom="issdc"`, `thermal="issdc"`, `thermal_bands=(226, 244)`, `clip_negative=True`, `fill_nan=0`, `polish="issdc"`, `use_slope_az=False` | Reproduces the ISSDC L2 reflectance product (NDI) from their L1 (NCI). |
 | `verma2022` | `sdist="none"`, `photom="apparent"`, `thermal="isothermal"`, `thermal_eps=0.95`, `thermal_bands=(225, 246)`, `clip_negative=True`, `polish="verma2022"`, `use_slope_az=False`, `smoothing=3` | The Verma et al. (2022) plugin's thermal correction, polish and smoothing. |
+
+How close the `issdc` preset gets, NCI -> NDI: 99% of pixels within 0.03% below 1.7 µm (the rest mostly where the spike rule fires differently, often in the edge columns); within about 0.3% at 1.7–2.5 µm; past 2.5 µm within a few percent, set by about 0.25 K of noise in ISSDC's temperature map that their delivered products do not carry.
 
 ### Geometry input
 

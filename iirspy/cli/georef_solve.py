@@ -36,7 +36,7 @@ from iirspy.georef.georef import scan_order_reversed
 from iirspy.iirs import L1
 from iirspy.instrument import PAN_BANDS
 from iirspy.io import ncpu
-from iirspy.l1.fill import BAND_GAP
+from iirspy.l1.frames import BAND_GAP
 
 log = logging.getLogger(__name__)
 

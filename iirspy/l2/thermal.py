@@ -1,13 +1,13 @@
-"""Thermal tail removal, the first L2 step: subtract the Moon's own emission before dividing by the solar flux.
+"""Thermal tail removal, the first L2 step: subtract the Moon's thermal emission before dividing by the solar flux.
 
-Past ~2.5 um the dayside Moon emits as well as reflects. Each pixel is taken as isothermal: T is its mean brightness
-temperature over `bands` (227-247, 4.5-4.9 um, where emission dominates), and eps * B(T, wl) is subtracted from
-every band, in radiance:
+Past ~2.5 um the dayside Moon emits as well as reflects. The ISSDC convention is to treat each pixel as isothermal: 
+T is its mean brightness temperature over `bands` (227-247, 4.5-4.9 um, where emission dominates). Then Planck
+blackbody radiance `B(T, wl)` is subtracted from every band, where `eps` is the emissivity:
 
     rad_reflected = rad - eps * B(T, wl)
 
-Where that T is not above `t_min` (shadow, noise), it falls back to the radiative-equilibrium temperature of a flat
-surface at the pixel's incidence (`flat_surface_temperature`): ~391 K at overhead sun, 0 K at the terminator.
+Where that T is not above `t_min` (due to shadow, noise), it falls back to the radiative-equilibrium temperature of 
+a flat surface at the pixel's incidence (`flat_surface_temperature`): ~391 K at noon at the equator.
 """
 
 import warnings
@@ -59,9 +59,9 @@ def thermal_radiance(rad, eps=1.0, bands=(227, 247), inc=None, sdist=1.0, t_min=
 def issdc_thermal_radiance(rad, bands=(226, 244)):
     """(B(T), T) as ISSDC's NDI: T solves mean(B(T, wl)) = mean(rad) over `bands`, emissivity 1.
 
-    Uses ISSDC's constants h = 6.626e-34, c = 2.998e8, k = 1.38e-23. Matches the NDI `tem` map with no offset
-    (median within 0.03 K on five scenes) up to a ~0.25 K pixel noise that no band of the radiance explains. Where
-    the band-mean radiance is not positive, T is NaN and nothing is subtracted.
+    Uses ISSDC's constants h = 6.626e-34, c = 2.998e8, k = 1.38e-23. Matches the NDI `tem` map on average; `tem`
+    carries ~0.25 K of extra pixel noise that cannot be rebuilt. Where the band-mean radiance is not positive, T is
+    NaN and nothing is subtracted.
     """
     h, c, k = 6.626e-34, 2.998e8, 1.38e-23
     tb = rad.sel(band=slice(*bands))

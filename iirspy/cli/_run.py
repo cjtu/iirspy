@@ -140,7 +140,7 @@ def build_l1(
     pure I/O nobody uses. None (default, what `iirspy.cli.refl` wants) writes every calibrated band.
 
     l1_config (an `L1Config`) replaces CALIBRATE_KWS and calibrate_kwargs outright (`iirs-compute-refl`);
-    its full resolved fields, plus a G1 table's content hash, are the cache key.
+    its full resolved fields, plus a calib LUT's content hash, are the cache key.
 
     calibrate_kwargs overrides CALIBRATE_KWS (e.g. interp_bands=None, exclude_wl=[...]) for a
     one-off reprocessing run without touching the production default -- it's part of the cache key

@@ -131,3 +131,10 @@ Currently works decently for equatorial L1 data using supplied GCPs but fails ne
 6. Write to geotif or envi img/hdr format
    - (Optional): Edit envi hdr / geotiff metadata to add wavelength band labels
 
+## Third-party software
+
+iirspy is MIT licensed. Georeferencing uses [AROSICS](https://github.com/GFZ/arosics) (Apache-2.0, GFZ Potsdam),
+installed separately; please cite Scheffler et al. (2017), [doi:10.3390/rs9070676](https://doi.org/10.3390/rs9070676).
+Data are read with [PDR](https://github.com/MillionConcepts/pdr) (BSD-3-Clause, Million Concepts); please cite
+Brown et al. (2024), [doi:10.21105/joss.07256](https://doi.org/10.21105/joss.07256).
+See [docs/acknowledgements.md](docs/acknowledgements.md) for details.

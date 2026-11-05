@@ -24,7 +24,7 @@ HAPKE = {
     "b": 0.3,
     "B0": 1.0,
     "h": 0.07,
-}  # single-term HG (b>0 backscatter), SHOE; no roughness. Provisional until calval.
+}  # single-term HG (b>0 backscatter), SHOE; no roughness. Provisional, needs testing.
 
 
 def _bands(src) -> tuple[np.ndarray, np.ndarray]:

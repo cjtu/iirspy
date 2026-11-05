@@ -2,7 +2,8 @@
 
 Everything here is a fixed property of the sensor or of one scene's label, read by every level. Calibration files are
 named by exposure + gain, e.g. `ch2_iirs_cal_e1g2_lut_coeff.csv`, under `DCALIB`; read packaged files through
-`PKG_DATA` (importlib.resources), never by path.
+`PKG_DATA` (importlib.resources), never by path. `mask_bad` is the L1 masking step: it nulls what these tables mark
+as unusable.
 """
 
 from importlib.resources import files
@@ -132,3 +133,25 @@ def get_saturation_radiance(fimg, calib_dir=DCALIB):
     flut = get_lut_file(fimg, "saturations_radiance", calib_dir)
     lut = np.loadtxt(flut, delimiter=",", usecols=2).astype("float32")  # band, wl, saturation [1000 mW/cm^2/sr/um]
     return RAD_NATIVE_SCALE * xr.DataArray(lut, coords={"band": np.arange(1, 257)}, name="saturation [W/m^2/sr/um]")
+
+
+def mask_bad(rad, qub, *, bad_pixel_mask=True, exclude_wl=None, calib_dir=DCALIB):
+    """`rad` with the OSF and invalid bands, `exclude_wl` (lo, hi) [nm] ranges, bad elements and saturation nulled.
+
+    Nulls are NaN, which `iirspy.l1.frames.fill_gaps` may later bridge. `bad_pixel_mask` True is the packaged mask,
+    unioned with a calib LUT's `calib_bad` coord when present; False is none; a (band, x) bool array is used as given.
+    """
+    bad_band = rad.band.isin((*OSF, *INVALID))
+    for lo, hi in exclude_wl or ():
+        bad_band = bad_band | ((rad.wl >= lo) & (rad.wl <= hi))
+    out = rad.where(~bad_band)
+    if bad_pixel_mask is True:
+        bad = load_bad_pixel_mask()
+        if "calib_bad" in out.coords:
+            bad = bad | out.calib_bad
+    else:
+        bad = bad_pixel_mask
+    if bad is not False:
+        out = out.where(~bad)
+    out = out.drop_vars("calib_bad", errors="ignore")
+    return out.where(out < get_saturation_radiance(qub, calib_dir))

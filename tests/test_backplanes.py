@@ -106,7 +106,7 @@ def test_write_read_loc_round_trip(tmp_path):
 
     f = bp.write_loc(tmp_path / "sid_loc.tif", loc, "20210101T0000000000")
     with rasterio.open(f) as src:
-        assert src.dtypes[0] == "float32"  # maintainer decision: f32 default, not f64
+        assert src.dtypes[0] == "float32"
         assert src.tags()["IIRS_PRODUCT"] == "LOC"
         assert "PRECISION" in src.tags()
         assert [src.descriptions[i] for i in range(3)] == ["longitude", "latitude", "radius"]
