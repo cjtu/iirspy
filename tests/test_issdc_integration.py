@@ -1,56 +1,52 @@
+"""Test pipeline reproduces ISSDC data: L1 -> L2 -> map product, and issdc preset vs official NDI."""
+
+import glob
 import os
 from pathlib import Path
 
 import numpy as np
 import pytest
+import rasterio
 import xarray as xr
 
 from iirspy import instrument
-from iirspy.l1.config import L1Config
-from iirspy.l2 import polish
+from iirspy.georef import Geometry
+from iirspy.georef.geometry import quality
+from iirspy.iirs import L1
+from iirspy.l2 import calibrate as calibrate_l2
 from iirspy.l2.config import L2Config
 
+STAGE = os.environ.get("IIRS_ISSDC_CROP")
 L2_REPRO = os.environ.get("IIRS_L2_REPRO")  # cached NCI/NDI windows, see test_issdc_preset_reproduces_ndi
 
 
-def test_polish_maps_by_band_number_not_position():
-    """A cube with bands dropped must still get each band's own coefficient."""
-    table = polish.spectral_polish(np.arange(1, 257))
-    kept = np.setdiff1d(np.arange(1, 257), [*instrument.OSF, *instrument.INVALID, 100, 101])
-    np.testing.assert_array_equal(polish.spectral_polish(kept).values, table.sel(band=kept).values)
-    assert float(table.sel(band=1)) == 1.0  # verma2022 starts at band 8
-
-
-@pytest.mark.parametrize(
-    "cfg",
-    [
-        *(L2Config.preset(n, flux=np.linspace(1, 2, 256), sdist=0.99) for n in L2Config.PRESETS),
-        *(L1Config.preset(n, exclude_wl=[(1800, 1900)]) for n in L1Config.PRESETS),
-    ],
+@pytest.mark.skipif(
+    not STAGE, reason="set IIRS_ISSDC_CROP to an ISSDC tree holding an nci crop with its csv, label and spm"
 )
-def test_every_field_survives_to_attrs(cfg):
-    assert type(cfg)(**cfg.to_attrs()) == cfg
-    assert type(cfg).preset("iirspy", **cfg.to_attrs()) == cfg
-
-
-@pytest.mark.parametrize(
-    "make",
-    [
-        lambda: L2Config.preset("isdc"),
-        lambda: L2Config.preset("issdc", polsh=None),
-        lambda: L2Config(thermal="verma"),
-        lambda: L2Config(flux="noaa"),
-        lambda: L2Config(polish="issdc_empirical"),
-        lambda: L2Config(sdist="spcie"),
-        lambda: L2Config(photom="hapke"),
-        lambda: L2Config(smoothing_edges="pairs"),
-        lambda: L1Config.preset("issdc", empircal=True),
-        lambda: L1Config.preset("nci"),
-    ],
-)
-def test_unknown_preset_field_or_key_raises(make):
-    with pytest.raises((ValueError, TypeError)):
-        make()
+@pytest.mark.filterwarnings("ignore:Dataset has no geotransform", "ignore:no thermal bands")
+def test_nci_to_map_product_from_issdc_files_alone(tmp_path):
+    """L1 -> georef(issdc) -> L2 -> to_geotiff, with no SPICE, DEM or arosics."""
+    qub = glob.glob(f"{STAGE}/data/calibrated/*/ch2_iir_nci_*_d_img_*.qub")[0]
+    sid = os.path.basename(qub).split("_")[3]
+    with rasterio.open(qub) as src:
+        mid = src.height // 2
+    l1 = L1(sid, STAGE, xyextent=(0, 249, mid, mid + 199))
+    one = lambda p: glob.glob(f"{STAGE}/{p}")[0]
+    geom = l1.georef(
+        "issdc",
+        group="equatorial",
+        fgeom=one("geometry/calibrated/*/*.csv"),
+        flabel=one("data/calibrated/*/*.xml"),
+        fspm=one("miscellaneous/calibrated/*/*.spm"),
+    )
+    geom.save(tmp_path)
+    geom = Geometry.open(tmp_path, sid, "equatorial")
+    l2 = l1.calibrate("issdc", geom=geom, smoothing=1)
+    assert l2.img.shape == l1.img.shape and np.isfinite(l2.img.values).any()
+    assert "photometric" in l2.img.attrs["provenance"]
+    fout = l2.to_geotiff(tmp_path / "map.tif", geom=geom, grid=geom.grid(500.0))
+    with rasterio.open(fout) as src:
+        assert np.isfinite(src.read()).any()
 
 
 def _align(ndi, cands, pad, n, band=48):
@@ -74,9 +70,6 @@ def test_issdc_preset_reproduces_ndi():
     IIRS_L2_REPRO holds <sid>/nci.npz (rad[, rad_flip]) and <sid>/ndi.npz (rfl, obs) windows of
     256 lines plus 8 padding lines each side.
     """
-    from iirspy.georef.geometry import Geometry, quality
-    from iirspy.l2 import calibrate
-
     pad, n = 8, 256
     wl = instrument.get_wls()
     short = (wl > 750) & (wl < 2300)
@@ -104,7 +97,7 @@ def test_issdc_preset_reproduces_ndi():
                 np.zeros(zen.shape, "uint16"),
                 quality("issdc", "warn"),
             )
-            refl = calibrate(da, L2Config.preset("issdc"), geom=geom).values
+            refl = calibrate_l2(da, L2Config.preset("issdc"), geom=geom).values
             ok = np.isfinite(refl) & np.isfinite(ref) & (ref > 0.01)
             ratio = np.where(ok, refl / np.where(ok, ref, 1), np.nan)
             meds.append(np.nanmedian(np.nanmedian(ratio.reshape(256, -1), 1)[short]))

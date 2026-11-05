@@ -1,3 +1,10 @@
+"""Architecture guard: imports must point down the layers, never up.
+
+Layers, lowest first: base modules (config, instrument, io) -> l1 -> georef -> l2 -> cli.
+A lower layer importing a higher one risks circular imports and tangled dependencies, so this
+statically parses every module under iirspy/ and fails on any upward import.
+"""
+
 import ast
 from pathlib import Path
 

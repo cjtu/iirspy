@@ -1,12 +1,12 @@
 """Thermal tail removal, the first L2 step: subtract the Moon's thermal emission before dividing by the solar flux.
 
-Past ~2.5 um the dayside Moon emits as well as reflects. The ISSDC convention is to treat each pixel as isothermal: 
+Past ~2.5 um the dayside Moon emits as well as reflects. The ISSDC convention is to treat each pixel as isothermal:
 T is its mean brightness temperature over `bands` (227-247, 4.5-4.9 um, where emission dominates). Then Planck
 blackbody radiance `B(T, wl)` is subtracted from every band, where `eps` is the emissivity:
 
     rad_reflected = rad - eps * B(T, wl)
 
-Where that T is not above `t_min` (due to shadow, noise), it falls back to the radiative-equilibrium temperature of 
+Where that T is not above `t_min` (due to shadow, noise), it falls back to the radiative-equilibrium temperature of
 a flat surface at the pixel's incidence (`flat_surface_temperature`): ~391 K at noon at the equator.
 """
 

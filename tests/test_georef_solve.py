@@ -1,3 +1,5 @@
+"""Scene solve: consensus reseeding and drift handling of chunk offsets, L1 cache reuse, product landing."""
+
 import json
 from pathlib import Path
 from types import SimpleNamespace

@@ -1,3 +1,5 @@
+"""L2 photometric correction: illumination angles, topographic slope/aspect, model limits and grazing-angle bounds."""
+
 import json
 from pathlib import Path
 
@@ -134,9 +136,6 @@ def test_photom_model_changes_the_answer_and_takes_a_callable():
     np.testing.assert_allclose(lam.values, same.values)
 
 
-COS_85 = np.cos(np.radians(85.0))
-
-
 def test_cos_min_floors_grazing_incidence_without_changing_default():
     """cos_min=0 is a no-op; a nonzero floor caps the I/F of a near-terminator pixel."""
     rad = _synthetic_l1()  # solar_inc=80 deg everywhere -> cos_inc ~ 0.17, well above any floor here
@@ -167,6 +166,7 @@ def _cos_view_dependent_photom(cos_inc, cos_view):
 
 def test_cos_min_floors_grazing_emission_independently_of_incidence():
     """A steep facet drives cos_view (emission cosine) toward 0 under nadir view; cos_min clamps it too."""
+    COS_85 = np.cos(np.radians(85.0))
     rad = _synthetic_l1()
     rad["solar_inc"] = ("y", np.full(rad.sizes["y"], 10.0))  # near-overhead sun: cos_inc stays high
     flat = xr.zeros_like(rad.isel(band=0, drop=True))
@@ -183,6 +183,7 @@ def test_cos_min_floors_grazing_emission_independently_of_incidence():
 
 def test_grazing_incidence_and_emission_together_stay_bounded():
     """Besse's rule: clamping incidence and emission at 85 deg keeps I/F from blowing up either way."""
+    COS_85 = np.cos(np.radians(85.0))
     rad = _synthetic_l1()
     rad["solar_inc"] = ("y", np.full(rad.sizes["y"], 89.5))  # grazing incidence
     flat = xr.zeros_like(rad.isel(band=0, drop=True))

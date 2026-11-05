@@ -1,7 +1,8 @@
 """L0 -> L1 pipeline: raw digital numbers to radiance [W/m^2/sr/um]. `L0.calibrate` calls it.
 
-Each step is switched by `L1Config` fields and appends {"step", "method"} to the JSON list `attrs["provenance"]`,
-which L2 continues. The step modules take plain arguments; only this module reads the config. In order:
+Each step is configured by `L1Config` fields and appends {"step", "method"} to the JSON `attrs["provenance"]`.
+
+Steps, in order:
 
 1. Residual dark: `empirical.residual_dark` (scene shadow rows; also attaches the empirical flat/smile frames)
 2. Flat and smile: `empirical` (applied here in `calibrate`)
@@ -9,6 +10,8 @@ which L2 continues. The step modules take plain arguments; only this module read
 4. Re-time frames: `frames.retime`
 5. Mask bad bands, elements and saturation: `instrument.mask_bad`
 6. Fill lost frames and short gaps: `frames.fill_gaps`
+
+Takes a DN cube (band, y, x) and returns a radiance cube of the same shape, both `xarray.DataArray`.
 """
 
 import json

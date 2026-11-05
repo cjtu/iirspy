@@ -1,15 +1,18 @@
 """L1 -> L2 pipeline: radiance [W/m^2/sr/um] to reflectance. `L1.calibrate` calls it.
 
-Each step is switched by `L2Config` fields and appends {"step", "method"} to the JSON list `attrs["provenance"]`,
-continuing L1's. The step modules take plain arguments; only this module reads the config. In order:
+Each step is configured by `L2Config` fields and appends {"step", "method"} to the JSON `attrs["provenance"]`.
 
-1. ISSDC polish (`polish="issdc"` only): `polish.issdc_polish`
+Steps, in order:
+
+1. ISSDC polish: `polish.issdc_polish`
 2. Thermal removal: `thermal.subtract`
 3. Solar flux division, radiance to I/F: `solar.divide_flux`
 4. Photometric normalization to the standard geometry: `photometry.photometric`
-5. Spectral polish (any `polish` but "issdc"): `polish.spectral_polish`
+5. Spectral polish: `polish.spectral_polish`
 6. Smoothing: `polish.moving_average`
 7. Clip negatives and fill NaN: here in `calibrate`
+
+Takes a radiance cube (band, y, x) and returns a reflectance cube of the same shape, both `xarray.DataArray`.
 """
 
 import json
