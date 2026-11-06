@@ -1,11 +1,12 @@
 """IIRS instrument constants and packaged tables: band wavelengths, bad bands and elements, exposure/gain, LUTs.
 
 Everything here is a fixed property of the sensor or of one scene's label, read by every level. Calibration files are
-named by exposure + gain, e.g. `ch2_iirs_cal_e1g2_lut_coeff.csv`, under `DCALIB`; read packaged files through
-`PKG_DATA` (importlib.resources), never by path. `mask_bad` is the L1 masking step: it nulls what these tables mark
+named by exposure + gain, e.g. `ch2_iirs_cal_e1g2_lut_coeff.csv`, under `PKG_DATA/iir/calibration`; read packaged files through
+`PKG_DATA` (importlib.resources), never by path, with `read_table`; `calib_dir` is the data root those tables are read from. `mask_bad` is the L1 masking step: it nulls what these tables mark
 as unusable.
 """
 
+import zipfile
 from importlib.resources import files
 from pathlib import Path
 
@@ -15,9 +16,7 @@ import pdr
 import xarray as xr
 
 PKG_DATA = files("iirspy").joinpath("data")
-DCALIB = PKG_DATA.joinpath("iir/calibration")
 FBADBANDS = str(PKG_DATA.joinpath("iirs_bad_bands.csv"))
-FBADPIXELS = str(PKG_DATA.joinpath("bad_pixel_mask.csv"))
 FWAVELENGTHS = str(PKG_DATA.joinpath("iir/miscellaneous/ch2_iirs_wavelength.csv"))
 OSF = (*range(29, 35), *range(69, 76), *range(162, 172))  # Order sorting filters
 INVALID = (*range(1, 7), *range(252, 257))  # Invalid band list
@@ -53,9 +52,18 @@ def load_bad_bands(fbad_bands=FBADBANDS):
     return ~pd.read_csv(fbad_bands, index_col=0).astype(bool)
 
 
-def load_bad_pixel_mask(fbad_pixels=FBADPIXELS):
+def read_table(name, member=None, *, root=PKG_DATA):
+    """A headerless comma-separated table `name` under `root` as a 2-D array, or its `member` if `name` is a zip."""
+    path = str(Path(str(root)) / name)
+    if member is None:
+        return np.loadtxt(path, delimiter=",", ndmin=2)
+    with zipfile.ZipFile(path) as zf, zf.open(member) as f:
+        return np.loadtxt(f, delimiter=",", ndmin=2)
+
+
+def load_bad_pixel_mask(calib_dir=PKG_DATA):
     """Return the per-detector-element bad pixel mask as a (band, x) DataArray, True where bad."""
-    mask = pd.read_csv(fbad_pixels, header=None).values.astype(bool)
+    mask = read_table("bad_pixel_mask.csv", root=calib_dir).astype(bool)
     coords = {"band": 1 + np.arange(0, 256), "x": 0.5 + np.arange(250)}
     return xr.DataArray(mask, coords=coords, name="bad_pixel")
 
@@ -86,37 +94,9 @@ def get_bad_bands(fimg, buffer=0):
     return bad_buffered  # array of True where band is bad
 
 
-def get_lut_file(fimg, lut_type="lut_coeff", calib_dir=DCALIB):
-    """
-    Locate and return the correct LUT file for the given image.
-
-    Parameters
-    ----------
-    fimg : str
-        Path to the IIRS image file.
-    lut_type : str
-        Type of LUT to find (default: "lut_coeff").
-        Options: "lut_coeff", "saturations_radiance"
-    calib_dir : str or Path
-        Directory containing calibration LUT files.
-    ext : str
-        File extension to look for (default: "csv").
-        Options: "csv", "xml"
-
-    Returns
-    -------
-    Path to the LUT file as a string.
-
-    Raises
-    ------
-    FileNotFoundError if the LUT file is not found.
-    """
-    exp_gain = get_exposure_gain(fimg)  # e.g., "e1g2"
-    pattern = f"ch2_iirs_cal_{exp_gain}_{lut_type}.csv"
-    flut = Path(calib_dir) / pattern
-    if flut.exists():
-        return str(flut)
-    raise FileNotFoundError(f"IIRS calibration file {flut} not found.")
+def scene_start(fimg):
+    """The scene's start time from its label."""
+    return pd.Timestamp(pdr.open(fimg).metaget("start_date_time"))
 
 
 def get_exposure_duration(fimg):
@@ -128,14 +108,14 @@ def get_exposure_duration(fimg):
     return float(pdr.open(fimg).metaget("isda:exposure_duration"))
 
 
-def get_saturation_radiance(fimg, calib_dir=DCALIB):
+def get_saturation_radiance(fimg, calib_dir=PKG_DATA):
     """Return IIRS saturation radiance file as 1D DataArray along band."""
-    flut = get_lut_file(fimg, "saturations_radiance", calib_dir)
-    lut = np.loadtxt(flut, delimiter=",", usecols=2).astype("float32")  # band, wl, saturation [1000 mW/cm^2/sr/um]
+    lut = read_table(f"iir/calibration/ch2_iirs_cal_{get_exposure_gain(fimg)}_saturations_radiance.csv", root=calib_dir)
+    lut = lut[:, 2].astype("float32")  # band, wl, saturation [1000 mW/cm^2/sr/um]
     return RAD_NATIVE_SCALE * xr.DataArray(lut, coords={"band": np.arange(1, 257)}, name="saturation [W/m^2/sr/um]")
 
 
-def mask_bad(rad, qub, *, bad_pixel_mask=True, exclude_wl=None, calib_dir=DCALIB):
+def mask_bad(rad, qub, *, bad_pixel_mask=True, exclude_wl=None, calib_dir=PKG_DATA):
     """`rad` with the OSF and invalid bands, `exclude_wl` (lo, hi) [nm] ranges, bad elements and saturation nulled.
 
     Nulls are NaN, which `iirspy.l1.frames.fill_gaps` may later bridge. `bad_pixel_mask` True is the packaged mask,
@@ -145,13 +125,15 @@ def mask_bad(rad, qub, *, bad_pixel_mask=True, exclude_wl=None, calib_dir=DCALIB
     for lo, hi in exclude_wl or ():
         bad_band = bad_band | ((rad.wl >= lo) & (rad.wl <= hi))
     out = rad.where(~bad_band)
-    if bad_pixel_mask is True:
-        bad = load_bad_pixel_mask()
+    if "keystone_bad" in out.coords:  # flags already moved with the keystone shift
+        bad = out.keystone_bad
+    elif bad_pixel_mask is True:
+        bad = load_bad_pixel_mask(calib_dir)
         if "calib_bad" in out.coords:
             bad = bad | out.calib_bad
     else:
         bad = bad_pixel_mask
     if bad is not False:
         out = out.where(~bad)
-    out = out.drop_vars("calib_bad", errors="ignore")
+    out = out.drop_vars(["calib_bad", "keystone_bad"], errors="ignore")
     return out.where(out < get_saturation_radiance(qub, calib_dir))

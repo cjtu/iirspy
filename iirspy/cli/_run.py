@@ -33,7 +33,13 @@ from iirspy.l2.config import L2Config
 
 log = logging.getLogger(__name__)
 
-CALIBRATE_KWS = {"empirical": True, "interp_bands": "linear", "interp_spatial": True, "bad_pixel_mask": True}
+CALIBRATE_KWS = {
+    "dark": "empirical",
+    "flat": "empirical",
+    "interp_bands": "linear",
+    "interp_spatial": True,
+    "bad_pixel_mask": True,
+}
 
 
 @dataclass(frozen=True)

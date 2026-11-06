@@ -28,7 +28,6 @@ from scipy.stats import norm
 
 from iirspy import instrument
 from iirspy.instrument import PAN_BANDS
-from iirspy.l1.radiometry import load_reference_flat
 
 FLAT_SMILE_MIN = 0.2
 
@@ -67,24 +66,24 @@ SMILE_STRIDE = 8  # along-track subsample stride for the smile estimate
 MAD_TO_SIGMA = 1.4826
 
 
-def residual_dark(dn, qub, *, subtract=True, attach_snr=True, calib_dir=instrument.DCALIB, **kws):
-    """(`dn` less the scene's residual dark, derivation notes): the first L1 step.
+def derive_frames(dn, fallback_flat, *, attach_snr=True, **kws):
+    """(`dn` with the scene's empirical dark, flat and smile attached, derivation notes): derives, applies nothing.
 
-    The empirical frames (`empirical_frames(dn, ref_flat, **kws)`) ride along as `empirical_*` (band, x) coords and
-    the notes as `attrs["empirical_notes"]`. The dark is subtracted, and the broadband SNR attached as `snr` with
-    `attach_snr`, only with `subtract` and a shadow in the scene; otherwise `dn` is unchanged.
+    The frames of `empirical_frames(dn, fallback_flat, **kws)` ride along as `empirical_*` (band, x) coords and the
+    notes as `attrs["empirical_notes"]`; `radiometry.subtract_dark` and `divide_flat` apply them. The broadband SNR is
+    attached as `snr` with `attach_snr` when the scene has a shadow. `fallback_flat` (band, x), in practice
+    `radiometry.flatfield_v1`, stands in where a scene has no qualifying flat region of its own.
     """
-    dark, flat, smile, snr, notes = empirical_frames(dn, load_reference_flat(qub, calib_dir=calib_dir), **kws)
-    out = dn - dark if subtract and snr is not None else dn.copy()
+    dark, flat, smile, snr, notes = empirical_frames(dn, fallback_flat, **kws)
     extra = {"empirical_flat_unmasked": flat.attrs.get("unmasked")}
     extra |= {f"empirical_flat_bin{i}": f for i, f in enumerate(flat.attrs.get("bins", []))}
-    out = out.assign_coords(
+    out = dn.assign_coords(
         empirical_dark=(("band", "x"), dark.broadcast_like(flat).values),  # (x,)-only zeros when no shadow was found
         empirical_flat=(("band", "x"), flat.values),
         empirical_smile=(("band", "x"), smile.values),
         **{k: (("band", "x"), v.values) for k, v in extra.items() if v is not None},
     )
-    if subtract and snr is not None and attach_snr:
+    if snr is not None and attach_snr:
         out = out.assign_coords(snr=(("y", "x"), snr.values))
     out.attrs["empirical_notes"] = json.dumps(notes)
     return out, notes
@@ -347,7 +346,7 @@ def dn_bins(row_bright, lit, nbins=N_DN_BINS):
     return [(float(lo), float(hi)) for lo, hi in zip(edges[:-1], [*edges[1:-1], np.inf], strict=True)]
 
 
-def build_flat(img, dark, rs, lit, row_bright, ref_flat=None):
+def build_flat(img, dark, rs, lit, row_bright, fallback_flat=None):
     """
     Median-composite sensor flat (band, x) over the flattest region of each brightness bin.
 
@@ -359,7 +358,7 @@ def build_flat(img, dark, rs, lit, row_bright, ref_flat=None):
     are scattered within that span, not a solid block.
     """
     bad = on_bands(instrument.load_bad_pixel_mask(), img)
-    ref_flat = None if ref_flat is None else on_bands(ref_flat, img)
+    fallback_flat = None if fallback_flat is None else on_bands(fallback_flat, img)
     flats, runs_used, levels = [], {}, []
     for lo, hi in dn_bins(row_bright, lit):
         rows = flattest_rows(rs, lit & (row_bright >= lo) & (row_bright < hi))
@@ -374,11 +373,11 @@ def build_flat(img, dark, rs, lit, row_bright, ref_flat=None):
         flat = unmasked.where(~bad)
         # unmasked composite + per-bin flats ride along as attrs; `residual_dark` attaches them as frames
         flat.attrs.update(unmasked=unmasked, bins=[f.astype("float32") for f in flats])
-        if ref_flat is not None:
-            emp_notes["flat_ref_rms"] = _flat_rms(flat, ref_flat)
-    elif ref_flat is not None:
+        if fallback_flat is not None:
+            emp_notes["flat_ref_rms"] = _flat_rms(flat, fallback_flat)
+    elif fallback_flat is not None:
         warnings.warn("no in-scene flat region; falling back to packaged reference flat", UserWarning, stacklevel=2)
-        flat = ref_flat.where(~bad).astype("float32")
+        flat = fallback_flat.where(~bad).astype("float32")
         emp_notes["flat_fallback"] = True
     else:
         warnings.warn("no in-scene flat region and no packaged reference flat; using flat=1", UserWarning, stacklevel=2)
@@ -415,7 +414,7 @@ def estimate_smile(img, dark, flat, lit, stride=SMILE_STRIDE):
     return smile.astype("float32"), {"smile_fallback": False}
 
 
-def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, apply_smile=False):
+def empirical_frames(img, fallback_flat=None, dark_yrange=None, flat_yrange=None, apply_smile=False):
     """
     Derive the empirical correction frames from a raw DN cube (band, y, x).
 
@@ -430,7 +429,7 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
       emp_notes : JSON-serializable provenance dict (dark rows/source/threshold, flat runs,
               fallbacks fired, per-scene-vs-reference flat RMS) stored in the product's attrs.
 
-    ref_flat is the packaged reference flat (band, x) used as the flat fallback and the RMS
+    fallback_flat is the packaged multi-scene flat (band, x) used as the flat fallback and the RMS
     diagnostic baseline; pass None to disable both. dark_yrange / flat_yrange are optional
     (ylow, yhigh) positional row ranges into the (possibly extent-cropped) cube that override the
     auto dark-row / flat-region detection with user-picked rows. apply_smile (default False) toggles
@@ -504,10 +503,10 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
         emp_notes.update(
             flat_runs={"user": [a, b]},
             flat_fallback=False,
-            flat_ref_rms=_flat_rms(flat, on_bands(ref_flat, img)) if ref_flat is not None else None,
+            flat_ref_rms=_flat_rms(flat, on_bands(fallback_flat, img)) if fallback_flat is not None else None,
         )
     else:
-        flat, flat_notes = build_flat(img, dark, rs, lit, row_bright, ref_flat)
+        flat, flat_notes = build_flat(img, dark, rs, lit, row_bright, fallback_flat)
         emp_notes.update(flat_notes)
 
     if apply_smile:

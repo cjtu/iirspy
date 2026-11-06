@@ -200,7 +200,12 @@ def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeyp
             "scan0": 0,
             "lat_range": [10.0, 20.0],
             "bands": [1, 2],
-            "calibrate_kwargs": {**_run.CALIBRATE_KWS, "frame_offsets": str(ffr), "empirical": True},
+            "calibrate_kwargs": {
+                **_run.CALIBRATE_KWS,
+                "frame_offsets": str(ffr),
+                "dark": "empirical",
+                "flat": "empirical",
+            },
             "frames": table_key(ffr),
             "crop_geom": "label",
         })
@@ -217,7 +222,7 @@ def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeyp
 
     # Different calibrate_kwargs to the same path -> cache miss, must not return the stale cube.
     with pytest.raises(RuntimeError, match="rebuild-attempted"):
-        _run.build_l1(job, (10.0, 20.0), [1, 2], ftif, calibrate_kwargs={"empirical": False})
+        _run.build_l1(job, (10.0, 20.0), [1, 2], ftif, calibrate_kwargs={"dark": "issdc_lut_median", "flat": None})
 
     # A different frame table -> cache miss.
     ffr.write_text("kind,line,group,bands,value\ndrop,5,3,13-16,1\n")

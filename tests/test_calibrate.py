@@ -29,7 +29,7 @@ def l0(tmp_path, monkeypatch):
     sat = xr.DataArray(np.full(256, 1e9), coords={"band": coords["band"]})
     monkeypatch.setattr(radiometry, "get_gain_offset", lambda *a, **k: (gain, offset))
     monkeypatch.setattr(instrument, "get_saturation_radiance", lambda *a, **k: sat)
-    monkeypatch.setattr(radiometry.pdr, "open", lambda f: SimpleNamespace(metaget=lambda k: "2020-12-02T15:27:48"))
+    monkeypatch.setattr(instrument.pdr, "open", lambda f: SimpleNamespace(metaget=lambda k: "2020-12-02T15:27:48"))
     monkeypatch.setattr(instrument, "get_exposure_duration", lambda *a: 1.0)
     dn = xr.DataArray(
         rng.uniform(1, 100, (3, 6, 250)).astype("float32"),
@@ -46,14 +46,55 @@ def l0(tmp_path, monkeypatch):
 
 def _cal(l0, **kw):
     cfg = L1Config.resolve(
-        "iirspy", **{**LUT_ONLY_KW, "empirical": False, "interp_bands": None, "interp_spatial": False, **kw}
+        "iirspy",
+        **{
+            **LUT_ONLY_KW,
+            "dark": "issdc_lut_median",
+            "flat": None,
+            "interp_bands": None,
+            "interp_spatial": False,
+            **kw,
+        },
     )
     return calibrate(l0.img, cfg, qub=l0.qub)
 
 
+def test_keystone_shift_and_edge_copy():
+    ramp = np.broadcast_to(np.arange(250.0), (256, 2, 250)).copy()
+    rad = xr.DataArray(ramp, dims=("band", "y", "x"), coords={"band": 1 + np.arange(256)})
+    shifted = radiometry.keystone(rad, shift="simple").values
+    q = instrument.read_table(radiometry.KEYSTONE_CSV)[:, 0] / 32
+    # a = -0.75 is not exact on a ramp, hence the tolerance
+    np.testing.assert_allclose(shifted[:, 0, 10:240] - np.arange(10, 240), q[:, None] * np.ones(230), atol=0.06)
+    assert (shifted[..., :2] != shifted[..., 2:3]).any()
+    only_edges = radiometry.edge_copy(rad).values
+    assert (only_edges[..., 2:248] == ramp[..., 2:248]).all()
+    assert (only_edges[..., :2] == ramp[..., 2:3]).all() and (only_edges[..., 248:] == ramp[..., 247:248]).all()
+
+
+def test_weighted_keystone_keeps_a_hot_element_out_of_its_neighbours():
+    clean = np.broadcast_to(np.arange(250.0), (256, 2, 250)).copy()
+    hot = clean.copy()
+    hot[:, :, 100] = 1e6
+    mk = lambda a: xr.DataArray(a, dims=("band", "y", "x"), coords={"band": 1 + np.arange(256)})
+    bad = np.zeros((256, 250), bool)
+    bad[:, 100] = True
+    bad = xr.DataArray(bad, dims=("band", "x"))
+    ref = radiometry.keystone(mk(clean), shift="simple").values
+    around = np.r_[96:99, 102:105]
+    simple = radiometry.keystone(mk(hot), shift="simple").values
+    weighted = radiometry.keystone(mk(hot), shift="weighted", bad_pixel_mask=bad)
+    assert (
+        np.abs(weighted.values[:, 0, around] - ref[:, 0, around]).max()
+        < 0.5
+        < np.abs(simple[:, 0, around] - ref[:, 0, around]).max()
+    )
+    assert weighted.keystone_bad.sum("x").min() >= 1 and weighted.keystone_bad.sum("x").max() <= 2
+
+
 def test_lut_median_and_identity_calib_lut(l0, tmp_path):
     obj, gain, offset = l0
-    rad = _cal(obj, calib="lut_median")
+    rad = _cal(obj)
     gm, om = gain.median("x"), offset.median("x")
     np.testing.assert_allclose(rad.values, (10 * (obj.img * gm + om)).values, rtol=1e-6)
 
@@ -69,17 +110,17 @@ def test_lut_median_and_identity_calib_lut(l0, tmp_path):
         epoch_start=["2019-01-01"],
         version="t",
     )
-    rad_t = _cal(obj, calib=str(ft.with_name("iirspy_recal_e1g2_lut_coeff_b.npz")))
+    rad_t = _cal(obj, calib=str(ft.with_name("iirspy_recal_e1g2_lut_coeff_b.npz")), dark=None, flat=None)
     np.testing.assert_allclose(rad_t.values, rad.values, rtol=1e-6)
     assert rad_t.attrs["calib_lut_version"] == "t" and len(rad_t.attrs["calib_lut_sha256"]) == 64
     assert radiometry._read_calib_lut(ft, pd.Timestamp("2020-12-02T15:27:48Z"))[3]["calib_lut_epoch"] == "2019-01-01"
     with pytest.MonkeyPatch.context() as mp:  # table gain is in e1 (1 ms) units, scaled by exposure like the LUT
         mp.setattr(instrument, "get_exposure_duration", lambda *a: 10.0)
-        rad_e3 = _cal(obj, calib=str(ft.with_name("iirspy_recal_e1g2_lut_coeff_b.npz")))
+        rad_e3 = _cal(obj, calib=str(ft.with_name("iirspy_recal_e1g2_lut_coeff_b.npz")), dark=None, flat=None)
     np.testing.assert_allclose(rad_e3.values, (10 * (obj.img * gm / 10 + om)).values, rtol=1e-6)
     with pytest.raises(ValueError, match="precedes"):
         np.savez(ft, gain=ngain[:1], offset=om.values, epoch_start=["2021-01-01"])
-        _cal(obj, calib=str(ft))
+        _cal(obj, calib=str(ft), dark=None, flat=None)
 
 
 def test_calib_lut_mask_union_and_open_ended_warning(tmp_path):
@@ -102,12 +143,11 @@ def test_calib_lut_mask_union_and_open_ended_warning(tmp_path):
 def test_attach_empirical_frames_does_not_apply(l0, monkeypatch):
     obj, *_ = l0
     ones = xr.DataArray(np.full((3, 250), 0.5), coords={"band": BANDS, "x": obj.img.x.values})
-    monkeypatch.setattr(empirical, "load_reference_flat", lambda *a, **k: None)
     monkeypatch.setattr(
         empirical, "empirical_frames", lambda *a, **k: (ones * 0, ones, ones, None, {"has_shadow": False})
     )
-    base = _cal(obj, calib="lut_median")
-    att = _cal(obj, calib="lut_median", attach_empirical_frames=True)
+    base = _cal(obj)
+    att = _cal(obj, attach_empirical_frames=True)
     assert {"empirical_dark", "empirical_flat", "empirical_smile"} <= set(att.coords) and "empirical_notes" in att.attrs
     np.testing.assert_array_equal(att.values, base.values)
 
@@ -210,14 +250,14 @@ def _steps(da):
 
 
 def test_every_active_step_leaves_one_provenance_entry_in_pipeline_order(dn):
-    l1 = calibrate(dn, L1Config(calib="lut_median", bad_pixel_mask=False, interp_bands="linear"), qub="")
-    assert _steps(l1) == ["radiometry", "mask", "fill"]
+    l1 = calibrate(dn, L1Config(bad_pixel_mask=False, interp_bands="linear"), qub="")
+    assert _steps(l1) == ["dark", "flat", "radiometry", "mask", "fill"]
     l2 = calibrate_l2(l1, L2Config(flux=1.0, smoothing=3, smoothing_edges="nan", clip_negative=True))
-    assert _steps(l2) == ["radiometry", "mask", "fill", "solar", "photometric", "smoothing", "clip"]
+    assert _steps(l2) == ["dark", "flat", "radiometry", "mask", "fill", "solar", "photometric", "smoothing", "clip"]
 
 
 def test_thermal_without_thermal_bands_is_a_no_op(dn):
-    l1 = calibrate(dn, L1Config(calib="lut_median", bad_pixel_mask=False), qub="")
+    l1 = calibrate(dn, L1Config(dark=None, flat=None, bad_pixel_mask=False), qub="")
     with pytest.warns(UserWarning, match="no thermal bands"):
         l2 = calibrate_l2(l1, L2Config(flux=1.0, thermal="isothermal"))
     assert "T" not in l2.coords and "thermal" not in _steps(l2)
@@ -261,3 +301,100 @@ def test_every_field_survives_to_attrs(cfg):
 def test_unknown_preset_field_or_key_raises(make):
     with pytest.raises((ValueError, TypeError)):
         make()
+
+
+@pytest.fixture
+def real_lines(monkeypatch):
+    """Two adjacent mid-strip lines of 20240125T0622468260 (e1g2): raw DN and ISSDC's NCI in W/m^2/sr/um."""
+    z = np.load("tests/data/e1g2_lines_20240125.npz")
+    coords = {"band": np.arange(1, 257), "y": [0.5, 1.5], "x": 0.5 + np.arange(250)}
+    monkeypatch.setattr(instrument, "get_exposure_duration", lambda *a: 1.0)
+    monkeypatch.setattr(
+        instrument,
+        "get_saturation_radiance",
+        lambda *a, **k: xr.DataArray(np.full(256, 1e9), coords={"band": coords["band"]}),
+    )
+    return xr.DataArray(z["dn"].astype("float32"), dims=("band", "y", "x"), coords=coords), z["nci"] * 1e-2
+
+
+GOOD_BANDS = np.r_[10:28, 36:68, 76:160, 175:250]  # off the order sorting filters, seams and invalid bands
+
+
+def good_elements():
+    """(band, x) True on detector elements of GOOD_BANDS the packaged mask does not flag."""
+    ok = np.zeros((256, 250), bool)
+    ok[GOOD_BANDS] = ~instrument.load_bad_pixel_mask().values[GOOD_BANDS]
+    return ok
+
+
+@pytest.mark.parametrize("source", ["issdc_lut", "issdc_lut_median", "issdc_derived"])
+def test_dark_is_a_few_dn(real_lines, source):
+    dn, _ = real_lines
+    added = radiometry.subtract_dark(xr.zeros_like(dn), "q", source).values[:, 0]  # offset / gain = minus the dark
+    core, tails = np.percentile(added[good_elements()], [5, 95]), np.percentile(added[good_elements()], [1, 99])
+    assert np.abs(core).max() < 5 and np.abs(tails).max() < 15  # derived offsets have a few-DN tail
+    if source == "issdc_lut_median":
+        assert np.ptp(added[GOOD_BANDS], axis=1).max() < 1e-3  # one value per band
+
+
+@pytest.mark.parametrize("source", ["issdc_lut", "issdc_derived"])
+def test_flat_has_median_one_and_a_few_percent_spread(real_lines, source):
+    dn, _ = real_lines
+    flat = (1 / radiometry.divide_flat(xr.ones_like(dn), "q", source)).values[:, 0]
+    ok = good_elements()
+    bands = [b for b in GOOD_BANDS if ok[b].sum() > 100]  # a few bands are flagged nearly whole
+    np.testing.assert_allclose([np.median(flat[b][ok[b]]) for b in bands], 1, atol=1e-2)
+    assert np.percentile(flat[ok], 1) > 0.7 and np.percentile(flat[ok], 99) < 1.3
+
+
+def test_derived_dark_and_flat_reproduce_nci_and_each_one_helps(real_lines):
+    dn, nci = real_lines
+    ok = good_elements()[:, None, :] & (nci > 0)
+
+    def err(dark, flat):
+        cube = radiometry.subtract_dark(dn, "q", "issdc_derived") if dark else dn
+        cube = radiometry.divide_flat(cube, "q", "issdc_derived") if flat else cube
+        return np.median(np.abs(radiometry.radiometry(cube, "q", "issdc_derived").values / nci - 1)[ok])
+
+    both, neither = err(True, True), err(False, False)
+    assert both < 0.015 and both < err(True, False) and both < err(False, True) < neither  # NCI also has the keystone
+
+
+def test_weighted_keystone_with_edge_copy_in_calibrate(real_lines, monkeypatch):
+    dn, _ = real_lines
+    flagged = np.zeros((256, 250), bool)
+    flagged[:, 120] = True
+    monkeypatch.setattr(
+        instrument,
+        "load_bad_pixel_mask",
+        lambda *a: xr.DataArray(flagged, coords={"band": dn.band.values, "x": dn.x.values}),
+    )
+    hot = dn.copy()
+    hot[:, :, 120] = 30000
+    cfg = L1Config.resolve("issdc", keystone="weighted")
+    clean, spiked = calibrate(dn, cfg, qub="q").values, calibrate(hot, cfg, qub="q").values
+    np.testing.assert_allclose(
+        spiked[..., 112:128], clean[..., 112:128], rtol=1e-5
+    )  # the flagged hot column never leaks
+    plain = L1Config.resolve("issdc")
+    leak = (
+        calibrate(hot, plain, qub="q").values[GOOD_BANDS, :, 119]
+        / calibrate(dn, plain, qub="q").values[GOOD_BANDS, :, 119]
+    )
+    assert np.nanmax(np.abs(leak - 1)) > 0.1  # the simple resample spreads the hot column into its neighbour
+    np.testing.assert_array_equal(np.nan_to_num(clean[..., :2]), np.nan_to_num(np.repeat(clean[..., 2:3], 2, -1)))
+    np.testing.assert_array_equal(np.nan_to_num(clean[..., 248:]), np.nan_to_num(np.repeat(clean[..., 247:248], 2, -1)))
+    out = calibrate(dn, cfg, qub="q")
+    assert not {"keystone_bad", "calib_bad"} & set(out.coords)
+
+
+def test_flatfield_v1_picks_the_quarter_and_clamps_the_ends():
+    q2 = radiometry.flatfield_v1(pd.Timestamp("2024-05-03")).values
+    np.testing.assert_allclose(q2, instrument.read_table("flatfield_v1.zip", "flatfield_v1_2024_q2.csv"), rtol=1e-6)
+    assert np.isfinite(q2).all() and 0.9 < np.median(q2) < 1.1
+    np.testing.assert_array_equal(
+        radiometry.flatfield_v1(pd.Timestamp("2018-01-01")), radiometry.flatfield_v1(pd.Timestamp("2019-01-15"))
+    )
+    np.testing.assert_array_equal(
+        radiometry.flatfield_v1(pd.Timestamp("2030-06-01")), radiometry.flatfield_v1(pd.Timestamp("2026-12-31"))
+    )

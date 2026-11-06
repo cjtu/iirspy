@@ -22,10 +22,13 @@ Table 1: L1 presets.
 
 | Preset | Fields | Purpose |
 |---|---|---|
-| `iirspy` (default) | `empirical=True`, `interp_bands="linear"`, `interp_spatial=True`, `fix_frames=True`, `fill_frames=True` | Per-scene empirical dark and flat, with the LUT giving only the per-band scale; band and single-column gaps filled; band groups re-timed onto true frames and lost frames rebuilt, see [Frame defects](frames.md). |
-| `issdc` | defaults | The per-element LUT gain and offset. |
+| `iirspy` (default) | `dark="issdc_lut_median"`, `flat="flatfield_v1"`, `interp_bands="linear"`, `interp_spatial=True`, `fix_frames=True`, `fill_frames=True` | The packaged LUT's band-median offset and gain as the dark and scale, and the static quarterly flat `flatfield_v1`, which was derived on that setup; band and single-column gaps filled; band groups re-timed onto true frames and lost frames rebuilt, see [Frame defects](frames.md). |
+| `issdc` | `calib="issdc_derived"`, `dark="issdc_derived"`, `flat="issdc_derived"`, `keystone="simple"`, `edge_copy=True` | Reproduces ISSDC's NCI L1 from raw counts to a median of 0.2-0.7 %: the gain and offset table fitted to NCI, then its cross-track keystone resample and edge-column copy. |
+| `lut-only` | `dark="issdc_lut_median"`, `flat=None` | The packaged LUT's band-median gain and offset; no flat. |
 
-The steps run in this order: residual dark, flat and smile, radiometry (`calib` picks the gain and offset, see `iirspy.l1.radiometry`), re-time frames, mask, fill (lost frames, then band and single-column gaps).
+The steps run in this order: empirical frames (when asked for), dark subtraction (`dark`), flat division (`flat`, with the empirical smile), radiometry (`calib` picks the band scale), keystone (`keystone`: `None`, `"simple"` or `"weighted"`, which leaves flagged elements out of the interpolation; `edge_copy` is separate), re-time frames, mask, fill (lost frames, then band and single-column gaps).
+
+Dark sources are `"issdc_lut"` (the whole packaged LUT, one offset per detector element), `"issdc_lut_median"` (its band-median offset), `"issdc_derived"` (fitted to ISSDC's NCI, `data/issdc_derived_*_e1g2.csv`) and `"empirical"` (the scene's shadow rows). Flat sources are `"issdc_lut"`, `"issdc_derived"`, `"flatfield_v1"` (`data/flatfield_v1.zip`, a quarterly static flat, one CSV per quarter) and `"empirical"` (the scene's own flat and smile). Both are applied to DN, before the scale. Files under `data/iir/` are ISSDC's own; everything we derived lives in `data/`. The keystone has two methods: `"simple"` is ISSDC's bicubic resample, `"weighted"` leaves flagged elements out of it so a bad column does not spread into its neighbours.
 
 Per-scene inputs are keyword arguments, not config fields: `empirical_kws` (for example user-picked dark rows), `calib_dir`, `output_bands` and `frame_offsets` (the scene's frame table).
 

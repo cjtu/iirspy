@@ -182,7 +182,8 @@ def test_cropped_l0_from_file_calibrates(tmp_path, monkeypatch):
     sub = L0.from_xarray(_crop_cube(), BASENAME, tmp_path).crop(y=(Y0 + 2.5, Y0 + 5.5), bands=[SUBSET[0], SUBSET[2]])
     l0 = L0.from_file(sub.save(tmp_path / "dn.tif", full_bands=False), BASENAME, tmp_path)
     kw = {
-        "empirical": False,
+        "dark": "issdc_lut_median",
+        "flat": None,
         "bad_pixel_mask": False,
         "fix_frames": False,
         "fill_frames": False,

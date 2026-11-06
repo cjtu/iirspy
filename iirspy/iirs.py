@@ -568,7 +568,7 @@ class L0(IIRSData):
         config="iirspy",
         *,
         empirical_kws=None,
-        calib_dir=instrument.DCALIB,
+        calib_dir=instrument.PKG_DATA,
         output_bands=None,
         frame_offsets=None,
         **overrides,

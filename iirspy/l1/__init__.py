@@ -4,12 +4,15 @@ Each step is configured by `L1Config` fields and appends {"step", "method"} to t
 
 Steps, in order:
 
-1. Residual dark: `empirical.residual_dark` (scene shadow rows; also attaches the empirical flat/smile frames)
-2. Flat and smile: `empirical` (applied here in `calibrate`)
+0. Empirical frames, when asked for: `empirical.derive_frames` derives the scene's dark, flat and smile and applies nothing
+1. Dark subtraction, in DN: `radiometry.subtract_dark`
+2. Flat division (and smile), in DN: `radiometry.divide_flat`
 3. Radiometry, DN to radiance: `radiometry.radiometry`
-4. Re-time frames: `frames.retime`
-5. Mask bad bands, elements and saturation: `instrument.mask_bad`
-6. Fill lost frames and short gaps: `frames.fill_gaps`
+4. Keystone shift: `radiometry.keystone`
+5. ISSDC edge-column copy: `radiometry.edge_copy`
+6. Re-time frames: `frames.retime`
+7. Mask bad bands, elements and saturation: `instrument.mask_bad`
+8. Fill lost frames and short gaps: `frames.fill_gaps`
 
 Takes a DN cube (band, y, x) and returns a radiance cube of the same shape, both `xarray.DataArray`.
 """
@@ -22,7 +25,9 @@ from iirspy.l1.config import CALIB
 
 
 @io.xarray_keep_attrs
-def calibrate(dn, cfg, *, qub, calib_dir=instrument.DCALIB, empirical_kws=None, frame_offsets=None, output_bands=None):
+def calibrate(
+    dn, cfg, *, qub, calib_dir=instrument.PKG_DATA, empirical_kws=None, frame_offsets=None, output_bands=None
+):
     """L0 digital number cube (band, y, x) -> L1 radiance [W/m^2/sr/um], by `cfg` (an `L1Config`).
 
     `qub` is the scene's raw label. `empirical_kws` go to `empirical.empirical_frames`; `frame_offsets` is the
@@ -35,19 +40,28 @@ def calibrate(dn, cfg, *, qub, calib_dir=instrument.DCALIB, empirical_kws=None, 
         steps.append({"step": step, "method": method})
 
     cube, has_shadow = dn, False
-    if cfg.empirical or cfg.attach_empirical_frames:
-        cube, notes = empirical.residual_dark(
-            dn, qub, subtract=cfg.empirical, attach_snr=cfg.attach_snr, calib_dir=calib_dir, **(empirical_kws or {})
+    if "empirical" in (cfg.dark, cfg.flat) or cfg.attach_empirical_frames:
+        fallback = radiometry.flatfield_v1(instrument.scene_start(qub), calib_dir)
+        cube, notes = empirical.derive_frames(
+            dn, fallback, attach_snr=cfg.attach_snr and cfg.dark == "empirical", **(empirical_kws or {})
         )
         has_shadow = notes["has_shadow"]
-        log("residual_dark", "scene" if cfg.empirical and has_shadow else "none")
-    if cfg.empirical:
-        cube = cube / (cube.empirical_flat * cube.empirical_smile).clip(min=empirical.FLAT_SMILE_MIN)
-        log("flat_smile", "empirical")
-    calib = "empirical" if cfg.empirical else cfg.calib
-    cube = radiometry.radiometry(cube, qub, calib, calib_dir=calib_dir, has_shadow=has_shadow)
-    log("radiometry", calib if calib in (*CALIB, "empirical") else "calib_lut")
+        log("empirical_frames", "scene" if has_shadow else "no shadow")
+    if cfg.dark:
+        cube = radiometry.subtract_dark(cube, qub, cfg.dark, has_shadow=has_shadow, calib_dir=calib_dir)
+        log("dark", cfg.dark)
+    if cfg.flat:
+        cube = radiometry.divide_flat(cube, qub, cfg.flat, calib_dir=calib_dir)
+        log("flat", cfg.flat)
+    cube = radiometry.radiometry(cube, qub, cfg.calib, calib_dir=calib_dir)
+    log("radiometry", cfg.calib if cfg.calib in CALIB else "calib_lut")
     cube = cube if output_bands is None else cube.sel(band=output_bands)
+    if cfg.keystone:
+        cube = radiometry.keystone(cube, shift=cfg.keystone, bad_pixel_mask=cfg.bad_pixel_mask, calib_dir=calib_dir)
+        log("keystone", cfg.keystone)
+    if cfg.edge_copy:
+        cube = radiometry.edge_copy(cube)
+        log("edge_copy", "issdc")
     if cfg.fix_frames:
         cube = frames.retime(cube, qub, frame_offsets)
         if "lost_frames" in cube.coords:
@@ -70,7 +84,7 @@ def calibrate(dn, cfg, *, qub, calib_dir=instrument.DCALIB, empirical_kws=None, 
     out.attrs |= {
         "name": "Radiance",
         "units": "W/m^2/sr/um",
-        "calibration_source": "empirical" if cfg.empirical else "user",
+        "calibration_source": "empirical" if "empirical" in (cfg.dark, cfg.flat) else "user",
         "iirspy_version": io.IIRSPY_VERSION,
         "l1_config": json.dumps(cfg.to_attrs()),
         "calib": cfg.calib if cfg.calib in CALIB else "calib_lut",
