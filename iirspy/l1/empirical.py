@@ -1,46 +1,40 @@
 """
-On-orbit empirical residual-dark / flat / smile correction for IIRS L0->L1 calibration.
+Empirical residual dark, flat and smile, the first L1 steps: per-scene detector corrections from the scene itself.
 
-The IIRS gain/offset LUT is applied per detector element (band, x), but its cross-track
-structure is poorly correlated with the true on-orbit detector response, injecting striping
-and speckle. This module derives three corrections from the scene itself and lets the L0->L1
-step use the LUT only for the per-band absolute scale (see iirs.L0.calibrate_to_rad):
+The ISSDC gain/offset LUT's cross-track structure correlates poorly with the on-orbit detector response and injects
+striping and speckle, so the LUT supplies only the per-band scale (`iirspy.l1.radiometry`) and three (band, x)
+frames come from the raw DN:
 
-  dark_resid(band, x) : median DN over the scene's shadow rows. L0 counts are already
-                        dark-subtracted onboard (pre-imaging night-side dark), so this is a
-                        *residual* dark - drift + hot/warm-pixel residuals + stray light. Its
-                        real job is per-element hot-pixel refinement. 0 when no shadow is found.
-  flat(band, x)       : sensor high-frequency response, R / lowpass_x(R), median-composited over
-                        the flattest rows of each brightness quantile bin. A hardware property,
-                        so it is transferable; falls back to a packaged reference flat when the
-                        scene has no qualifying flat region.
-  smile(band, x)      : band-relative smooth cross-track field. Only spectrally-varying smooth
-                        structure is divided out; the broadband scene gradient is preserved.
-
-Shadow and lit rows are both cut on the broadband SNR field (SHADOW_SNR, LIT_SNR), whose noise
-unit is the per-pixel scatter measured in the scene's own shadow.
-
-Correction model (shadow anchors the zero point; see SPEC / calibrate_to_rad):
+  dark_resid : median DN over the scene's shadow rows, the residual of the onboard dark subtraction (drift,
+               hot/warm pixels, stray light). 0 when the scene has no shadow.
+  flat       : sensor high-frequency response R / lowpass_x(R), composited over the flattest lit rows of each
+               brightness bin. A hardware property: the packaged reference flat stands in when a scene has none.
+  smile      : band-relative smooth cross-track field; the broadband scene gradient is kept.
 
   shadow scene   : rad = 10 * gain_med * (DN - dark_resid) / (flat * smile)   # LUT offset dropped
-  no-shadow scene: rad = 10 * (gain_med * DN / (flat * smile) + offset_med)   # LUT offset kept
+  no-shadow scene: rad = 10 * (gain_med * DN / (flat * smile) + offset_med)
 
-Everything here operates on the raw DN DataArray (band, y, x).
+Shadow and lit rows are cut on the broadband SNR (SHADOW_SNR, LIT_SNR), in units of the per-pixel scatter measured
+in the scene's own shadow.
 """
 
+import json
 import warnings
 from functools import cache
 
 import numpy as np
 import xarray as xr
+from scipy.stats import norm
 
-import iirspy.utils as utils
+from iirspy import instrument
+from iirspy.instrument import PAN_BANDS
+
+FLAT_SMILE_MIN = 0.2
 
 # --- Parameters (single source: the functions below hold no bare numbers) ---------------------
-_OSF, _INV = set(utils.OSF), set(utils.INVALID)
+_OSF, _INV = set(instrument.OSF), set(instrument.INVALID)
 
 # Band selections
-PAN_BANDS = [b for b in range(10, 251, 8) if b not in _OSF and b not in _INV]  # broadband, beats single-band noise
 N_CLEAN_BANDS = 8  # how many least-bad bands clean_bands() picks for spatial-outlier detection
 
 # Residual-dark / shadow detection (location-agnostic: shadow is found wherever it is, if at all)
@@ -72,6 +66,29 @@ SMILE_STRIDE = 8  # along-track subsample stride for the smile estimate
 MAD_TO_SIGMA = 1.4826
 
 
+def derive_frames(dn, fallback_flat, *, attach_snr=True, **kws):
+    """(`dn` with the scene's empirical dark, flat and smile attached, derivation notes): derives, applies nothing.
+
+    The frames of `empirical_frames(dn, fallback_flat, **kws)` ride along as `empirical_*` (band, x) coords and the
+    notes as `attrs["empirical_notes"]`; `radiometry.subtract_dark` and `divide_flat` apply them. The broadband SNR is
+    attached as `snr` with `attach_snr` when the scene has a shadow. `fallback_flat` (band, x), in practice
+    `radiometry.flatfield_v1`, stands in where a scene has no qualifying flat region of its own.
+    """
+    dark, flat, smile, snr, notes = empirical_frames(dn, fallback_flat, **kws)
+    extra = {"empirical_flat_unmasked": flat.attrs.get("unmasked")}
+    extra |= {f"empirical_flat_bin{i}": f for i, f in enumerate(flat.attrs.get("bins", []))}
+    out = dn.assign_coords(
+        empirical_dark=(("band", "x"), dark.broadcast_like(flat).values),  # (x,)-only zeros when no shadow was found
+        empirical_flat=(("band", "x"), flat.values),
+        empirical_smile=(("band", "x"), smile.values),
+        **{k: (("band", "x"), v.values) for k, v in extra.items() if v is not None},
+    )
+    if snr is not None and attach_snr:
+        out = out.assign_coords(snr=(("y", "x"), snr.values))
+    out.attrs["empirical_notes"] = json.dumps(notes)
+    return out, notes
+
+
 def lowpass_x(da, w=CROSS_WIN):
     """Smooth a (..., x) DataArray across x with a centered rolling median."""
     return da.rolling(x=w, center=True, min_periods=1).median()
@@ -100,7 +117,7 @@ def clean_bands():
     These are the bands used to read scene structure rather than sensor response, so the fewer bad
     pixels they carry the better. Derived from the packaged mask so it tracks mask updates.
     """
-    mask = utils.load_bad_pixel_mask()
+    mask = instrument.load_bad_pixel_mask()
     bands, counts = mask.band.values, mask.sum("x").values
     ok = np.array([b not in _OSF and b not in _INV for b in bands])
     order = np.lexsort((bands[ok], counts[ok]))
@@ -329,7 +346,7 @@ def dn_bins(row_bright, lit, nbins=N_DN_BINS):
     return [(float(lo), float(hi)) for lo, hi in zip(edges[:-1], [*edges[1:-1], np.inf], strict=True)]
 
 
-def build_flat(img, dark, rs, lit, row_bright, ref_flat=None):
+def build_flat(img, dark, rs, lit, row_bright, fallback_flat=None):
     """
     Median-composite sensor flat (band, x) over the flattest region of each brightness bin.
 
@@ -337,26 +354,30 @@ def build_flat(img, dark, rs, lit, row_bright, ref_flat=None):
     qualifies. Never raises. Returns (flat, emp_notes) recording the rows used, whether the
     fallback fired, and the per-scene-vs-reference RMS deviation (the flat stability metric).
 
-    emp_notes["flat_runs"][bin] is [first, last + 1] of the rows sampled in that bin; the rows
+    `emp_notes["flat_runs"][bin]` is `[first, last + 1]` of the rows sampled in that bin; the rows
     are scattered within that span, not a solid block.
     """
-    bad = on_bands(utils.load_bad_pixel_mask(), img)
-    ref_flat = None if ref_flat is None else on_bands(ref_flat, img)
-    flats, runs_used = [], {}
+    bad = on_bands(instrument.load_bad_pixel_mask(), img)
+    fallback_flat = None if fallback_flat is None else on_bands(fallback_flat, img)
+    flats, runs_used, levels = [], {}, []
     for lo, hi in dn_bins(row_bright, lit):
         rows = flattest_rows(rs, lit & (row_bright >= lo) & (row_bright < hi))
         runs_used[f"{lo:.0f}-{hi:.0f}"] = None if rows is None else [int(rows[0]), int(rows[-1]) + 1]
         if rows is not None:
             flats.append(derive_sensor_flat(img, dark, rows))
-    emp_notes = {"flat_runs": runs_used, "flat_fallback": False, "flat_ref_rms": None}
+            levels.append(float(np.nanmedian(row_bright[rows])))
+    emp_notes = {"flat_runs": runs_used, "flat_fallback": False, "flat_ref_rms": None, "flat_bin_levels": levels}
 
     if flats:
-        flat = xr.concat(flats, dim="region").median("region").where(~bad).astype("float32")
-        if ref_flat is not None:
-            emp_notes["flat_ref_rms"] = _flat_rms(flat, ref_flat)
-    elif ref_flat is not None:
+        unmasked = xr.concat(flats, dim="region").median("region").astype("float32")
+        flat = unmasked.where(~bad)
+        # unmasked composite + per-bin flats ride along as attrs; `residual_dark` attaches them as frames
+        flat.attrs.update(unmasked=unmasked, bins=[f.astype("float32") for f in flats])
+        if fallback_flat is not None:
+            emp_notes["flat_ref_rms"] = _flat_rms(flat, fallback_flat)
+    elif fallback_flat is not None:
         warnings.warn("no in-scene flat region; falling back to packaged reference flat", UserWarning, stacklevel=2)
-        flat = ref_flat.where(~bad).astype("float32")
+        flat = fallback_flat.where(~bad).astype("float32")
         emp_notes["flat_fallback"] = True
     else:
         warnings.warn("no in-scene flat region and no packaged reference flat; using flat=1", UserWarning, stacklevel=2)
@@ -393,7 +414,7 @@ def estimate_smile(img, dark, flat, lit, stride=SMILE_STRIDE):
     return smile.astype("float32"), {"smile_fallback": False}
 
 
-def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, apply_smile=False):
+def empirical_frames(img, fallback_flat=None, dark_yrange=None, flat_yrange=None, apply_smile=False):
     """
     Derive the empirical correction frames from a raw DN cube (band, y, x).
 
@@ -404,11 +425,11 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
               when apply_smile is False, in which case estimate_smile is skipped entirely).
       snr   : (y, x) float32 broadband SNR field above the dark level, or None when no shadow rows.
               snr is not None <=> a residual dark was derived <=> the scene anchors its own zero
-              point (calibrate_to_rad then drops the LUT offset).
+              point (`radiometry` then drops the LUT offset).
       emp_notes : JSON-serializable provenance dict (dark rows/source/threshold, flat runs,
               fallbacks fired, per-scene-vs-reference flat RMS) stored in the product's attrs.
 
-    ref_flat is the packaged reference flat (band, x) used as the flat fallback and the RMS
+    fallback_flat is the packaged multi-scene flat (band, x) used as the flat fallback and the RMS
     diagnostic baseline; pass None to disable both. dark_yrange / flat_yrange are optional
     (ylow, yhigh) positional row ranges into the (possibly extent-cropped) cube that override the
     auto dark-row / flat-region detection with user-picked rows. apply_smile (default False) toggles
@@ -475,15 +496,17 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
     rs = row_roughness(P)
     if flat_yrange is not None:
         a, b = int(flat_yrange[0]), int(flat_yrange[1])
-        bad = on_bands(utils.load_bad_pixel_mask(), img)
-        flat = derive_sensor_flat(img, dark, np.arange(a, b)).where(~bad).astype("float32")
+        bad = on_bands(instrument.load_bad_pixel_mask(), img)
+        unmasked = derive_sensor_flat(img, dark, np.arange(a, b))
+        flat = unmasked.where(~bad).astype("float32")
+        flat.attrs.update(unmasked=unmasked, bins=[unmasked])
         emp_notes.update(
             flat_runs={"user": [a, b]},
             flat_fallback=False,
-            flat_ref_rms=_flat_rms(flat, on_bands(ref_flat, img)) if ref_flat is not None else None,
+            flat_ref_rms=_flat_rms(flat, on_bands(fallback_flat, img)) if fallback_flat is not None else None,
         )
     else:
-        flat, flat_notes = build_flat(img, dark, rs, lit, row_bright, ref_flat)
+        flat, flat_notes = build_flat(img, dark, rs, lit, row_bright, fallback_flat)
         emp_notes.update(flat_notes)
 
     if apply_smile:
@@ -492,3 +515,75 @@ def empirical_frames(img, ref_flat=None, dark_yrange=None, flat_yrange=None, app
         smile, smile_notes = xr.ones_like(flat), {"smile_applied": False}
     emp_notes.update(smile_notes)
     return dark, flat, smile, snr, emp_notes
+
+
+def detect_stripes(da, sigma_threshold=1):
+    """
+    Detect vertical stripes for each individual band in a DataArray.
+
+    Parameters
+    ----------
+    da : xarray.DataArray
+        Input data array with dimensions ('band', 'y', 'x').
+    sigma_threshold : float, optional
+        The number of standard deviations to use as the threshold for detecting
+        anomalous pixels. Higher values are more conservative (default: 1).
+
+    Returns
+    -------
+    xarray.DataArray
+        Bool DataArray with dimensions ('band', 'x') indicating if is a stripe.
+    """
+    # Fraction of anomalous pixels to be considered a stripe, in terms of sigma
+    #  E.g. 68% for sigma=1, 95% for sigma=2, 99.7% for sigma=3, etc.
+    frac = norm().cdf(sigma_threshold) - norm().cdf(-sigma_threshold)
+    thresh = frac * len(da.y)  # threshold in num pixels
+
+    # Apply ufunc is hard to parse - applies the stripe detection band-wise
+    #   I.e. `for band in da: detect_stripes_2D(da[band])`
+    #   but with some fancy vectorizaiton and dask-delayed compute magic
+    out = xr.apply_ufunc(
+        detect_stripes_2D,
+        da,
+        thresh,
+        input_core_dims=[["y", "x"], []],
+        output_core_dims=[["x"]],
+        exclude_dims={"y"},
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[da.dtype],
+    )
+    return out
+
+
+def detect_stripes_2D(data, threshold):
+    """
+    Detect stripe along lines (y) in a 2D image (e.g. a single band from a data cube).
+
+    Defines a stripe as a line with more than thresh pixels lower or higher
+    than both adjacent pixels (e.g. a hot or cold line).
+
+    Parameters
+    ----------
+    data : 2D array
+        Numpy array image [lines (y), samples (x)]
+    thresh : num
+        Fraction of anomalous pixels to consider a line a stripe.
+
+    References
+    ----------
+    Yokoya, N., Miyamura, N., & Iwasaki, A. (2010). Preprocessing of
+        hyperspectral imagery with consideration of smile and keystone
+        properties. In Multispectral, Hyperspectral, and Ultraspectral Remote
+        Sensing Technology, Techniques, and Applications III (Vol. 7857,
+        pp. 73-81). SPIE.
+
+    """
+    # Make a left and right 2D image to compare with vector math
+    #  (duplicate left and right edge for simplicity)
+    data_l = np.insert(data[:, :-1], 0, data[:, 0], axis=1)
+    data_r = np.insert(data[:, 1:], -1, data[:, -1], axis=1)
+    # Number anomalous (larger or smaller than both neighbours)
+    num_anom = np.sum(((data < data_l) & (data < data_r)) | ((data > data_l) & (data > data_r)), axis=0)
+    is_stripe_x = num_anom > threshold  # 1D bool array along samples (x)
+    return is_stripe_x

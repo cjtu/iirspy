@@ -1,6 +1,6 @@
 # Frame defects
 
-IIRS L0 data lose frames independently in each group of four bands. `iirspy.frames` detects the lost frames, and `L0.calibrate` re-times the affected rows onto their true frames and rebuilds the lost pixels. The correction is on by default in the `iirspy` preset.
+IIRS L0 data lose frames independently in each group of four bands. `iirspy.l1.frames` detects the lost frames, and `L0.calibrate` re-times the affected rows onto their true frames and rebuilds the lost pixels. The correction is on by default in the `iirspy` preset.
 
 ## Why it matters
 
@@ -24,7 +24,7 @@ Figure 1: Lag in frames of each of the 64 four-band groups along scene 20210110T
 
 ![Match offset versus raw line for a drop.](img/frames/drop_match.png)
 
-Figure 2: Correlation of bands 93-96 against reference bands 117-120 at offsets -3 to +3 per raw line around line 52963. The best match steps from 0 to +1 at line 52963 and stays there, which is a drop. The single -1 blip near line 52937 is an unrelated overwrite.
+Figure 2: Correlation of bands 93-96 against bands 117-120 (the figure predates the reference being moved to bands 53-56) at offsets -3 to +3 per raw line around line 52963. The best match steps from 0 to +1 at line 52963 and stays there, which is a drop. The single -1 blip near line 52937 is an unrelated overwrite.
 
 ![Match offset versus raw line for an overwrite.](img/frames/overwrite_match.png)
 
@@ -32,15 +32,15 @@ Figure 3: The same correlation for bands 57-60 around line 53362. The best match
 
 ## Detection
 
-`iirspy.frames.build_table` makes one streamed pass over the whole raw cube. It builds a cross-track high-passed, normalised line profile for each group, then matches each group line by line against a reference group at offsets -5 to +5. The reference is bands 117-120 for reflected light and bands 201-204 for the thermal block (bands 173-252).
+`iirspy.l1.frames.build_table` makes one streamed pass over the whole raw cube. It builds a cross-track high-passed, normalised line profile for each group, then measures each group against one reference group (bands 53-56) at offsets -8 to +8. A group is compared with the nearest decided of its three neighbours toward the reference and the offsets are chained outward, so the slow spectral drift of the along-track position never enters a comparison and groups with no signal (about 3.0-3.5 um) are bridged.
 
-A stride-4 pre-screen in 1000-line windows finds where the offset changes. Only those windows are matched per line, and change points are fitted jointly across groups. A drop in the reference group shows as most other groups stepping -1 together and is credited to the reference. Lags only accumulate, so each block is anchored with its least-lagged groups at 0.
+A stride-4 pre-screen in 1000-line windows finds where the offset changes. Only those windows are matched per line, and change points are fitted jointly across groups. A drop in the reference group shows as most other groups stepping -1 together and is credited to the reference. Lags only accumulate. If some groups start behind the reference (as the thermal groups do in scenes after mid-2021, where their row `y` holds frame `y - 1` relative to the reflected ones), every group is bumped by the most negative start shared by two groups, so the frames lost in the unmeasurable start of the strip show as a start lag on the rest.
 
-Overwrites and black stripes come from exact or near-exact row repeats and all-zero rows. Fully shadowed rows cannot be matched and do not need to be. Low-SNR groups whose start offset cannot be decided are left at 0 and flagged with value `None`. A strip takes 40-140 s, mostly zip decompression, of which detection is 2-20 s.
+Overwrites and black stripes come from exact or near-exact row repeats and all-zero rows. Fully shadowed rows cannot be matched and do not need to be. Unlit lines (under 5% of the strip's median signal) take no part in matching, and a level needs a correlation peak of 0.05 per line. A group decided in under half the windows takes its neighbour's events (old tables flagged them with start value `None`, still read as 0). A strip takes 40-140 s, mostly zip decompression, of which detection is 2-20 s.
 
 ### Offsets table
 
-The table is `<sid>_frames_offsets.csv`, one per strip. `L0.calibrate_to_rad` with `fix_frames` builds it from the full cube on first use and caches it beside the `.qub`, or takes an existing table as `frame_offsets`. A band-subset cube cannot be scanned; pass a table built from the full cube or zip with `iirspy.frames.build_table`.
+The table is `<sid>_frames_offsets.csv`, one per strip. `L0.calibrate` with `fix_frames` builds it from the full cube on first use and caches it beside the `.qub`, or takes an existing table as `frame_offsets`. A band-subset cube cannot be scanned; pass a table built from the full cube or zip with `iirspy.l1.frames.build_table`. `iirs-georef-solve` keeps it beside the strip's GCPs and `_L1_b54.tif` in the geometry/recalibrated day directory, shared by all CRS groups.
 
 Table 1: Columns of `<sid>_frames_offsets.csv`.
 
@@ -50,7 +50,7 @@ Table 1: Columns of `<sid>_frames_offsets.csv`.
 | `line` | Raw line of the event. |
 | `group` | Band group, 0-based. |
 | `bands` | Band range of the group, 1-based. |
-| `value` | For `start` and `drop`, the lag change at that raw line (`None` is an undetermined start). For `overwrite` and `black`, the number of raw rows from that line that hold no valid frame. |
+| `value` | For `start` and `drop`, the lag change at that raw line (`None` in old tables is an undetermined start). For `overwrite` and `black`, the number of raw rows from that line that hold no valid frame. |
 
 Example rows from scene 20210110T0635093867:
 
@@ -95,4 +95,11 @@ Figure 6: Band 78 at line 26856 against reference band 118, same layout as Figur
 
 ## Pipeline behaviour
 
-- L1 from `calibrate_to_rad` with `fix_frames` is in true-frame coordinates. ISSDC products (`nri`, `nci`, `ndi`) still carry the defects.
+- `iirs-georef-solve` builds the table once per strip before any other processing if it is missing. It streams the `nri` zip with no staging, since the staged cube holds only the solve's bands, and caches the table. Every later task and CRS group reuses it.
+- A solve whose merged GCPs are older than the table is re-solved on the re-timed cube. The L1 cache and the per-chunk solve cache are keyed on the table's content hash. The chunk reference hillshades and WAC images do not depend on the cube and are reused from the work dir.
+- `iirs-compute-refl` refuses to run on GCPs that predate the table. Re-run the solve first.
+- GLT, LOC and L2 products are in true-frame coordinates. ISSDC products (`nri`, `nci`, `ndi`) still carry the defects.
+
+## Repairing any product
+
+`iirs-fix-frames <sid> --product nri|nci|ndi --out f.tif [--fill-frames]` loads the ISSDC cube of that level, applies `IIRSData.fix_frames` (the same `frames.apply`/`frames.fill` as the pipeline) and writes it in nci camera order. The table is built from the nri or nci cube when absent; an ndi cannot supply one, so it needs the table from an earlier run. The ndi is repaired as shipped: lost frames are NaN (or filled), its spectral smoothing and baked-in per-row terms are not corrected.

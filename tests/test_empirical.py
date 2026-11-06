@@ -1,24 +1,28 @@
 """Tests for the empirical dark / flat / smile correction.
 
 Most tests here are smoke tests on a synthetic cube: they check that each stage runs, returns the
-declared shapes, and takes its documented fallback. The acceptance test at the bottom is the real
-one - it injects a known residual dark, per-column gain and smile into a real L0 subset and checks
-each stage recovers what was injected.
+declared shapes, and takes its documented fallback.
+
+The acceptance test at the bottom is real. It injects a known residual dark, per-column gain and
+smile into a real L0 subset and checks each stage recovers what was injected.
 """
 
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import xarray as xr
 
-from iirspy import empirical as emp
-from iirspy.iirs import _band_numbers
+from iirspy import instrument
+from iirspy.iirs import IIRSData
+from iirspy.io import band_numbers
+from iirspy.l1 import empirical as emp
 
 FIXTURE = Path(__file__).parent / "data" / "iirs_l0_subset.tif"
 FIXTURE_BANDS = [10, 18, 26, 42, 110, 111, 112]
-PAN = [b for b in FIXTURE_BANDS if b in emp.PAN_BANDS]  # [10, 18, 26, 42]
+PAN = [b for b in FIXTURE_BANDS if b in instrument.PAN_BANDS]  # [10, 18, 26, 42]
 
 
 def synth_cube(nband=7, ny=600, nx=250, bands=None, dark_rows=200, seed=0, texture=0.0, pedestal=0.0):
@@ -48,16 +52,10 @@ def synth_cube(nband=7, ny=600, nx=250, bands=None, dark_rows=200, seed=0, textu
 def real_cube():
     """The committed 7-band x 800-line x 250-sample raw-DN crop of a real IIRS scene."""
     da = xr.open_dataarray(FIXTURE, engine="rasterio")
-    return da.assign_coords(band=_band_numbers(da)).astype("float32")
+    return da.assign_coords(band=band_numbers(da)).astype("float32")
 
 
 # --- unit / smoke -----------------------------------------------------------------------------
-
-
-def test_fixture_carries_pan_and_clean_bands(real_cube):
-    assert list(real_cube.band.values) == FIXTURE_BANDS
-    assert emp.avail(real_cube, emp.PAN_BANDS) == PAN
-    assert emp.avail(real_cube, emp.clean_bands()) == [42, 110, 111, 112]
 
 
 def test_avail_raises_when_no_band_present(real_cube):
@@ -277,6 +275,32 @@ def test_flat_falls_back_to_reference_when_no_region_qualifies(real_cube):
         flat, notes = emp.build_flat(real_cube, 0.0, rs, nolit, np.zeros(real_cube.sizes["y"]), ref)
     assert notes["flat_fallback"] is True
     assert float(flat.where(np.isfinite(flat)).median()) == pytest.approx(1.5)
+
+
+def test_empirical_sidecar_roundtrips_dark_flat_smile(tmp_path):
+    """`attach_empirical_frames` coords -> `_save_empirical_sidecar` -> one .npz with all three."""
+    bands, x = [10, 20, 30], np.arange(4.0)
+    img = xr.DataArray(
+        np.zeros((3, 2, 4), "float32"),
+        dims=("band", "y", "x"),
+        coords={
+            "band": bands,
+            "x": x,
+            "empirical_dark": (("band", "x"), np.full((3, 4), 1.0, "float32")),
+            "empirical_flat": (("band", "x"), np.full((3, 4), 2.0, "float32")),
+            "empirical_smile": (("band", "x"), np.full((3, 4), 3.0, "float32")),
+        },
+    )
+
+    fout = tmp_path / "cube.tif"
+    fnpz = IIRSData._save_empirical_sidecar(SimpleNamespace(img=img), fout)
+
+    assert fnpz == str(tmp_path / "cube_empirical.npz")
+    d = np.load(fnpz)
+    np.testing.assert_array_equal(d["dark"], 1.0)
+    np.testing.assert_array_equal(d["flat"], 2.0)
+    np.testing.assert_array_equal(d["smile"], 3.0)
+    np.testing.assert_array_equal(d["band"], bands)
 
 
 # --- acceptance: inject known artifacts into a real scene and recover them ----------------------

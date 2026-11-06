@@ -27,7 +27,7 @@ Check out the fully worked examples notebooks [here](https://github.com/cjtu/iir
 
 ## Quickstart
 
-1. Download IIRS data from the PRADAN / ISSDC system (requires an account).
+1. Download IIRS data from ISSDC (requires an account).
 2. Use `iirspy` to read data by giving the datetime basename and a local directory. Use `L0` for raw or `L1` for calibrated. The package unzips the downloaded files if necessary.
 
     ```python
@@ -64,6 +64,16 @@ Check out the fully worked examples notebooks [here](https://github.com/cjtu/iir
     l1_radiance = iirs_l0_raw.calibrate()
     l2_reflectance = iirs_l1_rad.calibrate()
     ```
+
+### Command-line tools
+
+`iirs-georef-solve`, `iirs-compute-refl`, `iirs-make-glt` and `iirs-fix-frames` need these set:
+
+- `IIRS_ARCHIVE`: ISSDC-layout tree holding `zips/`, `data/`, `geometry/`.
+- `IIRS_DEM_ROOTS`: `:`-separated dirs holding the LOLA / WAC DEMs.
+- `IIRS_RECAL_ROOT`: where recalibrated geometry (GCPs, GLT, LOC) is kept.
+
+Optional: `IIRS_SPICE` (default `$IIRS_ARCHIVE/spice`), `IIRS_ANC_ROOTS`, `IIRS_STAGE`.
 
 ## Other features
 
@@ -121,3 +131,10 @@ Currently works decently for equatorial L1 data using supplied GCPs but fails ne
 6. Write to geotif or envi img/hdr format
    - (Optional): Edit envi hdr / geotiff metadata to add wavelength band labels
 
+## Third-party software
+
+iirspy is MIT licensed. Georeferencing uses [AROSICS](https://github.com/GFZ/arosics) (Apache-2.0, GFZ Potsdam),
+installed separately; please cite Scheffler et al. (2017), [doi:10.3390/rs9070676](https://doi.org/10.3390/rs9070676).
+Data are read with [PDR](https://github.com/MillionConcepts/pdr) (BSD-3-Clause, Million Concepts); please cite
+Brown et al. (2024), [doi:10.21105/joss.07256](https://doi.org/10.21105/joss.07256).
+See [docs/acknowledgements.md](docs/acknowledgements.md) for details.
