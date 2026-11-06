@@ -3,11 +3,13 @@
 The detector reads out in 4-band groups (group g = bands 4g+1..4g+4, 1-based) and each group can lose frames on its
 own, with nothing in the DN to say so:
 
-- drop: from an exact line on, the group's raw row y holds frame y + 1. Lags only accumulate.
+- drop: from an exact line on, the group's raw row y holds frame y + 1. Lags only accumulate. A group can also start
+  lagged (frames lost before the first measurable line).
 - overwrite: frames y, y+1 are lost and refilled A A B B (row y repeats y-1, row y+1 repeats y+2); timing is kept.
 - black: four all-zero rows in one group while the rest of the detector has signal; timing is kept.
 
-`build_table` finds all three from one pass over the raw cube and writes them to `<sid>_frames_offsets.csv`.
+`build_table` finds all three from one pass over the raw cube, every group measured against the one reference group
+`REF`, and writes them to `<sid>_frames_offsets.csv`.
 `apply` moves every group onto true frames and masks the lost ones; `fill` rebuilds those from the pixel's own
 spectrum. ISSDC's nci carries the same defects uncorrected. `fill_gaps` is the last L1 step: it calls `fill`, then
 bridges the short NaN runs left by masking (up to `BAND_GAP` bands, one column across x, `ROW_GAP` rows along y).
@@ -35,9 +37,8 @@ HPX = 15  # cross-track high-pass window, px
 WIN = 1000  # pre-screen window, lines
 STRIDE = 4  # pre-screen uses every STRIDE-th line
 MARGIN = 0.01  # min per-line soft margin to accept a level
-REF_REFL = 29  # bands 117-120
-REF_THERM = 50  # bands 201-204
-THERMAL = range(43, 63)  # bands 173-252 sit in thermal emission, matched against REF_THERM
+PEAK = 0.05  # min per-line correlation at the best level: below it the rows are noise
+REF = 13  # bands 53-56, the reference every group is measured against
 SKIP = {0, 1, 63}  # bands 1-8, 253-256: no usable signal
 MAX_BRIDGE = 9  # widest band span `fill` bridges: a hole of two neighbouring groups
 BAND_GAP = 9  # widest spectral hole `interpolate_na` bridges: two dropped groups (8 bands) in a row
@@ -96,6 +97,12 @@ def _bands(path):
     return nl, ns, it()
 
 
+def _lit(prof):
+    """Lines where the detector has signal (median group profile above 5% of its strip median)."""
+    others = np.median(prof[[g for g in range(NG) if g not in SKIP]], axis=0)
+    return others > 0.05 * np.median(others)
+
+
 def scan(path):
     """One pass over the cube: per-group normalised high-passed rows, profiles, and copied / all-zero row flags."""
     nl, ns, it = _bands(path)
@@ -119,6 +126,7 @@ def scan(path):
             h -= h.mean(1, keepdims=True)
             rows[g] = h / (np.linalg.norm(h, axis=1, keepdims=True) + 1e-6)
             acc[:] = 0
+    rows[:, ~_lit(prof)] = 0  # unlit lines carry noise, not texture: they take no part in matching
     return rows, prof, dup, zero
 
 
@@ -141,174 +149,82 @@ def _soft_level(corr):
     """Offset maximising the summed correlation, and its margin over the runner-up per line."""
     s = corr.sum(0)
     o = np.argsort(s)[::-1]
-    return int(o[0] - K), float((s[o[0]] - s[o[1]]) / max(len(corr), 1))
-
-
-def _window_levels(rows, g, ref):
-    """Soft offset per WIN window from every STRIDE-th line, and whether each window is decided."""
-    c = _corr(rows, g, ref, 0, rows.shape[1], STRIDE)
-    w = WIN // STRIDE
-    lv = [_soft_level(c[i : i + w]) for i in range(0, len(c) - w + 1, w)]
-    return np.array([v[0] for v in lv], float), np.array([v[1] > MARGIN for v in lv])
-
-
-def _soft_step(corr, a, b):
-    """Index where level a before and level b after score highest together."""
-    return int(np.argmax(_step_scores(corr, a, b)))
-
-
-def _levels(a, b):
-    step = 1 if b > a else -1
-    return list(range(a + step, b + step, step))
-
-
-def detect(rows, passes=3):
-    """Per-group events [(line, group, delta)]; line 0 is the starting lag, delta None where it is undetermined.
-
-    Re-runs on the re-timed rows until no residual step is left.
-    """
-    nl = rows.shape[1]
-    ev = _detect_once(rows)
-    for _ in range(passes - 1):
-        lag = lag_table(ev, nl)
-        fr = np.zeros_like(rows)
-        for g in range(NG):
-            f = np.arange(nl) + lag[g]
-            ok = (f >= 0) & (f < nl)
-            fr[g, f[ok]] = rows[g, ok]
-        new = _detect_once(fr, starts_known=True)
-        new = [(int(y - lag[g, min(y, nl - 1)]), g, d) for y, g, d in new if y > 0 and d]
-        if not new:
-            break
-        ev = sorted(ev + new, key=lambda e: (e[0], e[1]))
-    return ev
-
-
-def _detect_once(rows, starts_known=False):
-    """Events of each group relative to its block's reference, assembled to absolute lags (see `_assemble`).
-
-    A stride-STRIDE pre-screen finds the windows where a group's offset changes; only those are matched line by line.
-    """
-    nl = rows.shape[1]
-    groups = [g for g in range(NG) if g not in SKIP]
-    refs = {g: (REF_THERM if g in THERMAL else REF_REFL) for g in groups if g not in (REF_REFL, REF_THERM)}
-    rel, starts = {}, {}
-    for g, ref in refs.items():
-        level = 0 if starts_known else None
-        for s in [] if starts_known else range(0, nl - WIN // 2, WIN // 2):
-            lv, m = _soft_level(_corr(rows, g, ref, s, s + WIN))
-            if m > MARGIN:
-                level = lv
-                break
-        starts[g] = level
-        if level is None:
-            continue
-        lv_w, ok = _window_levels(rows, g, ref)
-        good = np.where(ok)[0]
-        ev = []
-        for i in np.where(np.diff(lv_w[good]) != 0)[0]:  # each change between consecutive decided windows
-            y0, y1 = good[i] * WIN, (good[i + 1] + 1) * WIN
-            a, b = int(lv_w[good[i]]), int(lv_w[good[i + 1]])
-            c = _corr(rows, g, ref, y0, y1)
-            cur = 0
-            for t in _levels(a, b):
-                lvl_from = t - (1 if b > a else -1)
-                k = _soft_step(c[cur:], lvl_from, t)
-                ev.append((y0 + cur + k, t - lvl_from))
-                cur += k
-        rel[g] = ev
-    if starts_known:
-        return sorted((y, g, d) for g, ev in rel.items() for y, d in ev)
-    return _assemble(rows, refs, rel, starts)
-
-
-def _delta(rows, g, ref, y, tol=3, half=400):
-    """Decided soft-level change of g vs ref across line y, or None."""
-    (a, ma), (b, mb) = (
-        _soft_level(_corr(rows, g, ref, lo, hi)) for lo, hi in ((y - half, y - tol), (y + tol, y + half))
-    )
-    return b - a if ma > MARGIN and mb > MARGIN else None
-
-
-def _assemble(rows, refs, rel, starts, tol=3):  # noqa: C901
-    """Relative per-group events -> absolute (line, group, delta).
-
-    A drop in a reference shows as most of its dependants stepping -1 together: where >= 3 do so within `tol`, each
-    dependant's step is measured across the line and, if most step -1, the drop is credited to the reference.
-    Lags only accumulate, so each block is anchored with its least-lagged groups at 0; that minimum must be shared
-    by >= 2 groups so one noisy start cannot set it.
-    """
-    events: list[tuple[int, int, int | None]] = []
-    for ref in (REF_REFL, REF_THERM):
-        deps = [g for g, r in refs.items() if r == ref and starts[g] is not None]
-        events += [(0, g, None) for g, r in refs.items() if r == ref and starts[g] is None]
-        if not deps:
-            events.append((0, ref, None))
-            continue
-        neg = sorted((y, g) for g in deps for y, d in rel.get(g, []) if d == -1)
-        cands: list[int] = []
-        for y, _ in neg:
-            near = [yy for yy, _ in neg if abs(yy - y) <= tol]
-            if len(near) >= 3 and not any(abs(y - c) <= tol for c in cands):
-                cands.append(int(np.median(near)))
-        ref_drops = {}
-        for y in cands:
-            dl = {g: _delta(rows, g, ref, y) for g in deps}
-            dec = [v for v in dl.values() if v is not None]
-            if dec and sum(v == -1 for v in dec) > len(dec) / 2:
-                ref_drops[y] = dl
-        sv = sorted([starts[g] for g in deps] + [0])
-        s0 = next((v for v, w in pairwise(sv) if v == w), 0)  # no shared start: anchor on the reference
-        if s0:
-            events.append((0, ref, -s0))
-        events += [(y, ref, 1) for y in ref_drops]
-        for g in deps:
-            if starts[g] - s0:
-                events.append((0, g, starts[g] - s0))
-            events += [(y, g, d) for y, d in rel.get(g, []) if not any(abs(y - r) <= tol for r in ref_drops)]
-            for y, dl in ref_drops.items():
-                d = dl[g] + 1 if dl[g] is not None else 0
-                if d:
-                    events.append((y, g, d))
-    return _joint(events, rows, refs)
-
-
-def _joint(events, rows, refs, tol=6, half=80, slack=0.05):
-    """Snap drops within `tol` lines of each other to the one line that maximises their summed score.
-
-    A group keeps its own line if the shared one costs it more than `slack` of its best score per line.
-    """
-    drops = sorted(e for e in events if e[0] > 0 and e[2] is not None and e[1] in refs)
-    out = [e for e in events if e not in drops]
-    clusters: list[list] = []
-    for e in drops:
-        if clusters and e[0] - clusters[-1][-1][0] <= tol:
-            clusters[-1].append(e)
-        else:
-            clusters.append([e])
-    for cl in clusters:
-        y = int(np.median([e[0] for e in cl]))
-        y0 = max(0, y - half)
-        scores = {}
-        for e in cl:
-            c = _corr(rows, e[1], refs[e[1]], y0, y + half)
-            a, _ = _soft_level(c[: half - tol])
-            b, _ = _soft_level(c[half + tol :])
-            if a == b:
-                b = int(np.clip(a + e[2], -K, K))  # offsets index corr columns, stay inside +-K
-                if b == a:
-                    b = int(np.clip(a - e[2], -K, K))
-            scores[e] = _step_scores(c, a, b)
-        kj = int(np.argmax(sum(scores.values())))
-        for e, s in scores.items():
-            k = kj if s.max() - s[kj] <= slack * 2 * half else int(np.argmax(s))
-            out.append((y0 + k, e[1], e[2]))
-    return sorted(out, key=lambda e: (e[0], e[1]))
+    n = max(len(corr), 1)
+    return int(o[0] - K), float((s[o[0]] - s[o[1]]) / n) if s[o[0]] / n > PEAK else 0.0
 
 
 def _step_scores(corr, a, b):
+    """Score of a step from level a to level b at each line: summed correlation of a before it and b after."""
     ca, cb = corr[:, a + K], corr[:, b + K]
     return np.r_[0, np.cumsum(ca)] + np.r_[np.cumsum(cb[::-1])[::-1], 0]
+
+
+def detect(rows, tol=3):  # noqa: C901
+    """Per-group events [(line, group, delta)]; line 0 holds a group's start lag.
+
+    Outward from `REF`, each group is compared with the nearest of its (up to three) neighbours toward REF, per WIN
+    window, and the neighbours vote on its offset. Only the level against that anchor is localised to a line
+    (adjacent groups correlate strongly and barely drift), and a group inherits its anchor's events: lag = anchor
+    lag + level. A -1 against REF is a drop of REF, which the neighbour's own +1 cancels; other -1 are noise. A group
+    decided in under half the windows takes its anchor's events. If starts come out negative, all groups are bumped by the most
+    negative one shared by two groups: the lost frames sit in the unmeasurable start of the strip.
+    """
+    nl, w = rows.shape[1], WIN // STRIDE
+    live = [g for g in range(NG) if g not in SKIP]
+    off = np.full((NG, nl // STRIDE // w), np.nan)
+    off[REF] = 0
+    ev: dict[int, list[tuple[int, int]]] = {REF: []}
+    decided = {REF}  # groups that measured something; the others copy their anchor
+    for side in (1, -1):
+        for g in sorted((g for g in live if (g - REF) * side > 0), key=lambda g: abs(g - REF)):
+            anchors = sorted(
+                (a for a in decided if 0 <= (a - REF) * side < (g - REF) * side), key=lambda a: abs(a - g)
+            )[:3]
+            est = np.full((len(anchors), len(off[g])), np.nan)
+            for j, a in enumerate(anchors):
+                c = _corr(rows, g, a, 0, nl, STRIDE)
+                for i in np.flatnonzero(~np.isnan(off[a])):
+                    lv, m = _soft_level(c[i * w : (i + 1) * w])
+                    if m > MARGIN:
+                        est[j, i] = off[a, i] + lv
+            off[g] = np.round(np.ma.median(np.ma.masked_invalid(est), axis=0).filled(np.nan))
+            good = np.flatnonzero(~np.isnan(off[g]))
+            v = off[g, good]
+            off[g, good[1:-1][(v[1:-1] != v[:-2]) & (v[:-2] == v[2:])]] = np.nan  # a lone window off its neighbours
+            a0 = anchors[0]
+            if np.isnan(off[g]).sum() > 0.5 * len(off[g]):  # decided in under half the windows: no evidence
+                off[g] = off[a0]
+            else:
+                decided.add(g)
+            lvl = off[g] - off[a0]
+            good = np.flatnonzero(~np.isnan(lvl))
+            own = []
+            if len(good):
+                own = [(0, int(lvl[good[0]]), 0, 0)] if lvl[good[0]] else []
+                for i in np.flatnonzero(np.diff(lvl[good])):
+                    y0, y1 = good[i] * WIN, (good[i + 1] + 1) * WIN
+                    a, b = (int(np.clip(lvl[good[j]], -K, K)) for j in (i, i + 1))
+                    c = _corr(rows, g, a0, y0, y1)
+                    step, cur = (1 if b > a else -1), 0
+                    for t in range(a + step, b + step, step):
+                        k = int(np.argmax(_step_scores(c[cur:], t - step, t)))
+                        own.append((y0 + cur + k, step, y0, y1))
+                        cur += k
+            if a0 == REF:  # a step down against REF is a drop of REF
+                ev[REF] += [(y, 1) for y, d, *_ in own if d < 0 and not any(abs(y - r) <= tol for r, _ in ev[REF])]
+            ev[g] = list(ev[a0])
+            for y, d, y0, y1 in own:
+                inside = [e for e in ev[g] if d < 0 < e[1] and e[0] > 0 and y0 - tol <= e[0] < y1 + tol]
+                if inside:  # the anchor's drop this group did not share
+                    ev[g].remove(min(inside, key=lambda e: abs(e[0] - y)))
+                elif d > 0 or y == 0:
+                    ev[g].append((y, d))
+    start = {g: sum(d for y, d in ev[g] if y == 0) for g in live}
+    sv = sorted(start[g] for g in decided)
+    bump = -min(next((v for v, w in pairwise(sv) if v == w), 0), 0)
+    out = [(0, g, start[g] + bump) for g in live if start[g] + bump]
+    out += [(y, g, d) for g in live for y, d in ev[g] if y > 0]
+    return sorted(out, key=lambda e: (e[0], e[1]))
 
 
 # ---------------------------------------------------------------- table
@@ -322,8 +238,7 @@ def _runs(flag):
 
 def _fills(dup, zero, prof):
     """(kind, line, group, rows) for black and overwrite fills, only where the rest of the detector has signal."""
-    others = np.median(prof[[g for g in range(NG) if g not in SKIP]], axis=0)
-    lit = others > 0.05 * np.median(others)
+    lit = _lit(prof)
     out = []
     for g in sorted(set(range(NG)) - SKIP):
         out += [("black", s, g, n) for s, n in _runs(zero[g] & lit)]
@@ -343,7 +258,7 @@ def _fills(dup, zero, prof):
 def build_table(src, fcsv) -> Path:
     """Detect frame defects in a raw nri zip or .qub and write them to `fcsv`.
 
-    Columns kind,line,group,bands,value: `start`/`drop` give the lag change at that raw line (value None = start
+    Columns kind,line,group,bands,value: `start`/`drop` give the lag change at that raw line (old tables may hold value None: start
     undetermined, taken as 0); `overwrite`/`black` give the number of raw rows from that line that hold no frame.
     The write is atomic, so tasks racing on one strip never read a partial table.
     """
