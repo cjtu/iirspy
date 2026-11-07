@@ -196,7 +196,7 @@ def main(argv: list[str] | None = None) -> None:
         "fgeom": fgeom,
         "flabel": flabel,
         "kernels": kernels,
-        "frame_defects": defects,
+        "defects": defects,
         "ftif": ftif,
         "decay_m": args.decay_m,
         "tweaks": {k: getattr(args, k) for k in arosics.TWEAK_DEFAULTS},
