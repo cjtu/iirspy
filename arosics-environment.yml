@@ -4,12 +4,12 @@ name: arosics
 channels:
   - conda-forge
 dependencies:
-  - python=3.11
+  - python=3.12
   - gdal
   - libgdal-jp2openjpeg
   - arosics
   - geoarray
-  - rasterio
+  - rasterio>=1.5  # honours tolerance=0 (exact TPS); matches the cluster venvs
   - rioxarray
   - xarray
   - dask
