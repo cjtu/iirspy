@@ -36,8 +36,8 @@ dependencies = [
 iirs-georef-solve = "iirspy.cli.georef_solve:main"
 iirs-compute-refl = "iirspy.cli.refl:main"
 iirs-make-glt = "iirspy.cli.make_glt:main"
-iirs-fix-frames = "iirspy.cli.fixframes:main"
-iirs-frame-table = "iirspy.cli.frametable:main"
+iirs-fix-frame-defects = "iirspy.cli.fix_frame_defects:main"
+iirs-frame-defect-table = "iirspy.cli.frame_defect_table:main"
 
 [project.urls]
 Homepage = "https://cjtu.github.io/iirspy/"

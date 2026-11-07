@@ -9,7 +9,7 @@ import pytest
 from iirspy import io
 from iirspy.cli import _run
 from iirspy.georef import arosics
-from iirspy.l1.frames import table_key
+from iirspy.l1.frame_defects import table_key
 
 WS = Path(".")
 CFG0 = SimpleNamespace(min_match_frac=0.10)
@@ -31,7 +31,7 @@ def _fit(rejected, shift, accepted=True, match_frac=0.6):
 def _outlier_strip(calls, seen):
     """Four chunks agreeing on `CONSENSUS`, except chunk 2 latches a spurious 15 km peak once."""
 
-    def fake_solve_one(work, sid, group, frames, kernels, c, seed, *_, pin_coarse=False):
+    def fake_solve_one(work, sid, group, defects, kernels, c, seed, *_, pin_coarse=False):
         i = c["i"]
         calls.append((i, seed, pin_coarse))
         seen[i] = seen.get(i, 0) + 1
@@ -60,7 +60,7 @@ def test_a_chunk_disagreeing_with_the_strip_is_reseeded_from_the_consensus(monke
 def test_a_strip_with_no_corroborated_chunk_is_left_uncorrected(monkeypatch):
     calls = []
 
-    def fake_solve_one(work, sid, group, frames, kernels, c, seed, *_):
+    def fake_solve_one(work, sid, group, defects, kernels, c, seed, *_):
         calls.append(c["i"])
         # Coarse accepted, but the match rate never corroborated it -- so it cannot vote.
         return {"chunk": c, "gcps": {}, "fit": _fit(True, (9920.0, -320.0), match_frac=0.004)}
@@ -90,7 +90,7 @@ def _replay(monkeypatch, strip, s0, t):
     track `t`; a pinned re-solve lands on its seed."""
     pinned = {}
 
-    def fake_solve_one(work, sid, group, frames, kernels, c, seed, *_, pin_coarse=False):
+    def fake_solve_one(work, sid, group, defects, kernels, c, seed, *_, pin_coarse=False):
         frac, shift = strip[c["i"]]
         if pin_coarse:
             pinned[c["i"]] = seed
@@ -159,7 +159,7 @@ def test_a_registered_chunk_anchors_even_when_its_coarse_peak_was_refused(monkey
     ]
     pinned = []
 
-    def fake_solve_one(work, sid, group, frames, kernels, c, seed, *_, pin_coarse=False):
+    def fake_solve_one(work, sid, group, defects, kernels, c, seed, *_, pin_coarse=False):
         frac, accepted, shift = strip[c["i"]]
         if pin_coarse:
             pinned.append(c["i"])
@@ -186,7 +186,7 @@ def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeyp
     monkeypatch.setattr(_run, "stage_inputs", boom)
     monkeypatch.setattr(_run.ck, "ancillary", lambda sid, paths: {"geometry/calibrated": None})
 
-    ffr = tmp_path / "frames.csv"
+    ffr = tmp_path / "defects.csv"
     ffr.write_text("kind,line,group,bands,value\n")
     paths = io.Paths(tmp_path, (tmp_path,), (), tmp_path, tmp_path)
     job = _run.Job(
@@ -202,11 +202,11 @@ def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeyp
             "bands": [1, 2],
             "calibrate_kwargs": {
                 **_run.CALIBRATE_KWS,
-                "frame_offsets": str(ffr),
+                "frame_defects": str(ffr),
                 "dark": "empirical",
                 "flat": "empirical",
             },
-            "frames": table_key(ffr),
+            "frame_defects": table_key(ffr),
             "crop_geom": "label",
         })
     )
@@ -224,7 +224,7 @@ def test_build_l1_cache_hit_requires_matching_calibrate_kwargs(tmp_path, monkeyp
     with pytest.raises(RuntimeError, match="rebuild-attempted"):
         _run.build_l1(job, (10.0, 20.0), [1, 2], ftif, calibrate_kwargs={"dark": "issdc_lut_median", "flat": None})
 
-    # A different frame table -> cache miss.
+    # A different frame-defect table -> cache miss.
     ffr.write_text("kind,line,group,bands,value\ndrop,5,3,13-16,1\n")
     with pytest.raises(RuntimeError, match="rebuild-attempted"):
         _run.build_l1(job, (10.0, 20.0), [1, 2], ftif)

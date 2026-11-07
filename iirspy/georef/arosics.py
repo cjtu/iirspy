@@ -28,7 +28,7 @@ import numpy as np
 from iirspy.georef import ancillary
 from iirspy.georef import chunks as ck
 from iirspy.io import IIRSPY_VERSION
-from iirspy.l1.frames import table_key as frames_key
+from iirspy.l1.frame_defects import table_key as defects_key
 
 log = logging.getLogger(__name__)
 
@@ -97,11 +97,11 @@ def load_gcps(path: Path) -> dict:
 
 
 def _cached_chunk(
-    work: Path, sid: str, group: str, frames: Path, c: dict, good_corr: float, decay_m: float, tweaks: dict
+    work: Path, sid: str, group: str, defects: Path, c: dict, good_corr: float, decay_m: float, tweaks: dict
 ):
     """The prior solve of chunk `c['i']` if it is still valid, else None.
 
-    Valid means its band, DEM pair, row bounds, aoi, decay_m, frame table, tweaks and the iirspy version that
+    Valid means its band, DEM pair, row bounds, aoi, decay_m, frame-defect table, tweaks and the iirspy version that
     wrote it all match `c` and it wasn't rejected, at corr >= `good_corr`. The version is in the key
     because none of the other fields say anything about the *code* that solved the chunk, so without
     it a rerun after an algorithm change mixes old and new solves in one
@@ -128,7 +128,7 @@ def _cached_chunk(
         and fit.get("row0") == c["row0"]
         and fit.get("row1") == c["row1"]
         and fit.get("decay_m") == decay_m
-        and fit.get("frames") == frames_key(frames)
+        and fit.get("frame_defects") == defects_key(defects)
         and all(fit.get(k, TWEAK_DEFAULTS[k]) == v for k, v in tweaks.items())
         and all(abs(a - b) < 1.0 for a, b in zip(fit.get("aoi", []), c["aoi"], strict=True))
     )
@@ -321,7 +321,7 @@ def solve_group(
     fgeom,
     flabel,
     kernels,
-    frames: Path,
+    defects: Path,
     ftif: Path,
     only: str | None = None,
     hillshade_only: bool = False,
@@ -336,7 +336,7 @@ def solve_group(
     tweaks = tweaks or {}
     tweaks = {k: getattr(cfg, k) if tweaks.get(k) is None else tweaks[k] for k in TWEAK_DEFAULTS}
     results, info = solve_chunks(
-        work, sid, group, frames, kernels, chunks, cfg, ftif, fgeom, flabel, decay_m, tweaks, hillshade_only
+        work, sid, group, defects, kernels, chunks, cfg, ftif, fgeom, flabel, decay_m, tweaks, hillshade_only
     )
     return chunks, results, info
 
@@ -353,7 +353,7 @@ def solve(
     fgeom,
     flabel,
     kernels,
-    frames: Path,
+    defects: Path,
     ftif: Path,
     scan_source: str,
     lat_range: tuple[float, float],
@@ -379,7 +379,7 @@ def solve(
         fgeom=fgeom,
         flabel=flabel,
         kernels=kernels,
-        frames=frames,
+        defects=defects,
         ftif=ftif,
         decay_m=decay_m,
         tweaks=tweaks,
@@ -683,7 +683,7 @@ def _chunk_grade(r) -> str:
 
 
 def _solve_one(
-    work, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=False
+    work, sid, group, defects, kernels, c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=False
 ):
     """Solve chunk `c` seeded from `seed` (a prior coarse shift in metres), or reuse its cache.
 
@@ -706,7 +706,7 @@ def _solve_one(
     )
 
     i = c["i"]
-    cached = None if pin_coarse else _cached_chunk(work, sid, group, frames, c, ck.GOOD_CORR, decay_m, tweaks)
+    cached = None if pin_coarse else _cached_chunk(work, sid, group, defects, c, ck.GOOD_CORR, decay_m, tweaks)
     if cached is not None:
         fit, gcps_by_rc = cached
         log.info(f"chunk {i} [{c['band']}]: reusing cached solve, corr={fit['corr']}")
@@ -775,7 +775,7 @@ def _solve_one(
         "row0": c["row0"],
         "row1": c["row1"],
         "decay_m": decay_m,
-        "frames": frames_key(frames),
+        "frame_defects": defects_key(defects),
         **tweaks,
         "hillshade_s": round(hs_s, 2),
         "az_grid": round(hs_info["az_grid"], 2),
@@ -871,7 +871,7 @@ def _s_mid(c) -> float:
     return 0.5 * float(c["s0"] + c["s1"])
 
 
-def _consensus_pass(work, sid, group, frames, kernels, chunks, results, cfg0, ftif, fgeom, flabel, decay_m, tweaks):
+def _consensus_pass(work, sid, group, defects, kernels, chunks, results, cfg0, ftif, fgeom, flabel, decay_m, tweaks):
     """Re-solve every chunk that disagrees with the strip's consensus coarse shift, seeded from it.
 
     The coarse search estimates a quantity that is near-constant along a strip, so running it
@@ -933,14 +933,16 @@ def _consensus_pass(work, sid, group, frames, kernels, chunks, results, cfg0, ft
         if not off:
             continue
         results[idx] = _solve_one(
-            work, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=True
+            work, sid, group, defects, kernels, c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks, pin_coarse=True
         )
         if results[idx] is not None:
             results[idx]["fit"]["reseeded"] = True
     return results, {"coarse_consensus_m": consensus, "consensus_outlier_anchors": outliers, "uncorrected": False}
 
 
-def solve_chunks(work, sid, group, frames, kernels, chunks, cfg0, ftif, fgeom, flabel, decay_m, tweaks, hillshade_only):
+def solve_chunks(
+    work, sid, group, defects, kernels, chunks, cfg0, ftif, fgeom, flabel, decay_m, tweaks, hillshade_only
+):
     """Solve each chunk against its own hillshade, reusing any prior good solve of the same shape.
 
     A forward pass seeds each chunk with the last accepted chunk's coarse shift, then
@@ -957,13 +959,13 @@ def solve_chunks(work, sid, group, frames, kernels, chunks, cfg0, ftif, fgeom, f
     seed = (0.0, 0.0)
     for idx, c in enumerate(chunks):
         results[idx] = _solve_one(
-            work, sid, group, frames, kernels, c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks
+            work, sid, group, defects, kernels, c, seed, cfg0, ftif, fgeom, flabel, decay_m, tweaks
         )
         if _accepted(results[idx]):
             seed = _shift_of(results[idx])
 
     results, info = _consensus_pass(
-        work, sid, group, frames, kernels, chunks, results, cfg0, ftif, fgeom, flabel, decay_m, tweaks
+        work, sid, group, defects, kernels, chunks, results, cfg0, ftif, fgeom, flabel, decay_m, tweaks
     )
     solved = [r for r in results if r is not None]
     consensus = info.get("coarse_consensus_m")

@@ -36,15 +36,15 @@ from iirspy.cli._run import (
     build_l1,
     build_l1_nci,
     clean_work,
-    ensure_frame_offsets,
-    frame_offsets_path,
+    ensure_frame_defects,
+    frame_defects_path,
     is_disk_full,
     keep,
     l1_config,
     l2_config,
     log_provenance,
     open_run,
-    predates_frames,
+    predates_frame_defects,
     resource_report,
     write_refl_outputs,
 )
@@ -109,24 +109,24 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901
         sys.exit("--topo-only needs --georef arosics: the issdc method has no DEM topo")
 
     paths = io.Paths()
-    fgcps = frames = None
+    fgcps = defects = None
     if args.georef == "arosics":
         fgcps = Path(args.gcps) if args.gcps else ck.merged_gcps_path(sid, group, paths)
         if not fgcps.is_file() or fgcps.stat().st_size == 0:
             sys.exit(f"{fgcps} missing or empty -- {sid} {group} is not solved yet (run iirs-georef-solve first)")
-        frames = frame_offsets_path(sid, paths, fgcps.parent)
-        if predates_frames(fgcps, frames):
-            sys.exit(f"{fgcps} was solved before {frames.name} existed -- re-run iirs-georef-solve first")
+        defects = frame_defects_path(sid, paths, fgcps.parent)
+        if predates_frame_defects(fgcps, defects):
+            sys.exit(f"{fgcps} was solved before {defects.name} existed -- re-run iirs-georef-solve first")
 
     import dask
 
     dask.config.set(scheduler="threads", num_workers=ncpu())
 
     job = open_run(sid, group, args.out, "refl", paths)
-    if frames:
-        job = replace(job, frames=frames)
-    elif args.l2 != "issdc-nci" or args.fix_frames or args.fill_frames:
-        job = replace(job, frames=ensure_frame_offsets(job, job.work))
+    if defects:
+        job = replace(job, frame_defects=defects)
+    elif args.l2 != "issdc-nci" or args.fix_frame_defects or args.fill_frame_defects:
+        job = replace(job, frame_defects=ensure_frame_defects(job, job.work))
     log_provenance()
     log.info(
         f"{sid} group={group} zip={job.zip.name} ncpu={ncpu()} stage={job.stage} georef={args.georef} gcps={fgcps}"
@@ -167,7 +167,7 @@ def _run(job: Job, args, fgcps: Path | None, t_start: float) -> None:  # noqa: C
     nci = args.l2 == "issdc-nci"
     ftif = work / f"{sid}_{group}_l1_rad.tif"
     if nci:
-        kw = {k: v for k in ("fix_frames", "fill_frames") if (v := getattr(args, k)) is not None}
+        kw = {k: v for k in ("fix_frame_defects", "fill_frame_defects") if (v := getattr(args, k)) is not None}
         ftif, scan0, lat_range = build_l1_nci(job, lat_range, bands, ftif, **kw)
     else:
         ftif, scan0, lat_range = build_l1(job, lat_range, bands, ftif, l1_config=args.l1_config)

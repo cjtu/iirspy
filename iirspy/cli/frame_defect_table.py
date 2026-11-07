@@ -1,5 +1,5 @@
-"""Build the frame-defect tables of raw nri zips and nothing else (see `iirspy.l1.frames`), named as frame-table db
-members (`frames.db_name`: `<sid>_<data center>_frames_offsets.csv`), so `--out` zips straight into the db.
+"""Build the frame-defect tables of raw nri zips and nothing else (`iirspy.l1.frame_defects`), named as frame-defect db
+members (`frame_defects.db_name`: `<sid>_<data center>_frame_defects.csv`), so `--out` zips straight into the db.
 
 Each argument is a strip id (its preferred data center's zip is looked up in `--zips`) or a path to a zip. Tables already in `--out` are kept
 unless `--force`, so a timed-out batch resumes where it stopped. A failing scene is reported and skipped; the exit
@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from iirspy import io
-from iirspy.l1 import frames
+from iirspy.l1 import frame_defects
 
 
 def main(argv=None):
@@ -34,13 +34,13 @@ def main(argv=None):
             failed += 1
             print(f"{s}: FAILED no nri zip in {zips}", flush=True)
             continue
-        name, fcsv = zp.name, args.out / frames.db_name(zp)
+        name, fcsv = zp.name, args.out / frame_defects.db_name(zp)
         if fcsv.exists() and not args.force:
             print(f"{name}: have table", flush=True)
             continue
         t0 = time.time()
         try:
-            frames.build_table(zp, fcsv)
+            frame_defects.build_table(zp, fcsv)
         except Exception as e:  # one bad scene must not sink the batch
             failed += 1
             print(f"{name}: FAILED {type(e).__name__}: {e}", flush=True)

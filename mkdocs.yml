@@ -11,7 +11,7 @@ nav:
   - Home: index.md
   - Calibration configs: reflectance.md
   - L2 reflectance: reflectance.md
-  - Frame defects: frames.md
+  - Frame defects: frame_defects.md
   - Data guide: data-guide.md
   - Modules: modules.md
   - Acknowledgements: acknowledgements.md

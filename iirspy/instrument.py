@@ -118,7 +118,7 @@ def get_saturation_radiance(fimg, calib_dir=PKG_DATA):
 def mask_bad(rad, qub, *, bad_pixel_mask=True, exclude_wl=None, calib_dir=PKG_DATA):
     """`rad` with the OSF and invalid bands, `exclude_wl` (lo, hi) [nm] ranges, bad elements and saturation nulled.
 
-    Nulls are NaN, which `iirspy.l1.frames.fill_gaps` may later bridge. `bad_pixel_mask` True is the packaged mask,
+    Nulls are NaN, which `frame_defects.fill_gaps` may later bridge. `bad_pixel_mask` True is the packaged mask,
     unioned with a calib LUT's `calib_bad` coord when present; False is none; a (band, x) bool array is used as given.
     """
     bad_band = rad.band.isin((*OSF, *INVALID))

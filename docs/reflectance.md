@@ -22,15 +22,15 @@ Table 1: L1 presets.
 
 | Preset | Fields | Purpose |
 |---|---|---|
-| `iirspy` (default) | `dark="issdc_lut_median"`, `flat="flatfield_v1"`, `interp_bands="linear"`, `interp_spatial=True`, `fix_frames=True`, `fill_frames=True` | The packaged LUT's band-median offset and gain as the dark and scale, and the static quarterly flat `flatfield_v1`, which was derived on that setup; band and single-column gaps filled; band groups re-timed onto true frames and lost frames rebuilt, see [Frame defects](frames.md). |
+| `iirspy` (default) | `dark="issdc_lut_median"`, `flat="flatfield_v1"`, `interp_bands="linear"`, `interp_spatial=True`, `fix_frame_defects=True`, `fill_frame_defects=True` | The packaged LUT's band-median offset and gain as the dark and scale, and the static quarterly flat `flatfield_v1`, which was derived on that setup; band and single-column gaps filled; band groups re-timed onto true frames and lost frames rebuilt, see [Frame defects](frame_defects.md). |
 | `issdc` | `calib="issdc_derived"`, `dark="issdc_derived"`, `flat="issdc_derived"`, `keystone="simple"`, `edge_copy=True` | Reproduces ISSDC's NCI L1 from raw counts to a median of 0.2-0.7 %: the gain and offset table fitted to NCI, then its cross-track keystone resample and edge-column copy. |
 | `lut-only` | `dark="issdc_lut_median"`, `flat=None` | The packaged LUT's band-median gain and offset; no flat. |
 
-The steps run in this order: empirical frames (when asked for), dark subtraction (`dark`), flat division (`flat`, with the empirical smile), radiometry (`calib` picks the band scale), keystone (`keystone`: `None`, `"simple"` or `"weighted"`, which leaves flagged elements out of the interpolation; `edge_copy` is separate), re-time frames, mask, fill (lost frames, then band and single-column gaps).
+The steps run in this order: empirical frames (when asked for), dark subtraction (`dark`), flat division (`flat`, with the empirical smile), radiometry (`calib` picks the band scale), keystone (`keystone`: `None`, `"simple"` or `"weighted"`, which leaves flagged elements out of the interpolation; `edge_copy` is separate), re-time frame defects, mask, fill (frame defects, then band and single-column gaps).
 
 Dark sources are `"issdc_lut"` (the whole packaged LUT, one offset per detector element), `"issdc_lut_median"` (its band-median offset), `"issdc_derived"` (fitted to ISSDC's NCI, `data/issdc_derived_*_e1g2.csv`) and `"empirical"` (the scene's shadow rows). Flat sources are `"issdc_lut"`, `"issdc_derived"`, `"flatfield_v1"` (`data/flatfield_v1.zip`, a quarterly static flat, one CSV per quarter) and `"empirical"` (the scene's own flat and smile). Both are applied to DN, before the scale. Files under `data/iir/` are ISSDC's own; everything we derived lives in `data/`. The keystone has two methods: `"simple"` is ISSDC's bicubic resample, `"weighted"` leaves flagged elements out of it so a bad column does not spread into its neighbours.
 
-Per-scene inputs are keyword arguments, not config fields: `empirical_kws` (for example user-picked dark rows), `calib_dir`, `output_bands` and `frame_offsets` (the scene's frame table).
+Per-scene inputs are keyword arguments, not config fields: `empirical_kws` (for example user-picked dark rows), `calib_dir`, `output_bands` and `frame_defects` (the scene's frame-defect table).
 
 ## L2: reflectance
 
@@ -45,7 +45,7 @@ The steps run in this order. Band numbers are IIRS band numbers, 1-indexed.
 6. Clip: `clip_negative` sets negative reflectance to zero. It runs last, after smoothing, as range validation does in the ISSDC product. Past about 4.4 µm, where the signal is almost all thermal, this zeroes about half of the pixels of an ISSDC NDI band.
 7. Fill: `fill_nan` writes a value over every NaN (null pixels, lost frames, dropped bands) as the very last step. The `issdc` presets use 0, as ISSDC's NDI marks all its nulls with 0; the `iirspy` preset keeps NaN.
 
-`--fix-frames` and `--fill-frames` (true/false, bare = true; `L1Config` fields) re-time the cube with the strip's frame table and rebuild the lost frames before L2, on either L1 route (see `frames.md`). Unset keeps the L1 preset: on for the `iirspy` L1, off for `issdc-nci`.
+`--fix-frame-defects` and `--fill-frame-defects` (true/false, bare = true; `L1Config` fields) re-time the cube with the strip's frame-defect table and rebuild the lost frames before L2, on either L1 route (see `frame_defects.md`). Unset keeps the L1 preset: on for the `iirspy` L1, off for `issdc-nci`.
 
 Table 2: L2 presets. Unlisted fields keep the `L2Config` defaults.
 

@@ -1,6 +1,6 @@
 # Frame defects
 
-IIRS L0 data lose frames independently in each group of four bands. `iirspy.l1.frames` detects the lost frames, and `L0.calibrate` re-times the affected rows onto their true frames and rebuilds the lost pixels. The correction is on by default in the `iirspy` preset.
+IIRS L0 data lose frames independently in each group of four bands. `iirspy.l1.frame_defects` detects the lost frames, and `L0.calibrate` re-times the affected rows onto their true frames and rebuilds the lost pixels. The correction is on by default in the `iirspy` preset.
 
 ## Why it matters
 
@@ -32,7 +32,7 @@ Figure 3: The same correlation for bands 57-60 around line 53362. The best match
 
 ## Detection
 
-`iirspy.l1.frames.build_table` makes one streamed pass over the whole raw cube. It builds a cross-track high-passed, normalised line profile for each group, then measures each group against one reference group (bands 53-56) at offsets -8 to +8. A group is compared with the nearest decided of its three neighbours toward the reference and the offsets are chained outward, so the slow spectral drift of the along-track position never enters a comparison and groups with no signal (about 3.0-3.5 um) are bridged.
+`iirspy.l1.frame_defects.build_table` makes one streamed pass over the whole raw cube. It builds a cross-track high-passed, normalised line profile for each group, then measures each group against one reference group (bands 53-56) at offsets -8 to +8. A group is compared with the nearest decided of its three neighbours toward the reference and the offsets are chained outward, so the slow spectral drift of the along-track position never enters a comparison and groups with no signal (about 3.0-3.5 um) are bridged.
 
 A stride-4 pre-screen in 1000-line windows finds where the offset changes. Only those windows are matched per line, and change points are fitted jointly across groups. A drop in the reference group shows as most other groups stepping -1 together and is credited to the reference. Lags only accumulate. If some groups start behind the reference (as the thermal groups do in scenes after mid-2021, where their row `y` holds frame `y - 1` relative to the reflected ones), every group is bumped by the most negative start shared by two groups, so the frames lost in the unmeasurable start of the strip show as a start lag on the rest.
 
@@ -40,11 +40,11 @@ Overwrites and black stripes come from exact or near-exact row repeats and all-z
 
 ### Offsets table
 
-The table is `<sid>_frames_offsets.csv`, one per strip. `L0.calibrate` with `fix_frames` builds it from the full cube on first use and caches it beside the `.qub`, or takes an existing table as `frame_offsets`. A band-subset cube cannot be scanned; pass a table built from the full cube or zip with `iirspy.l1.frames.build_table`. `iirs-georef-solve` keeps it beside the strip's GCPs and `_L1_b54.tif` in the geometry/recalibrated day directory, shared by all CRS groups. It copies the table from the archive's frame-table db, `geometry/recalibrated/frames_tables.zip`, when the db holds one, and builds it otherwise. `iirs-frame-table` builds tables for that db.
+The table is `<sid>_frame_defects.csv`, one per strip. `L0.calibrate` with `fix_frame_defects` builds it from the full cube on first use and caches it beside the `.qub`, or takes an existing table as `frame_defects`. A band-subset cube cannot be scanned; pass a table built from the full cube or zip with `iirspy.l1.frame_defects.build_table`. `iirs-georef-solve` keeps it beside the strip's GCPs and `_L1_b54.tif` in the geometry/recalibrated day directory, shared by all CRS groups. It copies the table from the archive's frame-defect db, `geometry/recalibrated/frame_defect_tables.zip`, when the db holds one, and builds it otherwise. `iirs-frame-defect-table` builds tables for that db.
 
-A strip that ISSDC holds from more than one data center (57 of 2471) has one raw zip per center. Each center assembles its own L0, so their `start`, `black` and `overwrite` rows differ, while their `drop` rows agree. The db therefore keeps one table per zip, named `<sid>_<data center>_frames_offsets.csv`. Every sid lookup reads the same preferred copy (`iirspy.io.collect_order`: d32, d18, hw1, then the others, with n18 last), so a strip's table, GCPs and products all come from one collect.
+A strip that ISSDC holds from more than one data center (57 of 2471) has one raw zip per center. Each center assembles its own L0, so their `start`, `black` and `overwrite` rows differ, while their `drop` rows agree. The db therefore keeps one table per zip, named `<sid>_<data center>_frame_defects.csv`. Every sid lookup reads the same preferred copy (`iirspy.io.collect_order`: d32, d18, hw1, then the others, with n18 last), so a strip's table, GCPs and products all come from one collect.
 
-Table 1: Columns of `<sid>_frames_offsets.csv`.
+Table 1: Columns of `<sid>_frame_defects.csv`.
 
 | Column | Content |
 |---|---|
@@ -66,10 +66,10 @@ black,26856,19,77-80,4
 
 ## Correction
 
-The fields `fix_frames` and `fill_frames` of `L1Config` are both on in the `iirspy` preset and off in `issdc`. The table is passed as `L0.calibrate(..., frame_offsets=path)`.
+The fields `fix_frame_defects` and `fill_frame_defects` of `L1Config` are both on in the `iirspy` preset and off in `issdc`. The table is passed as `L0.calibrate(..., frame_defects=path)`.
 
-1. Re-time (`fix_frames`): each group's rows move to their true frame, raw row `y` to frame `y + lag`. This is a pure re-index and no values are interpolated. Lost frames (the dropped frame, overwrite rows, black rows) become NaN.
-2. Fill (`fill_frames`): each lost pixel is rebuilt from its own spectrum and its neighbours' spectral shape. The hole is bridged linearly between the nearest kept bands on either side at the same pixel. The bridge is then multiplied by the ratio of the nearest kept rows above and below (within 6 rows) to their own linear bridge, which restores the curvature of any absorption inside the gap. Holes spanning more than 9 bands, or with no kept neighbouring row, stay NaN and fall to `interp_bands`. That step also still handles OSF/invalid bands and bad pixels, where no neighbouring row has the band.
+1. Re-time (`fix_frame_defects`): each group's rows move to their true frame, raw row `y` to frame `y + lag`. This is a pure re-index and no values are interpolated. Lost frames (the dropped frame, overwrite rows, black rows) become NaN.
+2. Fill (`fill_frame_defects`): each lost pixel is rebuilt from its own spectrum and its neighbours' spectral shape. The hole is bridged linearly between the nearest kept bands on either side at the same pixel. The bridge is then multiplied by the ratio of the nearest kept rows above and below (within 6 rows) to their own linear bridge, which restores the curvature of any absorption inside the gap. Holes spanning more than 9 bands, or with no kept neighbouring row, stay NaN and fall to `interp_bands`. That step also still handles OSF/invalid bands and bad pixels, where no neighbouring row has the band.
 
 The fill was chosen by punching artificial 4-band holes into lit pixels of good data (groups 4-39) in 4 scenes and refilling them. Holes are under 1% of the rows in a strip. The single-band noise floor is about 1.8-1.9%, which no method can beat.
 
@@ -104,4 +104,4 @@ Figure 6: Band 78 at line 26856 against reference band 118, same layout as Figur
 
 ## Repairing any product
 
-`iirs-fix-frames <sid> --product nri|nci|ndi --out f.tif [--fill-frames]` loads the ISSDC cube of that level, applies `IIRSData.fix_frames` (the same `frames.apply`/`frames.fill` as the pipeline) and writes it in nci camera order. The table is built from the nri or nci cube when absent; an ndi cannot supply one, so it needs the table from an earlier run. The ndi is repaired as shipped: lost frames are NaN (or filled), its spectral smoothing and baked-in per-row terms are not corrected.
+`iirs-fix-frame-defects <sid> --product nri|nci|ndi --out f.tif [--fill-frame-defects]` loads the ISSDC cube of that level, applies `IIRSData.fix_frame_defects` (the same `frame_defects.apply`/`frame_defects.fill` as the pipeline) and writes it in nci camera order. The table is built from the nri or nci cube when absent; an ndi cannot supply one, so it needs the table from an earlier run. The ndi is repaired as shipped: lost frames are NaN (or filled), its spectral smoothing and baked-in per-row terms are not corrected.

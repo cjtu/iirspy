@@ -9,7 +9,7 @@ own, with nothing in the DN to say so:
 - black: four all-zero rows in one group while the rest of the detector has signal; timing is kept.
 
 `build_table` finds all three from one pass over the raw cube, every group measured against the one reference group
-`REF`, and writes them to `<sid>_frames_offsets.csv`.
+`REF`, and writes them to `<sid>_frame_defects.csv`.
 `apply` moves every group onto true frames and masks the lost ones; `fill` rebuilds those from the pixel's own
 spectrum. ISSDC's nci carries the same defects uncorrected. `fill_gaps` is the last L1 step: it calls `fill`, then
 bridges the short NaN runs left by masking (up to `BAND_GAP` bands, one column across x, `ROW_GAP` rows along y).
@@ -48,22 +48,22 @@ BAND_GAP = 9  # widest spectral hole `interpolate_na` bridges: two dropped group
 ROW_GAP = 5  # likewise along y: up to 4 lost frames in a row
 
 
-def retime(rad, qub, frame_offsets=None):
+def retime(rad, qub, frame_defects=None):
     """Move each 4-band group of `rad` onto true frames; the lost frames ride along as the `lost_frames` coord.
 
-    `frame_offsets` is the strip's table (`build_table`). None builds it from the full cube `qub` and caches it beside
-    it as `<qub stem>_frames_offsets.csv`; a band-subset cube cannot be scanned, so `rad` comes back unchanged, with a
+    `frame_defects` is the strip's table (`build_table`). None builds it from the full cube `qub` and caches it beside
+    it as `<qub stem>_frame_defects.csv`; a band-subset cube cannot be scanned, so `rad` comes back unchanged, with a
     warning.
     """
-    if frame_offsets is None:
-        frame_offsets = Path(qub).with_name(f"{Path(qub).stem}_frames_offsets.csv")
-        if not frame_offsets.exists():
+    if frame_defects is None:
+        frame_defects = Path(qub).with_name(f"{Path(qub).stem}_frame_defects.csv")
+        if not frame_defects.exists():
             try:
-                build_table(qub, frame_offsets)
+                build_table(qub, frame_defects)
             except ValueError as e:
-                warnings.warn(f"fix_frames skipped: {e}", UserWarning, stacklevel=2)
+                warnings.warn(f"fix_frame_defects skipped: {e}", UserWarning, stacklevel=2)
                 return rad
-    out, lost = apply(rad, frame_offsets)
+    out, lost = apply(rad, frame_defects)
     return out.assign_coords(lost_frames=(("band", "y"), lost))
 
 
@@ -85,7 +85,7 @@ def _bands(path):
     )
     dtype = np.dtype({2: "<i2", 4: "<f4"}[dt])
     if nb != 4 * NG:
-        raise ValueError(f"{path.name} holds {nb} bands; the frame table needs all {4 * NG}")
+        raise ValueError(f"{path.name} holds {nb} bands; the frame-defect table needs all {4 * NG}")
 
     def it():
         if z is None:
@@ -279,21 +279,21 @@ def build_table(src, fcsv) -> Path:
 
 
 def db_name(raw) -> str:
-    """Member name of raw zip or cube `raw`'s table in a frame-table db: `<sid>_<data center>_frames_offsets.csv`.
+    """Member name of raw zip or cube `raw`'s table in a frame-defect db: `<sid>_<data center>_frame_defects.csv`.
 
     Each data center assembles its own L0, so `start`/`black`/`overwrite` rows differ between copies of a strip (S114).
 
     >>> db_name("ch2_iir_nri_20230604T1425413885_d_img_n18.zip")
-    '20230604T1425413885_n18_frames_offsets.csv'
+    '20230604T1425413885_n18_frame_defects.csv'
     """
-    return f"{io.iirsbasename(Path(raw).name)}_{io.data_center(raw)}_frames_offsets.csv"
+    return f"{io.iirsbasename(Path(raw).name)}_{io.data_center(raw)}_frame_defects.csv"
 
 
 def from_db(db, raw, fcsv) -> bool:
     """Copy raw zip `raw`'s table out of the zip `db` (members named by `db_name`) to `fcsv`; False if it has none.
 
     `fcsv` takes the member's date as mtime, the table's build date, so GCPs solved before it read as solved on
-    un-retimed cubes (`predates_frames`).
+    un-retimed cubes (`predates_frame_defects`).
     """
     if not Path(db).exists():
         return False
@@ -312,7 +312,7 @@ def from_db(db, raw, fcsv) -> bool:
 
 
 def table_key(fcsv) -> str:
-    """Content hash of a frame table, so a cache built on another (or no) table never matches."""
+    """Content hash of a frame-defect table, so a cache built on another (or no) table never matches."""
     return hashlib.sha256(Path(fcsv).read_bytes()).hexdigest()[:12]
 
 
@@ -443,14 +443,15 @@ def fill(rad, lost, depth=6):
     return rad.copy(data=filled)
 
 
-def fill_gaps(rad, *, fill_frames=False, interp_bands=None, interp_spatial=False):
-    """`rad` with lost frames rebuilt (`fill_frames`), then band gaps (`interp_bands` method) and x/y gaps filled.
+def fill_gaps(rad, *, fill_frame_defects=False, interp_bands=None, interp_spatial=False):
+    """`rad` with lost frames rebuilt (`fill_frame_defects`), then band gaps (`interp_bands` method) and x/y gaps
+    filled.
 
     The `lost_frames` coord is consumed.
     """
     lost = rad.lost_frames.values if "lost_frames" in rad.coords else None
     out = rad.drop_vars("lost_frames", errors="ignore")
-    if fill_frames and lost is not None:
+    if fill_frame_defects and lost is not None:
         out = fill(out, lost)
     if interp_bands is not None:
         out = out.interpolate_na("band", max_gap=BAND_GAP, keep_attrs=True, method=interp_bands)

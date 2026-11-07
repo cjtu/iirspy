@@ -22,7 +22,7 @@ from rioxarray.exceptions import NoDataInBounds
 
 from iirspy import instrument, io, l1, l2
 from iirspy.georef import GEOREF, ancillary, georef
-from iirspy.l1 import empirical, frames
+from iirspy.l1 import empirical, frame_defects
 from iirspy.l1.config import L1Config
 from iirspy.l2 import polish
 from iirspy.l2.config import L2Config
@@ -141,7 +141,7 @@ class IIRSData(ABC):
     """Abstract base class for IIRS data products.
 
     Cropped images work the same at every level: `crop` -> `save` -> `from_file` round-trips values,
-    absolute y/x and band numbers. With `fix_frames`, crop with a few rows of margin.
+    absolute y/x and band numbers. With `fix_frame_defects`, crop with a few rows of margin.
     """
 
     _NATIVE_SCALE = 1.0  # file units -> product units, applied by `from_file`
@@ -337,19 +337,20 @@ class IIRSData(ABC):
         img = _expand_to_full_bands(self.img) if full_bands else self.img
         return io.write_camera_product(img, fout, sub_rows)
 
-    def fix_frames(self, fcsv, fill=False):
+    def fix_frame_defects(self, fcsv, fill=False):
         """Move each 4-band group onto true frames and NaN its lost ones, or with `fill` rebuild them.
 
-        `fcsv` is the strip's frame table (`frames.build_table`), derived from the nri or nci cube, never an ndi.
+        `fcsv` is the strip's frame-defect table (`frame_defects.build_table`), derived from the nri or nci cube, never
+        an ndi.
         """
-        if self.img.attrs.get("frames_fixed"):
-            raise ValueError(f"{self.basename}: frames already fixed")
+        if self.img.attrs.get("frame_defects_fixed"):
+            raise ValueError(f"{self.basename}: frame defects already fixed")
         if not Path(fcsv).exists():
-            raise FileNotFoundError(f"no frame table {fcsv}: build it from the nri (L0) or nci (L1) cube first")
+            raise FileNotFoundError(f"no frame-defect table {fcsv}: build it from the nri (L0) or nci (L1) cube first")
         attrs = dict(self.img.attrs)
-        img, lost = frames.apply(self.img, fcsv)
-        self.img = frames.fill(img, lost) if fill else img
-        self.img.attrs.update(attrs, frames_fixed=1, frames_filled=int(fill))
+        img, lost = frame_defects.apply(self.img, fcsv)
+        self.img = frame_defects.fill(img, lost) if fill else img
+        self.img.attrs.update(attrs, frame_defects_fixed=1, frame_defects_filled=int(fill))
 
     def _save_snr_sidecar(self, fout, row_block=None):
         """Write the (y, x) empirical broadband SNR field beside fout, in fout's own format."""
@@ -570,15 +571,16 @@ class L0(IIRSData):
         empirical_kws=None,
         calib_dir=instrument.PKG_DATA,
         output_bands=None,
-        frame_offsets=None,
+        frame_defects=None,
         **overrides,
     ):
         """Calibrate to an L1 object, with ISSDC L1 metadata if it exists (see `iirspy.l1.calibrate`).
 
         `config` is an `L1Config` or a preset name; `overrides` replace single fields. `empirical_kws` go to
         `empirical.empirical_frames`, e.g. dark_yrange/flat_yrange (positional row ranges into this cube) or
-        apply_smile=True. `output_bands` narrows the returned bands. `frame_offsets` is the strip's frame table
-        (`frames.build_table`) for `fix_frames`; None builds it from this cube (all 256 bands, ~1 min) and caches it
+        apply_smile=True. `output_bands` narrows the returned bands. `frame_defects` is the strip's frame-defect
+        table (`frame_defects.build_table`) for `fix_frame_defects`; None builds it from this cube (all 256 bands,
+        ~1 min) and caches it
         beside the .qub.
         """
         img = l1.calibrate(
@@ -587,7 +589,7 @@ class L0(IIRSData):
             qub=self.qub,
             calib_dir=calib_dir,
             empirical_kws=empirical_kws,
-            frame_offsets=frame_offsets,
+            frame_defects=frame_defects,
             output_bands=output_bands,
         )
         try:

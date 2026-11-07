@@ -10,9 +10,9 @@ Steps, in order:
 3. Radiometry, DN to radiance: `radiometry.radiometry`
 4. Keystone shift: `radiometry.keystone`
 5. ISSDC edge-column copy: `radiometry.edge_copy`
-6. Re-time frames: `frames.retime`
+6. Re-time frame defects: `retime`
 7. Mask bad bands, elements and saturation: `instrument.mask_bad`
-8. Fill lost frames and short gaps: `frames.fill_gaps`
+8. Fill frame defects and short gaps: `fill_gaps`
 
 Takes a DN cube (band, y, x) and returns a radiance cube of the same shape, both `xarray.DataArray`.
 """
@@ -20,18 +20,19 @@ Takes a DN cube (band, y, x) and returns a radiance cube of the same shape, both
 import json
 
 from iirspy import instrument, io
-from iirspy.l1 import empirical, frames, radiometry
+from iirspy.l1 import empirical, radiometry
 from iirspy.l1.config import CALIB
+from iirspy.l1.frame_defects import fill_gaps, retime
 
 
 @io.xarray_keep_attrs
 def calibrate(
-    dn, cfg, *, qub, calib_dir=instrument.PKG_DATA, empirical_kws=None, frame_offsets=None, output_bands=None
+    dn, cfg, *, qub, calib_dir=instrument.PKG_DATA, empirical_kws=None, frame_defects=None, output_bands=None
 ):
     """L0 digital number cube (band, y, x) -> L1 radiance [W/m^2/sr/um], by `cfg` (an `L1Config`).
 
-    `qub` is the scene's raw label. `empirical_kws` go to `empirical.empirical_frames`; `frame_offsets` is the
-    strip's frame table (`frames.build_table`); `output_bands` narrows the bands after radiometry, so the
+    `qub` is the scene's raw label. `empirical_kws` go to `empirical.empirical_frames`; `frame_defects` is the
+    strip's frame-defect table (`frame_defects.build_table`); `output_bands` narrows the bands after radiometry, so the
     empirical frames still see every band of `dn`.
     """
     steps = []
@@ -62,17 +63,20 @@ def calibrate(
     if cfg.edge_copy:
         cube = radiometry.edge_copy(cube)
         log("edge_copy", "issdc")
-    if cfg.fix_frames:
-        cube = frames.retime(cube, qub, frame_offsets)
+    if cfg.fix_frame_defects:
+        cube = retime(cube, qub, frame_defects)
         if "lost_frames" in cube.coords:
             log("retime", "frame_table")
     cube = instrument.mask_bad(
         cube, qub, bad_pixel_mask=cfg.bad_pixel_mask, exclude_wl=cfg.exclude_wl, calib_dir=calib_dir
     )
     log("mask", "bad_elements")
-    if cfg.fill_frames or cfg.interp_bands or cfg.interp_spatial:
-        cube = frames.fill_gaps(
-            cube, fill_frames=cfg.fill_frames, interp_bands=cfg.interp_bands, interp_spatial=cfg.interp_spatial
+    if cfg.fill_frame_defects or cfg.interp_bands or cfg.interp_spatial:
+        cube = fill_gaps(
+            cube,
+            fill_frame_defects=cfg.fill_frame_defects,
+            interp_bands=cfg.interp_bands,
+            interp_spatial=cfg.interp_spatial,
         )
         log("fill", "interpolate")
 

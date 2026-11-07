@@ -25,10 +25,10 @@ from iirspy.cli._run import (
     Job,
     build_l1,
     clean_work,
-    ensure_frame_offsets,
+    ensure_frame_defects,
     log_provenance,
     open_run,
-    predates_frames,
+    predates_frame_defects,
 )
 from iirspy.georef import ancillary, arosics
 from iirspy.georef import chunks as ck
@@ -36,7 +36,7 @@ from iirspy.georef.georef import scan_order_reversed
 from iirspy.iirs import L1
 from iirspy.instrument import PAN_BANDS
 from iirspy.io import ncpu
-from iirspy.l1.frames import BAND_GAP
+from iirspy.l1.frame_defects import BAND_GAP
 
 log = logging.getLogger(__name__)
 
@@ -103,15 +103,15 @@ def _write_reversed_csv(job: Job, fgeom: Path) -> Path:
     return dst
 
 
-def _glt_only(job: Job, frames: Path, args, cfg, fgeom, lat_range) -> bool:
+def _glt_only(job: Job, defects: Path, args, cfg, fgeom, lat_range) -> bool:
     """Already solved: build the GLT (and LOC, if missing) from the saved GCPs instead of restaging and re-solving."""
     work, sid, group = job.work, job.sid, job.group
     name = f"{sid}_{group}.gcps"
     fdone = next((f for f in (work / name, *([Path(args.keep) / name] if args.keep else [])) if f.exists()), None)
     if fdone is None or args.resolve or args.chunks or args.hillshade_only:
         return False
-    if predates_frames(fdone, frames):
-        log.info(f"{fdone} predates {frames.name} -- re-solving on the re-timed cube")
+    if predates_frame_defects(fdone, defects):
+        log.info(f"{fdone} predates {defects.name} -- re-solving on the re-timed cube")
         return False
     if fgeom is None:
         sys.exit(f"missing geometry csv for {sid}")
@@ -154,10 +154,10 @@ def main(argv: list[str] | None = None) -> None:
     cfg = ck.chunk_cfg(group, paths.dem_roots)
     fgeom = ck.ancillary(sid, paths)["geometry/calibrated"]
     keep = Path(args.keep) if args.keep else None
-    frames = ensure_frame_offsets(job, keep)
-    job = replace(job, frames=frames)
+    defects = ensure_frame_defects(job, keep)
+    job = replace(job, frame_defects=defects)
     lat_range = ck.l1_lat_range(group)
-    if _glt_only(job, frames, args, cfg, fgeom, lat_range):
+    if _glt_only(job, defects, args, cfg, fgeom, lat_range):
         return clean_work(work, args.clean)
 
     # Calibration only masks/interpolates the registration band's +-BAND_GAP window; the PAN_BANDS beyond it
@@ -196,7 +196,7 @@ def main(argv: list[str] | None = None) -> None:
         "fgeom": fgeom,
         "flabel": flabel,
         "kernels": kernels,
-        "frames": frames,
+        "frame_defects": defects,
         "ftif": ftif,
         "decay_m": args.decay_m,
         "tweaks": {k: getattr(args, k) for k in arosics.TWEAK_DEFAULTS},

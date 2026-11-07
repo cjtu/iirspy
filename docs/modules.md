@@ -12,7 +12,7 @@
 
 ::: iirspy.l1.radiometry
 
-::: iirspy.l1.frames
+::: iirspy.l1.frame_defects
 
 ::: iirspy.l2
 

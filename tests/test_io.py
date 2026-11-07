@@ -185,8 +185,8 @@ def test_cropped_l0_from_file_calibrates(tmp_path, monkeypatch):
         "dark": "issdc_lut_median",
         "flat": None,
         "bad_pixel_mask": False,
-        "fix_frames": False,
-        "fill_frames": False,
+        "fix_frame_defects": False,
+        "fill_frame_defects": False,
         "interp_bands": None,
         "interp_spatial": False,
     }

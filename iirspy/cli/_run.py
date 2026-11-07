@@ -28,11 +28,12 @@ from iirspy.georef import ancillary
 from iirspy.georef import chunks as ck
 from iirspy.io import ncpu
 from iirspy.l1.config import CALIB, L1Config
-from iirspy.l1.frames import table_key as frames_key
+from iirspy.l1.frame_defects import table_key as defects_key
 from iirspy.l2.config import L2Config
 
 log = logging.getLogger(__name__)
-FRAMES_DB = "geometry/recalibrated/frames_tables.zip"  # one table per raw zip, members named by `frames.db_name`
+# One table per raw zip, members named by `frame_defects.db_name`.
+FRAME_DEFECT_DB = "geometry/recalibrated/frame_defect_tables.zip"
 
 CALIBRATE_KWS = {
     "dark": "empirical",
@@ -52,7 +53,7 @@ class Job:
     logfile: Path
     paths: io.Paths
     work: Path
-    frames: Path | None = None
+    frame_defects: Path | None = None
 
 
 def open_run(sid: str, group: str, out: str | None, step: str, paths: io.Paths) -> Job:
@@ -182,9 +183,9 @@ def build_l1(
                 shutil.copyfile(fsrc, dst_dir / fsrc.name)
 
     saved_bands = out_bands if out_bands is not None else bands
-    effective_calibrate_kws = {**CALIBRATE_KWS, "frame_offsets": str(job.frames), **(calibrate_kwargs or {})}
+    effective_calibrate_kws = {**CALIBRATE_KWS, "frame_defects": str(job.frame_defects), **(calibrate_kwargs or {})}
     if l1_config is not None:
-        effective_calibrate_kws = {"l1_config": l1_config.to_attrs(), "frame_offsets": str(job.frames)}
+        effective_calibrate_kws = {"l1_config": l1_config.to_attrs(), "frame_defects": str(job.frame_defects)}
         if l1_config.calib not in CALIB:
             effective_calibrate_kws["calib_sha256"] = hashlib.sha256(Path(l1_config.calib).read_bytes()).hexdigest()
     # Crop with the geometry csv the solve's GCP lattice uses: a sid can carry several g_grd csvs
@@ -201,7 +202,7 @@ def build_l1(
             and meta.get("bands") == saved_bands
             and "calibrate_kwargs" in meta
             and meta["calibrate_kwargs"] == effective_calibrate_kws
-            and meta.get("frames") == frames_key(job.frames)
+            and meta.get("frame_defects") == defects_key(job.frame_defects)
             and meta.get("crop_geom") == crop_geom
         ):
             log.info(f"L1 already built: {ftif_out} (covers {cached_range}, requested {lat_range})")
@@ -222,7 +223,7 @@ def build_l1(
         l1 = (
             l0.calibrate(**effective_calibrate_kws)
             if l1_config is None
-            else l0.calibrate(l1_config, frame_offsets=str(job.frames))
+            else l0.calibrate(l1_config, frame_defects=str(job.frame_defects))
         )
     # l1.img already holds exactly `bands` -- that's what _stage_inputs staged.
     _, xyext = ancillary.parse_geom(fgeom or l1.csv, latlonextent=(-180, 180, *lat_range))
@@ -241,7 +242,7 @@ def build_l1(
             "lat_range": list(lat_range),
             "bands": saved_bands,
             "calibrate_kwargs": effective_calibrate_kws,
-            "frames": frames_key(job.frames),
+            "frame_defects": defects_key(job.frame_defects),
             "crop_geom": crop_geom,
         })
     )
@@ -258,19 +259,19 @@ def build_l1_nci(
     bands: list[int],
     ftif_out: Path,
     chunk_y: int = 1024,
-    fix_frames: bool = False,
-    fill_frames: bool = False,
+    fix_frame_defects: bool = False,
+    fill_frame_defects: bool = False,
 ) -> tuple[Path, int, tuple[float, float]]:
     """`build_l1`'s counterpart for ISSDC's own L1: the nci cube, cropped to `lat_range`, written in the same
     layout (native radiance units, `bands` only, `.meta.json` beside it) so everything after it is shared.
 
     The cube is unzipped into the ISSDC tree under `paths.archive` if needed (`ck.ensure_nci`). No empirical dark/flat
-    or band repair: ISSDC's calibration as shipped, plus `IIRSData.fix_frames` with `job.frames` if asked (`fill_frames`
-    implies `fix_frames`). Returns the L1 path, row 0's `Scan` and `lat_range`.
+    or band repair: ISSDC's calibration as shipped, plus `IIRSData.fix_frame_defects` with `job.frame_defects` if asked
+    (`fill_frame_defects` implies `fix_frame_defects`). Returns the L1 path, row 0's `Scan` and `lat_range`.
     """
     from iirspy import L1
 
-    fix_frames = fix_frames or fill_frames
+    fix_frame_defects = fix_frame_defects or fill_frame_defects
     fmeta = ftif_out.with_suffix(".meta.json")
     if ftif_out.exists() and fmeta.exists():
         meta = json.loads(fmeta.read_text())
@@ -278,7 +279,8 @@ def build_l1_nci(
             meta.get("source") == "issdc-nci"
             and meta.get("bands") == bands
             and tuple(meta["lat_range"]) == tuple(lat_range)
-            and meta.get("frames") == [fix_frames, fill_frames, frames_key(job.frames) if fix_frames else None]
+            and meta.get("frame_defects")
+            == [fix_frame_defects, fill_frame_defects, defects_key(job.frame_defects) if fix_frame_defects else None]
         ):
             log.info(f"nci L1 already built: {ftif_out}")
             return ftif_out, meta["scan0"], lat_range
@@ -291,47 +293,52 @@ def build_l1_nci(
         scan0 = int(l1.extent[2])
         l1.img = l1.img.sel(band=bands) / instrument.RAD_NATIVE_SCALE
         l1.img.attrs["units"] = "1000 mW/cm^2/sr/um"
-        if fix_frames:
-            l1.fix_frames(job.frames, fill_frames)
+        if fix_frame_defects:
+            l1.fix_frame_defects(job.frame_defects, fill_frame_defects)
     with timed(f"nci L1 write ({l1.img.shape[0]} band x {l1.img.shape[1]} rows)"):
         l1.save(str(ftif_out), snr_sidecar=False, empirical_sidecar=False)
-    frames_meta = [fix_frames, fill_frames, frames_key(job.frames) if fix_frames else None]
+    defects_meta = [
+        fix_frame_defects,
+        fill_frame_defects,
+        defects_key(job.frame_defects) if fix_frame_defects else None,
+    ]
     fmeta.write_text(
         json.dumps({
             "scan0": scan0,
             "lat_range": list(lat_range),
             "bands": bands,
             "source": "issdc-nci",
-            "frames": frames_meta,
+            "frame_defects": defects_meta,
         })
     )
     log.info(f"nci L1 saved: {ftif_out}")
     return ftif_out, scan0, lat_range
 
 
-def frame_offsets_path(sid: str, paths: io.Paths, dest: Path | None = None) -> Path:
-    """`sid`'s frame table: one per strip, beside its GCPs and `_L1_b*.tif` in `dest` (default `ck.recal_dir`)."""
-    return Path(dest or ck.recal_dir(sid, paths)) / f"{sid}_frames_offsets.csv"
+def frame_defects_path(sid: str, paths: io.Paths, dest: Path | None = None) -> Path:
+    """`sid`'s frame-defect table: one per strip, beside its GCPs and `_L1_b*.tif` in `dest` (default
+    `ck.recal_dir`)."""
+    return Path(dest or ck.recal_dir(sid, paths)) / f"{sid}_frame_defects.csv"
 
 
-def ensure_frame_offsets(job: Job, dest: Path | None = None) -> Path:
-    """`job.sid`'s frame table, cached for every later task and group: copied from the archive's frame-table db
-    (`geometry/recalibrated/frames_tables.zip`), else built from the whole zip (~1 min, streamed, not staged).
+def ensure_frame_defects(job: Job, dest: Path | None = None) -> Path:
+    """`job.sid`'s frame-defect table, cached for every later task and group: copied from the archive's frame-defect db
+    (`geometry/recalibrated/frame_defect_tables.zip`), else built from the whole zip (~1 min, streamed, not staged).
     """
-    from iirspy.l1 import frames
+    from iirspy.l1 import frame_defects
 
-    f = frame_offsets_path(job.sid, job.paths, dest)
-    if f.exists() or frames.from_db(job.paths.archive / FRAMES_DB, job.zip, f):
+    f = frame_defects_path(job.sid, job.paths, dest)
+    if f.exists() or frame_defects.from_db(job.paths.archive / FRAME_DEFECT_DB, job.zip, f):
         return f
-    log.info(f"frame table missing, building from {job.zip.name} -> {f}")
+    log.info(f"frame-defect table missing, building from {job.zip.name} -> {f}")
     with timed("frame table"):
-        frames.build_table(job.zip, f)
+        frame_defects.build_table(job.zip, f)
     return f
 
 
-def predates_frames(fgcps: Path, fframes: Path) -> bool:
-    """Whether `fgcps` was solved before `fframes` existed, i.e. on a cube whose groups were not re-timed."""
-    return not fframes.exists() or fgcps.stat().st_mtime < fframes.stat().st_mtime
+def predates_frame_defects(fgcps: Path, fdefects: Path) -> bool:
+    """Whether `fgcps` was solved before `fdefects` existed, i.e. on a cube whose groups were not re-timed."""
+    return not fdefects.exists() or fgcps.stat().st_mtime < fdefects.stat().st_mtime
 
 
 def clean_work(work: Path, clean: bool) -> None:
@@ -409,20 +416,21 @@ def l2_config(args) -> L2Config:
 
 
 def l1_config(args) -> L1Config:
-    """The preset `args.l1` with every given `--l1-<field>` and then `--fix-frames`/`--fill-frames` applied."""
+    """The preset `args.l1` with every given `--l1-<field>`, then `--fix-frame-defects`/`--fill-frame-defects`."""
     over = {f.name: getattr(args, f"l1_{f.name}") for f in fields(L1Config) if hasattr(args, f"l1_{f.name}")}
-    over |= {k: v for k in ("fix_frames", "fill_frames") if (v := getattr(args, k)) is not None}
+    over |= {k: v for k in ("fix_frame_defects", "fill_frame_defects") if (v := getattr(args, k)) is not None}
     return L1Config.preset(args.l1, **over)
 
 
 def add_config_args(ap) -> None:
-    """`--fix-frames`/`--fill-frames`, `--l1` and `--l2` presets and one `--l1-<field>`/`--l2-<field>` override per config field."""
+    """`--fix-frame-defects`/`--fill-frame-defects`, `--l1` and `--l2` presets and one `--l1-<field>`/`--l2-<field>`
+    override per config field."""
     for step, h in (
         ("fix", "move each 4-band group onto true frames"),
         ("fill", "rebuild the lost frames (implies fix)"),
     ):
         ap.add_argument(
-            f"--{step}-frames",
+            f"--{step}-frame-defects",
             nargs="?",
             const=True,
             type=_json_value,
@@ -540,7 +548,9 @@ def write_refl_outputs(
     prov_inputs = {
         "nri_zip": file_info(job.zip),
         "gcps": file_info(fgcps, sha=True) if fgcps else None,
-        "frames": {**file_info(job.frames), "key": frames_key(job.frames)} if job.frames else None,
+        "frame_defects": {**file_info(job.frame_defects), "key": defects_key(job.frame_defects)}
+        if job.frame_defects
+        else None,
         "label": file_info(flabel),
         "geometry_csv": file_info(fgeom),
         "geometry": geo.provenance,

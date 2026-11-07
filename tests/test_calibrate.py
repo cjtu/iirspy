@@ -17,7 +17,7 @@ from iirspy.l2.config import L2Config
 
 BASENAME = "20201202T1527488942"
 BANDS = [10, 18, 54]
-LUT_ONLY_KW = {"bad_pixel_mask": False, "fix_frames": False, "attach_empirical_frames": False}
+LUT_ONLY_KW = {"bad_pixel_mask": False, "fix_frame_defects": False, "attach_empirical_frames": False}
 
 
 @pytest.fixture
