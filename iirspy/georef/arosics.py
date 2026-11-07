@@ -695,6 +695,7 @@ def _solve_one(
     Returns {"chunk", "gcps", "fit"}, or None on total failure.
     """
     from iirspy.georef.georef import (
+        WARP_TOLERANCE,
         project,
         read_band,
         register,
@@ -759,7 +760,7 @@ def _solve_one(
     solve_s = time.time() - t_solve
 
     band_i = read_band(ftif, cfg.band)
-    after = project(band_i, reg.gcps, cfg)
+    after = project(band_i, reg.gcps, cfg, tolerance=WARP_TOLERANCE)
     m = np.isfinite(after) & np.isfinite(ref) & (after > 0) & (ref > 0)
     corr = float(np.corrcoef(after[m], ref[m])[0, 1]) if m.sum() > 1000 else None
     save_grid(work / f"{sid}_{group}_chunk{i}_final.tif", after, cfg)

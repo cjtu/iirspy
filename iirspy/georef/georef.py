@@ -53,6 +53,8 @@ from iirspy.georef import ancillary
 
 AROSICS_ENV = os.environ.get("IIRSPY_AROSICS_ENV", "arosics")  # conda env iirspy.georef.coreg runs in
 MAX_RAM_BYTES = float(os.environ.get("IIRSPY_MAX_RAM_BYTES", 4e9))  # past this, project() spills to disk
+# px; approximate TPS for the solve's working warps (register, chunk QA); products and GLTs stay exact
+WARP_TOLERANCE = float(os.environ.get("IIRSPY_WARP_TOLERANCE", 0.125))
 MOON_RADIUS_M = 1737400.0
 SOLAR_RADIUS_DEG = 0.266  # nominal; the true value per epoch comes from SPICE
 LONLAT = CRS.from_authority("IAU", "30100")
@@ -1368,7 +1370,7 @@ def warp_destination(shape, dtype) -> np.ndarray:
         return np.memmap(tmp.name, dtype=dtype, mode="w+", shape=shape)
 
 
-def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None, out=None, dst_nodata=np.nan):
+def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None, out=None, dst_nodata=np.nan, tolerance=0.0):
     """One reproject of a camera-space band -- or a whole (band, y, x) cube -- onto the AOI grid.
 
     Pass the cube, not one band at a time: GDAL solves the warp once per call.
@@ -1378,8 +1380,8 @@ def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None, out=No
     - `dst_nodata` must match `out`'s dtype when `out` is given (e.g. an int sentinel for an int32
     `out`) -- GDAL writes it verbatim, it is not a float-only convention.
     - SRC_METHOD=GCP_TPS: thin-plate-spline interpolation.
-    - tolerance=0 is the exact transformer (rasterio's default 0.125 replaces TPS with a
-    polynomial fitted within an eighth of a pixel which added 5 m of noise at 40 m/px)
+    - `tolerance=0` is the exact transformer; > 0 (px) fits a polynomial per destination chunk, so the
+    answer follows the output extent and `window` no longer crops the full warp.
     """
     shape, tr = window_of(cfg, window)
     shape = np.shape(band)[:-2] + shape
@@ -1396,7 +1398,7 @@ def project(band, gcps, cfg, resampling=Resampling.bilinear, window=None, out=No
         resampling=resampling,
         src_nodata=np.nan,
         dst_nodata=dst_nodata,
-        tolerance=0.0,
+        tolerance=tolerance,
         num_threads=io.ncpu(),  # parallize warp kernel over available cores
         SRC_METHOD="GCP_TPS",
     )
@@ -1619,7 +1621,7 @@ def register(ftif, fgeom, flabel, cfg, kernels=None, reference=None, verbose=Fal
     # base: supplied geometry alone -- what the coarse search is measured on
     t0 = time.time()
     x, y = x + cfg.seed_m[0], y + cfg.seed_m[1]
-    img = project(band, _to_gcps(jj, ii, x, y), cfg)
+    img = project(band, _to_gcps(jj, ii, x, y), cfg, tolerance=WARP_TOLERANCE)
     info["project_s"] = round(time.time() - t0, 2)
     t0 = time.time()
     dx, dy, cinfo = coarse_shift(img, ref, cfg)
@@ -1632,7 +1634,7 @@ def register(ftif, fgeom, flabel, cfg, kernels=None, reference=None, verbose=Fal
     best_p95, best_xy = np.inf, None
     for k in range(1, cfg.niter + 1):
         t_iter = time.time()
-        img = project(band, _to_gcps(jj, ii, x, y), cfg)
+        img = project(band, _to_gcps(jj, ii, x, y), cfg, tolerance=WARP_TOLERANCE)
         project_s = time.time() - t_iter
         tp, n_cand, n_cand_lit = tie_points(ref, img, tr, cfg, cfg.max_shift_for(k))
         tp = _reject_shift_cap(tp, cfg.max_shift_for(k))
