@@ -224,15 +224,13 @@ def kernels(day: str, paths: io.Paths) -> list[Path]:
 
 
 def _one(pattern: str, roots: Sequence[Path]) -> Path | None:
-    """First match for `pattern` under `roots`.
+    """Match for `pattern` under the first root holding one, the preferred data center's (`io.collect_order`) if several.
 
-    Globbed, never rebuilt by hand: the detector suffix is not always `d32` (`20231222T0751377198`
-    is `d18`).
+    Globbed, never rebuilt by hand: the data center suffix varies (`20231222T0751377198` is `d18`).
     """
     for root in roots:
-        hits = sorted(root.glob(pattern))
-        if hits:
-            return hits[0]
+        if hit := min(root.glob(pattern), key=io.collect_order, default=None):
+            return hit
     return None
 
 
@@ -273,15 +271,13 @@ def ancillary(sid: str, paths: io.Paths) -> dict[str, Path | None]:
 
 
 def nri_zip(sid: str, paths: io.Paths) -> Path | None:
-    """The nri bundle for `sid`, searched recursively since `zips/` nests some by region."""
-    hits = sorted((paths.archive / "zips").rglob(f"ch2_iir_nri_{sid}_d_img_*.zip"))
-    return hits[0] if hits else None
+    """The nri bundle for `sid` (the preferred data center's), searched recursively since `zips/` nests some by region."""
+    return min((paths.archive / "zips").rglob(f"ch2_iir_nri_{sid}_d_img_*.zip"), key=io.collect_order, default=None)
 
 
 def nci_zip(sid: str, paths: io.Paths) -> Path | None:
     """The nci (ISSDC L1) bundle for `sid` under `paths.archive/zips`, searched recursively."""
-    hits = sorted((paths.archive / "zips").rglob(f"ch2_iir_nci_{sid}_d_img_*.zip"))
-    return hits[0] if hits else None
+    return min((paths.archive / "zips").rglob(f"ch2_iir_nci_{sid}_d_img_*.zip"), key=io.collect_order, default=None)
 
 
 def ensure_nci(sid: str, paths: io.Paths) -> Path:

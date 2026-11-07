@@ -32,6 +32,7 @@ from iirspy.l1.frames import table_key as frames_key
 from iirspy.l2.config import L2Config
 
 log = logging.getLogger(__name__)
+FRAMES_DB = "geometry/recalibrated/frames_tables.zip"  # one table per raw zip, members named by `frames.db_name`
 
 CALIBRATE_KWS = {
     "dark": "empirical",
@@ -314,18 +315,17 @@ def frame_offsets_path(sid: str, paths: io.Paths, dest: Path | None = None) -> P
 
 
 def ensure_frame_offsets(job: Job, dest: Path | None = None) -> Path:
-    """`job.sid`'s frame table, built from the whole zip on first use and cached for every later task and group.
-
-    It needs every band of every line once (~1 min); nothing else in a run does, so it streams the zip rather than
-    staging it.
+    """`job.sid`'s frame table, cached for every later task and group: copied from the archive's frame-table db
+    (`geometry/recalibrated/frames_tables.zip`), else built from the whole zip (~1 min, streamed, not staged).
     """
     from iirspy.l1 import frames
 
     f = frame_offsets_path(job.sid, job.paths, dest)
-    if not f.exists():
-        log.info(f"frame table missing, building from {job.zip.name} -> {f}")
-        with timed("frame table"):
-            frames.build_table(job.zip, f)
+    if f.exists() or frames.from_db(job.paths.archive / FRAMES_DB, job.zip, f):
+        return f
+    log.info(f"frame table missing, building from {job.zip.name} -> {f}")
+    with timed("frame table"):
+        frames.build_table(job.zip, f)
     return f
 
 

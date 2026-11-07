@@ -129,10 +129,30 @@ def extract(fzip, out_dir, **kw):
     return paths
 
 
+DC_RANK = {"d32": 0, "d18": 1, "hw1": 2, "n18": 4}  # S114: most lines and fewest zero/copied frames first; others 3
+
+
+def data_center(path) -> str:
+    """ISSDC data center that produced `path`: the last `_` field of its stem (`..._d_img_d32.zip` -> 'd32')."""
+    return Path(path).stem.rsplit("_", 1)[-1]
+
+
+def collect_order(path):
+    """Sort key putting the preferred data center's copy of a strip first (`DC_RANK`, then name).
+
+    Every lookup that turns a sid into a file goes through it, so a sid always means the same collect.
+
+    >>> sorted(["x_d_img_n18.zip", "x_d_img_gds.zip", "x_d_img_d18.zip", "x_d_img_d32.zip"], key=collect_order)
+    ['x_d_img_d32.zip', 'x_d_img_d18.zip', 'x_d_img_gds.zip', 'x_d_img_n18.zip']
+    """
+    return DC_RANK.get(data_center(path), 3), Path(path).name
+
+
 def unzip_iirs(ddir, basename, level):
     """Find an ISSDC bundle for `basename` under `ddir` and extract all of it, qub included, beside itself."""
     mtc = LVL2MTC[level]
-    f = next((f for f in Path(ddir).glob(f"**/*{mtc}*.zip") if basename in f.stem), None)
+    hits = [f for f in Path(ddir).glob(f"**/*{mtc}*.zip") if basename in f.stem]
+    f = min(hits, key=collect_order, default=None)
     if f is None:
         raise FileNotFoundError(f"Image {basename} not found in {ddir}. Please download from ISSDC or check file path.")
     extract(f, f.parent, exclude=())
@@ -158,26 +178,31 @@ def _iirs_basename(img_path_obj):
     return parts[3] if len(parts) > 3 else None
 
 
+def _by_sid(files, wanted):
+    """{sid: file} for the sids in `wanted`, the preferred data center's file where a sid has several."""
+    found: dict[str, Path] = {}
+    for f in sorted(files, key=collect_order):
+        if (b := _iirs_basename(f)) in wanted:
+            found.setdefault(b, f)
+    return found
+
+
 def _find_direct(ddir, subdir, ext, bnames):
     """Fast lookup under IIRS archive path: `<ddir>/<subdir>/<sid[:8]>/*.<ext>`."""
     found: dict[str, Path] = {}
     for sid in bnames:
-        date_dir = Path(ddir) / subdir / sid[:8]
-        if date_dir.is_dir():
-            for f in date_dir.glob(f"*.{ext}"):
-                if _iirs_basename(f) == sid:
-                    found[sid] = f
+        found |= _by_sid((Path(ddir) / subdir / sid[:8]).glob(f"*.{ext}"), {sid})
     return found
 
 
 def _find_flat(ddir, ext, wanted):
     """Fast lookup for files dropped directly in `ddir` instead of the normal tree."""
-    return {b: f for f in Path(ddir).glob(f"*.{ext}") if f.is_file() and (b := _iirs_basename(f)) in wanted}
+    return _by_sid((f for f in Path(ddir).glob(f"*.{ext}") if f.is_file()), wanted)
 
 
 def _find_recursive(ddir, subdir, ext, wanted):
     """Slow full recursive walk search for missing files (last resort)."""
-    return {b: f for f in Path(ddir).glob(f"**/{subdir}/**/*.{ext}") if (b := _iirs_basename(f)) in wanted}
+    return _by_sid(Path(ddir).glob(f"**/{subdir}/**/*.{ext}"), wanted)
 
 
 def _find_reprocessed(ddir, subdir, suffix, bnames, group=None):

@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import time
 import warnings
 import zipfile
 from itertools import pairwise
@@ -29,6 +30,8 @@ import dask.array as da
 import numpy as np
 import xarray as xr
 from scipy.ndimage import uniform_filter1d
+
+from iirspy import io
 
 NG = 64
 K = 8  # max |offset| searched, lines (20210723T2153218013 reaches +6)
@@ -273,6 +276,39 @@ def build_table(src, fcsv) -> Path:
     tmp.write_text("\n".join(lines) + "\n")
     os.replace(tmp, out)
     return out
+
+
+def db_name(raw) -> str:
+    """Member name of raw zip or cube `raw`'s table in a frame-table db: `<sid>_<data center>_frames_offsets.csv`.
+
+    Each data center assembles its own L0, so `start`/`black`/`overwrite` rows differ between copies of a strip (S114).
+
+    >>> db_name("ch2_iir_nri_20230604T1425413885_d_img_n18.zip")
+    '20230604T1425413885_n18_frames_offsets.csv'
+    """
+    return f"{io.iirsbasename(Path(raw).name)}_{io.data_center(raw)}_frames_offsets.csv"
+
+
+def from_db(db, raw, fcsv) -> bool:
+    """Copy raw zip `raw`'s table out of the zip `db` (members named by `db_name`) to `fcsv`; False if it has none.
+
+    `fcsv` takes the member's date as mtime, the table's build date, so GCPs solved before it read as solved on
+    un-retimed cubes (`predates_frames`).
+    """
+    if not Path(db).exists():
+        return False
+    with zipfile.ZipFile(db) as z:
+        try:
+            info = z.getinfo(db_name(raw))
+        except KeyError:
+            return False
+        tmp = Path(fcsv).with_name(f"{Path(fcsv).name}.{os.getpid()}.tmp")
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_bytes(z.read(info))
+    t = time.mktime((*info.date_time, 0, 0, -1))
+    os.utime(tmp, (t, t))
+    os.replace(tmp, fcsv)
+    return True
 
 
 def table_key(fcsv) -> str:

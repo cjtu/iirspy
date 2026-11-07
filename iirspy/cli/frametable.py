@@ -1,12 +1,12 @@
-"""Build the frame-defect table (`<sid>_frames_offsets.csv`) of raw nri zips and nothing else (see `iirspy.l1.frames`).
+"""Build the frame-defect tables of raw nri zips and nothing else (see `iirspy.l1.frames`), named as frame-table db
+members (`frames.db_name`: `<sid>_<data center>_frames_offsets.csv`), so `--out` zips straight into the db.
 
-Each argument is a strip id (its zip is looked up in `--zips`) or a path to a zip. Tables already in `--out` are kept
+Each argument is a strip id (its preferred data center's zip is looked up in `--zips`) or a path to a zip. Tables already in `--out` are kept
 unless `--force`, so a timed-out batch resumes where it stopped. A failing scene is reported and skipped; the exit
 status is 1 if any failed.
 """
 
 import argparse
-import re
 import sys
 import time
 from pathlib import Path
@@ -25,24 +25,27 @@ def main(argv=None):
     zips = args.zips or io.Paths().archive / "zips"
     failed = 0
     for s in args.scenes:
-        zp = Path(s) if s.endswith(".zip") else next(iter(sorted(zips.glob(f"ch2_iir_nri_{s}_*.zip"))), None)
-        sid = re.search(r"nri_(\d{8}T\d+)_", zp.name)[1] if zp else s  # type: ignore[index]
-        fcsv = args.out / f"{sid}_frames_offsets.csv"
-        if fcsv.exists() and not args.force:
-            print(f"{sid}: have table", flush=True)
-            continue
+        zp = (
+            Path(s)
+            if s.endswith(".zip")
+            else min(zips.glob(f"ch2_iir_nri_{s}_*.zip"), key=io.collect_order, default=None)
+        )
         if zp is None or not zp.exists():
             failed += 1
-            print(f"{sid}: FAILED no nri zip in {zips}", flush=True)
+            print(f"{s}: FAILED no nri zip in {zips}", flush=True)
+            continue
+        name, fcsv = zp.name, args.out / frames.db_name(zp)
+        if fcsv.exists() and not args.force:
+            print(f"{name}: have table", flush=True)
             continue
         t0 = time.time()
         try:
             frames.build_table(zp, fcsv)
         except Exception as e:  # one bad scene must not sink the batch
             failed += 1
-            print(f"{sid}: FAILED {type(e).__name__}: {e}", flush=True)
+            print(f"{name}: FAILED {type(e).__name__}: {e}", flush=True)
             continue
-        print(f"{sid}: {time.time() - t0:.0f}s {zp.stat().st_size / 1e9:.2f} GB", flush=True)
+        print(f"{name}: {time.time() - t0:.0f}s {zp.stat().st_size / 1e9:.2f} GB", flush=True)
     sys.exit(bool(failed))
 
 

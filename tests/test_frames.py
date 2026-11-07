@@ -23,3 +23,25 @@ def test_detect_recovers_starts_and_drops():
     want = sorted([(0, g, 1) for g in live] + [(1500, 20, 1), (4500, frames.REF, 1)])
     assert [e[1:] for e in got] == [e[1:] for e in want]
     assert max(abs(g[0] - w[0]) for g, w in zip(got, want, strict=True)) <= 1
+
+
+def test_a_strip_reads_the_db_table_of_the_collect_it_reads(tmp_path):
+    """A strip held by two data centers resolves to one zip, and the db hands back that zip's table."""
+    import zipfile
+
+    from iirspy import io
+    from iirspy.cli._run import FRAMES_DB, Job, ensure_frame_offsets
+    from iirspy.georef import chunks
+
+    sid = "20260701T1835107378"
+    (tmp_path / "zips").mkdir()
+    db = tmp_path / FRAMES_DB
+    db.parent.mkdir(parents=True)
+    with zipfile.ZipFile(db, "w") as z:
+        for dc in ("d18", "d32"):
+            (tmp_path / "zips" / f"ch2_iir_nri_{sid}_d_img_{dc}.zip").touch()
+            z.writestr(f"{sid}_{dc}_frames_offsets.csv", dc)
+    paths = io.Paths(archive=tmp_path)
+    job = Job(sid, "south", chunks.nri_zip(sid, paths), tmp_path, tmp_path / "log", paths, tmp_path)
+    assert job.zip.name.endswith("_d32.zip")
+    assert ensure_frame_offsets(job, tmp_path / "keep").read_text() == "d32"
