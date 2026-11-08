@@ -68,7 +68,12 @@ def calibrate(
         if "lost_frames" in cube.coords:
             log("retime", "frame_table")
     cube = instrument.mask_bad(
-        cube, qub, bad_pixel_mask=cfg.bad_pixel_mask, exclude_wl=cfg.exclude_wl, calib_dir=calib_dir
+        cube,
+        qub,
+        mask_bands=cfg.mask_bands,
+        bad_pixel_mask=cfg.bad_pixel_mask,
+        exclude_wl=cfg.exclude_wl,
+        calib_dir=calib_dir,
     )
     log("mask", "bad_elements")
     if cfg.fill_frame_defects or cfg.interp_bands or cfg.interp_spatial:

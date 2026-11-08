@@ -340,9 +340,11 @@ class IIRSData(ABC):
     def fix_frame_defects(self, fcsv, fill=False):
         """Move each 4-band group onto true frames and NaN its lost ones, or with `fill` rebuild them.
 
-        `fcsv` is the strip's frame-defect table (`frame_defects.build_table`), derived from the nri or nci cube, never
-        an ndi.
+        `fcsv` is the strip's frame-defect table (`frame_defects.build_table`), derived from the nri or nci cube. Frame
+        defects are an L1 step: an L2 (ISSDC's ndi, or ours, already fixed at L1) is refused.
         """
+        if self.level == 2:
+            raise ValueError(f"{self.basename}: frame defects are fixed at L1 (nri or nci), never on an L2")
         if self.img.attrs.get("frame_defects_fixed"):
             raise ValueError(f"{self.basename}: frame defects already fixed")
         if not Path(fcsv).exists():

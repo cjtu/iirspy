@@ -115,13 +115,14 @@ def get_saturation_radiance(fimg, calib_dir=PKG_DATA):
     return RAD_NATIVE_SCALE * xr.DataArray(lut, coords={"band": np.arange(1, 257)}, name="saturation [W/m^2/sr/um]")
 
 
-def mask_bad(rad, qub, *, bad_pixel_mask=True, exclude_wl=None, calib_dir=PKG_DATA):
-    """`rad` with the OSF and invalid bands, `exclude_wl` (lo, hi) [nm] ranges, bad elements and saturation nulled.
+def mask_bad(rad, qub, *, mask_bands=True, bad_pixel_mask=True, exclude_wl=None, calib_dir=PKG_DATA):
+    """`rad` with the OSF and invalid bands (`mask_bands`), `exclude_wl` (lo, hi) [nm] ranges, bad elements and
+    saturation nulled.
 
     Nulls are NaN, which `frame_defects.fill_gaps` may later bridge. `bad_pixel_mask` True is the packaged mask,
     unioned with a calib LUT's `calib_bad` coord when present; False is none; a (band, x) bool array is used as given.
     """
-    bad_band = rad.band.isin((*OSF, *INVALID))
+    bad_band = rad.band.isin((*OSF, *INVALID)) & mask_bands
     for lo, hi in exclude_wl or ():
         bad_band = bad_band | ((rad.wl >= lo) & (rad.wl <= hi))
     out = rad.where(~bad_band)

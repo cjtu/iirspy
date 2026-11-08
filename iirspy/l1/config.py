@@ -28,10 +28,11 @@ class L1Config(Config):
             relative to the band median), "flatfield_v1" (`data/flatfield_v1.zip`) or "empirical" (the scene's own flat
             and smile). The LUT's band median alone is a flat of 1, so there is no "issdc_lut_median" flat.
         interp_bands: Fill masked bands by interpolating across band (e.g. "linear"), or None.
-        interp_spatial: Fill single-column all-band NaN gaps across x.
+        interp_spatial: Fill NaN runs of up to 4 px along x and y, band by band (`frame_defects.fill_gaps`).
         fix_frame_defects: Move each 4-band group onto true frames and null its lost frames (needs the
             scene's frame-defect table, see `iirspy.l1.frame_defects`).
         fill_frame_defects: Rebuild the nulled frames from each pixel's own spectrum (`iirspy.l1.frame_defects.fill`).
+        mask_bands: Null the OSF and invalid bands (`instrument.OSF`, `instrument.INVALID`); ISSDC ships them measured.
         bad_pixel_mask: Null the packaged bad detector elements.
         exclude_wl: Extra (lo, hi) wavelength ranges [nm] to null, or None.
         attach_snr: Attach the empirical broadband SNR as an `snr` coord (empirical scenes with shadow).
@@ -51,6 +52,7 @@ class L1Config(Config):
     interp_spatial: bool = False
     fix_frame_defects: bool = False
     fill_frame_defects: bool = False
+    mask_bands: bool = True
     bad_pixel_mask: bool = True
     exclude_wl: tuple[tuple[float, float], ...] | None = None
     attach_snr: bool = True
@@ -89,6 +91,7 @@ L1Config.PRESETS = {
         "flat": "issdc_derived",
         "keystone": "simple",
         "edge_copy": True,
+        "mask_bands": False,
     },
     "lut-only": {
         "dark": "issdc_lut_median",

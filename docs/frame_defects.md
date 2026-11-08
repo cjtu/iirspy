@@ -8,7 +8,7 @@ A group that lags the rest of the detector is displaced along track by whole pix
 
 ## Defects
 
-The detector's 256 bands are read out in 64 groups of 4, group `g` (0-based) holding 1-based bands `4g+1` to `4g+4`. Each group can lose frames independently and nothing in the DN marks it. The description below is our interpretation of the raw `nri` L0 data. The ISSDC calibrated `nci` data carry the same defects uncorrected, and ISSDC fills black stripes by duplicating neighbouring rows.
+The detector's 256 bands are read out in 64 groups of 4, group `g` (0-based) holding 1-based bands `4g+1` to `4g+4`. Each group can lose frames independently and nothing in the DN marks it. The description below is our interpretation of the raw `nri` L0 data. The ISSDC calibrated `nci` data carry the same defects uncorrected: overwrite copies stay in place and black rows hold the calibration of DN 0 (about zero radiance, the same value in every row of the run), not a fill from neighbouring rows.
 
 - Drop. From one exact line on, raw row `y` of the group holds true frame `y + lag`. Lags only accumulate and never reverse. Groups often drop together, in 8-band pairs or several groups at one line. The end of the strip is padded by repeating the last line, once per drop. Drops do not propagate to other bands and their spacing is irregular. In a 78-scene sample, 29 scenes (about 37%) have drops, more often in long south-pole strips.
 - Overwrite. Two frames `y` and `y+1` are lost and refilled from both sides (A A B B). Row `y` repeats frame `y-1` and row `y+1` holds frame `y+2`, one row early. Timing is unchanged outside those two rows. The copies are exact or within 1 DN in one band. About 1,700 events in one scene were checked and all had this structure.
@@ -100,8 +100,10 @@ Figure 6: Band 78 at line 26856 against reference band 118, same layout as Figur
 - `iirs-georef-solve` builds the table once per strip before any other processing if it is missing. It streams the `nri` zip with no staging, since the staged cube holds only the solve's bands, and caches the table. Every later task and CRS group reuses it.
 - A solve whose merged GCPs are older than the table is re-solved on the re-timed cube. The L1 cache and the per-chunk solve cache are keyed on the table's content hash. The chunk reference hillshades and WAC images do not depend on the cube and are reused from the work dir.
 - `iirs-compute-refl` refuses to run on GCPs that predate the table. Re-run the solve first.
-- GLT, LOC and L2 products are in true-frame coordinates. ISSDC products (`nri`, `nci`, `ndi`) still carry the defects.
+- GLT, LOC and L2 products are in true-frame coordinates. ISSDC `nri` and `nci` still carry the defects. The `ndi` keeps the overwrite copies and black rows (reflectance about 0), but at least one D32 `ndi` (20210803T0205382374) has its drops re-timed: each group's rows follow the table's lag. Start lags are not undone (20240503T0409002870, D18).
 
 ## Repairing any product
 
-`iirs-fix-frame-defects <sid> --product nri|nci|ndi --out f.tif [--fill-frame-defects]` loads the ISSDC cube of that level, applies `IIRSData.fix_frame_defects` (the same `frame_defects.apply`/`frame_defects.fill` as the pipeline) and writes it in nci camera order. The table is built from the nri or nci cube when absent; an ndi cannot supply one, so it needs the table from an earlier run. The ndi is repaired as shipped: lost frames are NaN (or filled), its spectral smoothing and baked-in per-row terms are not corrected.
+`iirs-fix-frame-defects <sid> --product nri|nci --out f.tif [--fill-frame-defects]` loads the ISSDC cube of that level, applies `IIRSData.fix_frame_defects` (the same `frame_defects.apply`/`frame_defects.fill` as the pipeline) and writes it in nci camera order. The table is built from that cube when absent.
+
+Frame defects are fixed once, at L1: in the raw-count L1 and in the nci read as L1, which also covers our L2 built from the nci. They are never applied to an L2, ours or ISSDC's `ndi` (`fix_frame_defects` refuses a level-2 cube), because some `ndi` already have their drops re-timed and applying the table again would shift them twice.

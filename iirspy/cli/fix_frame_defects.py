@@ -1,6 +1,7 @@
-"""Repair frame defects in an ISSDC nri, nci or ndi cube and write it in nci camera order (`iirspy.l1.frame_defects`).
+"""Repair frame defects in an ISSDC nri or nci cube and write it in nci camera order (`iirspy.l1.frame_defects`).
 
-The frame-defect table comes from the nri or nci cube, built here when absent; an ndi needs it from an earlier run.
+The frame-defect table comes from that cube, built here when absent. Frame defects are an L1 step, so an ndi is never
+repaired: some are already re-timed by ISSDC, and our own L2 is built from a repaired L1.
 """
 
 import argparse
@@ -8,10 +9,10 @@ from pathlib import Path
 
 from iirspy import io
 from iirspy.cli._run import frame_defects_path
-from iirspy.iirs import L0, L1, L2
+from iirspy.iirs import L0, L1
 from iirspy.l1 import frame_defects
 
-LEVELS = {"nri": L0, "nci": L1, "ndi": L2}
+LEVELS = {"nri": L0, "nci": L1}
 
 
 def main(argv=None):
@@ -26,7 +27,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     cube = LEVELS[args.product](args.sid, args.directory or paths.archive)
     table = Path(args.table or frame_defects_path(args.sid, paths))
-    if args.product != "ndi" and not table.exists():
+    if not table.exists():
         frame_defects.build_table(cube.qub, table)
     cube.fix_frame_defects(table, args.fill_frame_defects)
     print(cube.save(args.out))

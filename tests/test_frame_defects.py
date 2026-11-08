@@ -1,4 +1,6 @@
+import dask.array as da
 import numpy as np
+import xarray as xr
 
 from iirspy.l1 import frame_defects
 
@@ -45,3 +47,21 @@ def test_a_strip_reads_the_db_table_of_the_collect_it_reads(tmp_path):
     job = Job(sid, "south", chunks.nri_zip(sid, paths), tmp_path, tmp_path / "log", paths, tmp_path)
     assert job.zip.name.endswith("_d32.zip")
     assert ensure_frame_defects(job, tmp_path / "keep").read_text() == "d32"
+
+
+def test_spatial_fill_bridges_holes_up_to_span_on_either_axis():
+    """A plane in x and y comes back exactly through dead columns, lost rows and a blob; a hole wider than SPAN on both
+    axes stays NaN, also across a dask chunk edge."""
+    y, x = np.mgrid[0:40, 0:30]
+    truth = np.stack([1 + 0.1 * x + 0.05 * y, 2 + 0.03 * x - 0.02 * y])
+    a = truth.copy()
+    a[:, :18, 10:12] = np.nan  # two dead columns (rows 0-17)
+    a[:, 20:23, :] = np.nan  # three lost whole frames, across the chunk edge at y=21
+    a[:, 30:32, 3:5] = np.nan  # 2x2 blob
+    a[:, 33:39, 20:26] = np.nan  # 6x6: beyond SPAN on both axes
+    rad = xr.DataArray(da.from_array(a, chunks=(2, 21, 30)), dims=("band", "y", "x"), coords={"band": [1, 2]})
+    out = frame_defects.fill_gaps(rad, interp_spatial=True).values
+    wide = np.zeros(a.shape, bool)
+    wide[:, 33:39, 20:26] = True
+    np.testing.assert_allclose(out[~wide], truth[~wide])
+    assert np.isnan(out[wide]).all()

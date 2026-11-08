@@ -12,7 +12,7 @@ own, with nothing in the DN to say so:
 `REF`, and writes them to `<sid>_frame_defects.csv`.
 `apply` moves every group onto true frames and masks the lost ones; `fill` rebuilds those from the pixel's own
 spectrum. ISSDC's nci carries the same defects uncorrected. `fill_gaps` is the last L1 step: it calls `fill`, then
-bridges the short NaN runs left by masking (up to `BAND_GAP` bands, one column across x, `ROW_GAP` rows along y).
+bridges the short NaN runs left by masking (up to `BAND_GAP` bands, then up to `SPAN` px along x and y).
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ REF = 13  # bands 53-56, the reference every group is measured against
 SKIP = {0, 1, 63}  # bands 1-8, 253-256: no usable signal
 MAX_BRIDGE = 9  # widest band span `fill` bridges: a hole of two neighbouring groups
 BAND_GAP = 9  # widest spectral hole `interpolate_na` bridges: two dropped groups (8 bands) in a row
-ROW_GAP = 5  # likewise along y: up to 4 lost frames in a row
+SPAN = 4  # widest x or y hole `interp_spatial` bridges, px: up to 4 lost frames or dead columns in a row
 
 
 def retime(rad, qub, frame_defects=None):
@@ -456,31 +456,37 @@ def fill_gaps(rad, *, fill_frame_defects=False, interp_bands=None, interp_spatia
     if interp_bands is not None:
         out = out.interpolate_na("band", max_gap=BAND_GAP, keep_attrs=True, method=interp_bands)
     if interp_spatial:
-        # max_gap=2 in 0.5-based x coords spans exactly one missing column
-        out = out.interpolate_na("x", max_gap=2, keep_attrs=True, method="linear")
-        out = _interp_rows(out)
+        out = _interp_xy(out)
     return out
 
 
-def _interp_rows(rad, max_gap=ROW_GAP):
-    """Linear fill along y of NaN runs shorter than `max_gap` rows, chunk by chunk (overlapped so a run on a chunk edge fills).
+def _lines(a, axis, span):
+    """Per voxel of `a`: the straight line across its NaN run along `axis` times 1 / run length, and that weight; both
+    0 off runs of at most `span` with a valid end on each side."""
+    b = np.moveaxis(a, axis, -1)
+    n = b.shape[-1]
+    i = np.arange(n)
+    ok = ~np.isnan(b)
+    prev = np.maximum.accumulate(np.where(ok, i, -1), axis=-1)
+    nxt = np.minimum.accumulate(np.where(ok, i, n)[..., ::-1], axis=-1)[..., ::-1]
+    w = np.where(~ok & (prev >= 0) & (nxt < n) & (nxt - prev - 1 <= span), 1 / (nxt - prev - 1).clip(1), 0)
+    p, q = prev.clip(0, n - 1), nxt.clip(0, n - 1)
+    t = (i - p) / (q - p).clip(1)
+    v = np.take_along_axis(b, p, -1) * (1 - t) + np.take_along_axis(b, q, -1) * t
+    return np.moveaxis(np.where(w > 0, v * w, 0), -1, axis), np.moveaxis(w, -1, axis)
 
-    A 2-row run straddling the chunk edge fills; a run of `max_gap` rows or more stays NaN:
 
-    >>> a = np.ones((1, 12, 1)); a[0, 5:7] = np.nan; a[0, 8:] = np.nan
-    >>> r = xr.DataArray(da.from_array(a, chunks=(1, 6, 1)), dims=("band", "y", "x"))
-    >>> np.isnan(_interp_rows(r, 4).values[0, :, 0]).astype(int).tolist()
-    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1]
+def _interp_xy(rad, span=SPAN):
+    """Linear fill of NaN runs of at most `span` px along x and along y, band by band; a voxel both reach takes the two
+    lines weighted by 1 / run length, so the shorter run dominates. Chunked along y with a `span` overlap.
     """
-    ax = rad.get_axis_num("y")
+    rad = rad.transpose("band", "y", "x")
     data = rad.data if isinstance(rad.data, da.Array) else da.from_array(rad.data)
-    data = data.rechunk({a: -1 for a in range(rad.ndim) if a != ax})
+    data = data.rechunk({0: -1, 2: -1})
 
-    def block(b):
-        dims = [f"d{i}" for i in range(b.ndim)]
-        dims[ax] = "y"
-        return (
-            xr.DataArray(b, dims=dims, coords={"y": np.arange(b.shape[ax])}).interpolate_na("y", max_gap=max_gap).values
-        )
+    def block(a):
+        (vx, wx), (vy, wy) = _lines(a, 2, span), _lines(a, 1, span)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return np.where(wx + wy > 0, (vx + vy) / (wx + wy), a).astype(a.dtype)
 
-    return rad.copy(data=data.map_overlap(block, depth={ax: max_gap}, boundary="none", dtype=data.dtype))
+    return rad.copy(data=data.map_overlap(block, depth={1: span}, boundary="none", dtype=data.dtype))
